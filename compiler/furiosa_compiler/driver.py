@@ -108,7 +108,7 @@ def compile_model(model_path: Path, out: Path, keep_going: bool = False) -> dict
         else:
             directory = out / "kernels" / symbol
             directory.mkdir(parents=True, exist_ok=True)
-            for stage in ("ttir", "linalg"):
+            for stage in ("ttir", "linalg", "structured"):
                 (directory / f"{stage}.mlir").write_text(kernel.stage(stage))
             entry["written"] = kernel.written()
             entry["linalg"] = f"kernels/{symbol}/linalg.mlir"

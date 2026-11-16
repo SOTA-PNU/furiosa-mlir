@@ -7,6 +7,7 @@ as a constexpr and records the launch grid, so the raising pass sees a kernel wi
 import functools
 import hashlib
 import json
+from pathlib import Path
 from dataclasses import dataclass
 from types import ModuleType
 from typing import Dict, Tuple
@@ -64,7 +65,10 @@ class FuriosaBackend(BaseBackend):
         self.binary_ext = "linalg"
 
     def hash(self) -> str:
-        return f"furiosa-{self.target.arch}"
+        # triton_key() hashes libtriton but not this backend (its directory is no Python package), so the
+        # stages defined here enter the cache key through their source.
+        source = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
+        return f"furiosa-{self.target.arch}-{source}"
 
     def parse_options(self, opts) -> FuriosaOptions:
         known = FuriosaOptions.__dataclass_fields__
@@ -114,9 +118,20 @@ class FuriosaBackend(BaseBackend):
         return str(mod)
 
     @staticmethod
+    def make_structured(src, metadata, options):
+        """Promotes the raised kernel's affine reads to indexing-map inputs (furiosa-structure). A failure
+        yields a comment carrying the diagnostic, so the raised stage stays usable."""
+        try:
+            return furiosa.passes.structure(src)
+        except RuntimeError as e:
+            return codegen_failure(e)
+
+    @staticmethod
     def make_fopt(src, metadata, options):
         """Maps the raised kernel to furiosa-opt (fopt). A kernel no op class maps yet yields a comment carrying
         the diagnostic instead of failing compilation, so the earlier stages stay usable."""
+        if src.startswith(CODEGEN_FAILED):
+            return src
         try:
             return furiosa.codegen.linalg_to_fopt(src)
         except RuntimeError as e:
@@ -137,6 +152,7 @@ class FuriosaBackend(BaseBackend):
             raise NotImplementedError(f"the furiosa backend compiles Triton kernels, not {language}")
         stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
         stages["linalg"] = lambda src, metadata: self.make_linalg(src, metadata, options)
+        stages["structured"] = lambda src, metadata: self.make_structured(src, metadata, options)
         stages["fopt"] = lambda src, metadata: self.make_fopt(src, metadata, options)
         stages["rust"] = lambda src, metadata: self.make_rust(src, metadata, options)
 

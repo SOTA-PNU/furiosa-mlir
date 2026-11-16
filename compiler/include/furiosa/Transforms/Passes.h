@@ -12,6 +12,9 @@ namespace mlir::furiosa {
 /// the `furiosa.grid` attribute) to whole-tensor linalg on tensors.
 std::unique_ptr<Pass> createRaiseToLinalgPass();
 
+/// Promotes affine tensor.extract reads of gather-form raised linalg to indexing-map inputs.
+std::unique_ptr<Pass> createStructurePass();
+
 /// The dialects the Furiosa passes create.
 void registerDialects(DialectRegistry &registry);
 

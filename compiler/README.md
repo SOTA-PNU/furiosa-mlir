@@ -59,8 +59,11 @@ Running the function on the buffers must give exactly what the Triton grid gives
 
 ```
 <dir>/graph.json                     every graph: buffers and launches (kernel symbol, buffer per pointer arg, grid)
-<dir>/kernels/<symbol>/{ttir,linalg}.mlir
+<dir>/kernels/<symbol>/{ttir,linalg,structured}.mlir
 ```
+
+`structured.mlir` is the raised kernel after `furiosa-structure` (affine reads as indexing-map inputs); it is
+what codegen consumes, and L1 runs both it and `linalg.mlir`.
 
 A specialization is keyed by kernel, constexpr values, grid and the dtype/shape of each pointer
 argument (not the buffer names), so one compiled kernel serves every launch with that shape; `graph.json`

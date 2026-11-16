@@ -24,8 +24,8 @@ _FUNC = re.compile(r"func\.func (?:public )?@([\w$.]+)\(")
 class Kernels:
     """JIT-compiles each kernel of graph.json once, on first use."""
 
-    def __init__(self, out_dir: Path, entries: dict):
-        self.out_dir, self.entries, self.compiled = out_dir, entries, {}
+    def __init__(self, out_dir: Path, entries: dict, stage: str = "linalg"):
+        self.out_dir, self.entries, self.stage, self.compiled = out_dir, entries, stage, {}
 
     def get(self, symbol: str):
         if symbol not in self.compiled:
@@ -34,10 +34,12 @@ class Kernels:
             entry = self.entries[symbol]
             if "error" in entry:
                 raise RuntimeError(f"{symbol} failed to compile: {entry['error']}")
-            path = self.out_dir / entry.get("linalg", f"kernels/{symbol}/linalg.mlir")
+            path = self.out_dir / f"kernels/{symbol}/{self.stage}.mlir"
             if not path.exists():
-                raise RuntimeError(f"{symbol}: no raised linalg at {path}")
+                raise RuntimeError(f"{symbol}: no {self.stage} stage at {path}")
             text = path.read_text()
+            if text.startswith("// furiosa codegen failed:"):
+                raise RuntimeError(f"{symbol}: {self.stage} stage failed: {text.splitlines()[1][3:300]}")
             names = _FUNC.findall(text)
             name = entry["kernel"] if entry["kernel"] in names else (names[0] if names else None)
             if name is None:
@@ -97,7 +99,21 @@ def compare(got: dict, want: dict, rtol: float, atol: float) -> tuple[bool, str]
     return True, f"rel {worst:.2g} @ {worst_name}" if worst_name else ""
 
 
+STAGES = ("linalg", "structured")  # the raised form, and the structured form codegen consumes
+
+
 def judge(out_dir: Path, golden_dir: Path, rtol: float, atol: float) -> tuple[bool, str]:
+    """Both stages must reproduce the golden outputs; the detail reports the raised stage."""
+    details = []
+    for stage in STAGES:
+        ok, detail = judge_stage(out_dir, golden_dir, rtol, atol, stage)
+        if not ok:
+            return False, f"{stage}: {detail}"
+        details.append(detail)
+    return True, details[0]
+
+
+def judge_stage(out_dir: Path, golden_dir: Path, rtol: float, atol: float, stage: str) -> tuple[bool, str]:
     graph_file = out_dir / "graph.json"
     if not graph_file.exists():
         return False, f"no {graph_file}"
@@ -105,7 +121,7 @@ def judge(out_dir: Path, golden_dir: Path, rtol: float, atol: float) -> tuple[bo
     meta = json.loads((golden_dir / "meta.json").read_text())
     if len(meta["graphs"]) != len(compiled["graphs"]):
         return False, f"golden has {len(meta['graphs'])} graphs, the compiler {len(compiled['graphs'])}"
-    kernels = Kernels(out_dir, compiled["kernels"])
+    kernels = Kernels(out_dir, compiled["kernels"], stage)
     details = []
     for i, graph in enumerate(compiled["graphs"]):
         buffers = tensors.load(golden_dir / str(i) / "inputs.safetensors")

@@ -1,6 +1,6 @@
 """Assembles the furiosa-opt crate for a compiled model (harness/README.md's crate contract).
 
-Each kernel specialization's raised linalg (kernels/<symbol>/linalg.mlir) goes through the codegen
+Each kernel specialization's structured linalg (kernels/<symbol>/structured.mlir) goes through the codegen
 (linalg -> fopt -> Rust) into its own module, src/kernel/<symbol>.rs, so every kernel keeps its own axes!.
 The generated run_graph holds each graph buffer as an untyped HbmBuffer and gives it, per launch, the
 HbmTensor type that kernel declares (`HbmTensor: TryFrom<HbmBuffer>` relabels without a copy): kernels
@@ -154,8 +154,10 @@ def ident(text: str) -> str:
 
 
 def codegen(kernel_dir: Path) -> tuple[str, dict]:
-    """The kernel's Rust module and signature, from its raised linalg; also writes fopt.mlir and kernel.rs."""
-    linalg = (kernel_dir / "linalg.mlir").read_text()
+    """The kernel's Rust module and signature, from its structured linalg; also writes fopt.mlir and kernel.rs."""
+    linalg = (kernel_dir / "structured.mlir").read_text()
+    if linalg.startswith("// furiosa codegen failed:"):
+        raise CrateError(f"{kernel_dir.name}: furiosa-structure: {linalg.strip()}")
     try:
         fopt = furiosa.codegen.linalg_to_fopt(linalg)
     except RuntimeError as e:

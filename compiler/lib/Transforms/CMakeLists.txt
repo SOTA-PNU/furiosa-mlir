@@ -1,5 +1,6 @@
 add_triton_library(FuriosaTransforms
   RaiseToLinalg.cpp
+  Structure.cpp
 
   LINK_LIBS PUBLIC
     TritonIR
@@ -7,6 +8,9 @@ add_triton_library(FuriosaTransforms
     MLIRFuncDialect
     MLIRFuncInlinerExtension
     MLIRLinalgDialect
+    MLIRLinalgTransforms
+    MLIRParser
+    MLIRTransformUtils
     MLIRMathDialect
     MLIRSCFDialect
     MLIRTensorDialect
