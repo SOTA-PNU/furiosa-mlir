@@ -4,6 +4,7 @@ add_triton_library(FuriosaCodegen
   LinalgToFopt.cpp
   Mapping/Contraction.cpp
   Mapping/Elementwise.cpp
+  Mapping/Gather.cpp
   Mapping/Rowwise.cpp
 
   DEPENDS

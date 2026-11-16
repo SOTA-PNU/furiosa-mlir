@@ -45,6 +45,9 @@ public:
   Value param(unsigned i) { return kernel.getArgument(i); }
   /// A pointer argument the kernel writes, as a returned `HbmTensor<D, Chip, element>`.
   void output(int64_t ptrArg, Type elementType, fopt::MapAttr element);
+  /// A pointer argument the kernel updates in place, as `&mut HbmTensor<D, Chip, element>` (the kernel
+  /// writes part of it, or reads it too); returns its parameter index.
+  unsigned inout(int64_t ptrArg, Type elementType, fopt::MapAttr element);
 
   /// Starts the body once every input and output is declared.
   void beginBody();
@@ -68,6 +71,7 @@ private:
   SmallVector<std::pair<std::string, int64_t>> axes;
   SmallVector<Type> inputTypes, outputTypes;
   SmallVector<int64_t> inputArgs, outputArgs;
+  SmallVector<bool> inoutParams;
   func::FuncOp kernel;
 };
 
@@ -85,6 +89,8 @@ OpClass elementwiseClass();
 OpClass contractionClass();
 /// Row-wise elementwise generics and row reductions over [rows, columns] (Mapping/Rowwise.cpp).
 OpClass rowwiseClass();
+/// Rows of a table read at data-dependent indices, as an indirect DMA (Mapping/Gather.cpp).
+OpClass gatherClass();
 
 } // namespace mlir::furiosa::mapping
 

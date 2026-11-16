@@ -309,4 +309,87 @@ def Fopt_CommitOp : Fopt_Op<"commit", [Pure]> {
   let hasVerifier = 1;
 }
 
+//===----------------------------------------------------------------------===//
+// HBM views and indirect DMA
+//===----------------------------------------------------------------------===//
+
+// A view is an expression, not a statement: each view value has one use and prints inline there, as
+// `t.view()` / `t.view_mut()` followed by its tile and pad calls.
+
+def Fopt_HbmView : Fopt_Type<"HbmView", "hbmv"> {
+  let summary = "HbmTensorView<D, Chip, Element> (or HbmTensorViewMut when mutable)";
+  let parameters = (ins "::mlir::Type":$elementType, "MapAttr":$chip, "MapAttr":$element, "bool":$isMut);
+  let assemblyFormat = "`<` $elementType `,` $chip `,` $element `,` $isMut `>`";
+}
+
+def Fopt_ViewOp : Fopt_Op<"view", [Pure]> {
+  let summary = "t.view() or, into a mutable view, t.view_mut()";
+  let arguments = (ins Fopt_HbmTensor:$source);
+  let results = (outs Fopt_HbmView:$result);
+  let assemblyFormat = "$source attr-dict `:` qualified(type($source)) `->` qualified(type($result))";
+  let hasVerifier = 1;
+}
+
+def Fopt_TileOp : Fopt_Op<"tile", [Pure]> {
+  let summary = "v.tile::<Index, LEN, Element2>(start)";
+  let arguments = (ins Fopt_HbmView:$source, Fopt_MapAttr:$index, I64Attr:$len, I64Attr:$start);
+  let results = (outs Fopt_HbmView:$result);
+  let assemblyFormat = [{
+    $source `index` $index `len` $len `start` $start attr-dict `:` qualified(type($source)) `->`
+    qualified(type($result))
+  }];
+  let hasVerifier = 1;
+}
+
+def Fopt_PadOp : Fopt_Op<"pad", [Pure]> {
+  let summary = "v.pad::<Element2>() (one outermost padding factor)";
+  let arguments = (ins Fopt_HbmView:$source);
+  let results = (outs Fopt_HbmView:$result);
+  let assemblyFormat = "$source attr-dict `:` qualified(type($source)) `->` qualified(type($result))";
+  let hasVerifier = 1;
+}
+
+def Fopt_ViewToDmOp : Fopt_Op<"view_to_dm", [Pure]> {
+  let summary = "v.to_dm::<Cluster, Slice, Element>(&mut device.tdma)";
+  let arguments = (ins Fopt_HbmView:$source);
+  let results = (outs Fopt_DmTensor:$result);
+  let assemblyFormat = "$source attr-dict `:` qualified(type($source)) `->` qualified(type($result))";
+  let hasVerifier = 1;
+}
+
+def Fopt_DmToHbmViewOp : Fopt_Op<"dm_to_hbm_view"> {
+  let summary = "dm.view().to_hbm_view(&mut device.tdma, dst)";
+  let arguments = (ins Fopt_DmTensor:$source, Fopt_HbmView:$dest);
+  let assemblyFormat = "$source `,` $dest attr-dict `:` qualified(type($source)) `,` qualified(type($dest))";
+  let hasVerifier = 1;
+}
+
+def Fopt_HbmToHbmViewOp : Fopt_Op<"hbm_to_hbm_view"> {
+  let summary = "src.to_hbm_view(&mut device.tdma, dst) (an HBM-to-HBM copy between views)";
+  let arguments = (ins Fopt_HbmView:$source, Fopt_HbmView:$dest);
+  let assemblyFormat = "$source `,` $dest attr-dict `:` qualified(type($source)) `,` qualified(type($dest))";
+  let hasVerifier = 1;
+}
+
+def Fopt_GatherOp : Fopt_Op<"gather", [Pure]> {
+  let summary = "table.gather::<Indexed, Payload>().by_byte_offsets::<Domain>(&offsets).to_dm(&mut device.tdma)";
+  let description = [{
+    `result[d, p] = table[offsets[d] / stride(Indexed), p]`: the DMA reads, per entry of the HBM index (whose
+    element mapping is the domain), one payload of the table at that byte offset.
+  }];
+  let arguments = (ins Fopt_HbmTensor:$table, Fopt_HbmTensor:$offsets, Fopt_MapAttr:$indexed, Fopt_MapAttr:$payload);
+  let results = (outs Fopt_DmTensor:$result);
+  let assemblyFormat = [{
+    $table `[` $offsets `]` `indexed` $indexed `payload` $payload attr-dict `:` qualified(type($table)) `,`
+    qualified(type($offsets)) `->` qualified(type($result))
+  }];
+  let hasVerifier = 1;
+}
+
+def Fopt_VectorFxpOp : Fopt_StageOp<"vector_fxp"> {
+  let summary = ".vector_fxp(FxpBinaryOp::<op>, imm) (an i32 ALU op with an immediate)";
+  let arguments = (ins Fopt_Stream:$input, StrAttr:$op, I32Attr:$imm);
+  let assemblyFormat = "$op $input `,` $imm attr-dict `:` qualified(type($input)) `->` qualified(type($result))";
+}
+
 #endif // FURIOSA_CODEGEN_FOPT_OPS

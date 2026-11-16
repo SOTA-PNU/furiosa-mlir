@@ -120,7 +120,32 @@ private:
 
   /// The builder chain that ends in `stream`: device.<ctx>.begin(..).<stage>()...
   FailureOr<std::string> chain(Value stream);
+
+  /// The expression of an HBM view: t.view() / t.view_mut(), then its tile and pad calls.
+  FailureOr<std::string> view(Value v);
 };
+
+FailureOr<std::string> Emitter::view(Value v) {
+  Operation *op = v.getDefiningOp();
+  if (auto o = dyn_cast_or_null<ViewOp>(op))
+    return nameOf(o.getSource()) + (o.getType().getIsMut() ? ".view_mut()" : ".view()");
+  if (auto o = dyn_cast_or_null<TileOp>(op)) {
+    FailureOr<std::string> base = view(o.getSource());
+    if (failed(base))
+      return failure();
+    return *base + ".tile::<" + o.getIndex().rust() + ", " + std::to_string(o.getLen()) + ", " +
+           o.getType().getElement().rust() + ">(" + std::to_string(o.getStart()) + ")";
+  }
+  if (auto o = dyn_cast_or_null<PadOp>(op)) {
+    FailureOr<std::string> base = view(o.getSource());
+    if (failed(base))
+      return failure();
+    return *base + ".pad::<" + m(o.getType().getElement()) + ">()";
+  }
+  if (op)
+    op->emitOpError("is not a view expression");
+  return failure();
+}
 
 FailureOr<std::string> Emitter::chain(Value stream) {
   SmallVector<Operation *> stages;
@@ -222,6 +247,10 @@ FailureOr<std::string> Emitter::chain(Value stream) {
               out << "\n.vector_stash()";
               return success();
             })
+            .Case([&](VectorFxpOp o) {
+              out << "\n.vector_fxp(FxpBinaryOp::" << o.getOp() << ", " << o.getImm() << ")";
+              return success();
+            })
             .Case([&](VectorIntraSliceReduceOp o) {
               out << "\n.vector_intra_slice_reduce::<" << o.getAxis() << ", " << tp() << ">(IntraSliceReduceOpF32::"
                   << o.getOp() << ")";
@@ -306,7 +335,7 @@ LogicalResult Emitter::emit(func::FuncOp kernel) {
   for (auto [i, arg] : llvm::enumerate(kernel.getArguments())) {
     auto name = kernel.getArgAttrOfType<StringAttr>(i, kNameAttr);
     names[arg] = fresh(name ? name.getValue() : "arg" + std::to_string(i));
-    os << ", " << names[arg] << ": &Arg" << i;
+    os << ", " << names[arg] << (kernel.getArgAttr(i, kInoutAttr) ? ": &mut Arg" : ": &Arg") << i;
   }
   os << ")";
   if (type.getNumResults() == 1)
@@ -370,9 +399,40 @@ LogicalResult Emitter::emit(func::FuncOp kernel) {
               os << "    let " << names[o] << ": " << rustType(o.getType()) << " = " << *c << "\n.commit();\n";
               return success();
             })
+            .Case([&](ViewToDmOp o) -> LogicalResult {
+              FailureOr<std::string> v = view(o.getSource());
+              if (failed(v))
+                return failure();
+              names[o] = fresh("t" + std::to_string(names.size()));
+              os << "    let " << names[o] << ": " << rustType(o.getType()) << " = " << *v
+                 << ".to_dm(&mut device.tdma);\n";
+              return success();
+            })
+            .Case([&](GatherOp o) {
+              names[o] = fresh(nameOf(o.getTable()) + "_rows");
+              os << "    let " << names[o] << ": " << rustType(o.getType()) << " = " << nameOf(o.getTable())
+                 << ".gather::<" << m(o.getIndexed()) << ", " << m(o.getPayload()) << ">().by_byte_offsets::<"
+                 << m(o.getOffsets().getType().getElement()) << ">(&" << nameOf(o.getOffsets())
+                 << ").to_dm(&mut device.tdma);\n";
+              return success();
+            })
+            .Case([&](DmToHbmViewOp o) -> LogicalResult {
+              FailureOr<std::string> v = view(o.getDest());
+              if (failed(v))
+                return failure();
+              os << "    " << nameOf(o.getSource()) << ".view().to_hbm_view(&mut device.tdma, " << *v << ");\n";
+              return success();
+            })
+            .Case([&](HbmToHbmViewOp o) -> LogicalResult {
+              FailureOr<std::string> src = view(o.getSource()), dst = view(o.getDest());
+              if (failed(src) || failed(dst))
+                return failure();
+              os << "    " << *src << ".to_hbm_view(&mut device.tdma, " << *dst << ");\n";
+              return success();
+            })
             .Default([&](Operation *op) -> LogicalResult {
-              if (op->getNumResults() == 1 && isa<StreamType>(op->getResult(0).getType()))
-                return success(); // printed as part of its chain
+              if (op->getNumResults() == 1 && isa<StreamType, HbmViewType>(op->getResult(0).getType()))
+                return success(); // printed as part of its chain or its use
               return op->emitOpError("has no Rust statement form");
             });
     if (failed(ok))
@@ -412,12 +472,14 @@ FailureOr<std::string> mlir::furiosa::foptSignature(ModuleOp module) {
   if (kernels.size() != 1)
     return module.emitError("expected one fopt kernel per module, found ") << kernels.size();
   func::FuncOp kernel = kernels.front();
-  llvm::json::Array inputs, outputs;
+  llvm::json::Array inputs, outputs, inouts;
   for (unsigned i = 0; i < kernel.getNumArguments(); ++i) {
     auto arg = kernel.getArgAttrOfType<IntegerAttr>(i, "fopt.arg");
     if (!arg)
       return kernel.emitError("parameter ") << i << " has no fopt.arg";
     inputs.push_back(arg.getInt());
+    if (kernel.getArgAttr(i, kInoutAttr))
+      inouts.push_back(i);
   }
   for (unsigned i = 0; i < kernel.getNumResults(); ++i) {
     auto arg = kernel.getResultAttrOfType<IntegerAttr>(i, "fopt.arg");
@@ -430,6 +492,7 @@ FailureOr<std::string> mlir::furiosa::foptSignature(ModuleOp module) {
                          {"chip", kernel->getAttrOfType<IntegerAttr>(kChipAttr).getInt()},
                          {"pe", pe ? pe.getInt() : 8},
                          {"inputs", std::move(inputs)},
+                         {"inouts", std::move(inouts)},
                          {"outputs", std::move(outputs)}};
   std::string text;
   llvm::raw_string_ostream os(text);

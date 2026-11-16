@@ -623,3 +623,89 @@ LogicalResult CommitOp::verify() {
     return emitOpError("commit keeps the stream's element type, chip, cluster and slice");
   return success();
 }
+
+/// A view is printed inline at its one use.
+static LogicalResult verifyViewUse(Operation *op) {
+  if (!op->getResult(0).hasOneUse())
+    return op->emitOpError("a view must have exactly one use (it prints inline there)");
+  return success();
+}
+
+LogicalResult ViewOp::verify() {
+  auto src = getSource().getType();
+  auto out = getResult().getType();
+  if (src.getElementType() != out.getElementType() || src.getChip() != out.getChip() ||
+      src.getElement() != out.getElement())
+    return emitOpError("a whole view keeps the tensor's type");
+  return verifyViewUse(*this);
+}
+
+LogicalResult TileOp::verify() {
+  auto src = getSource().getType();
+  auto out = getResult().getType();
+  if (src.getElementType() != out.getElementType() || src.getChip() != out.getChip() ||
+      src.getIsMut() != out.getIsMut())
+    return emitOpError("a tile keeps the view's element type, chip and mutability");
+  if (getLen() < 1 || getStart() < 0)
+    return emitOpError("a tile needs a positive length and a non-negative start");
+  return verifyViewUse(*this);
+}
+
+LogicalResult PadOp::verify() {
+  auto src = getSource().getType();
+  auto out = getResult().getType();
+  if (src.getElementType() != out.getElementType() || src.getChip() != out.getChip() ||
+      src.getIsMut() != out.getIsMut())
+    return emitOpError("a pad keeps the view's element type, chip and mutability");
+  if (out.getElement().size() < src.getElement().size())
+    return emitOpError("a pad cannot narrow the view");
+  return verifyViewUse(*this);
+}
+
+LogicalResult ViewToDmOp::verify() {
+  auto src = getSource().getType();
+  auto dst = getResult().getType();
+  if (src.getElementType() != dst.getElementType() || src.getChip() != dst.getChip())
+    return emitOpError("to_dm keeps the element type and the chip mapping");
+  return verifyPlacement(*this, dst.getCluster(), dst.getSlice());
+}
+
+LogicalResult DmToHbmViewOp::verify() {
+  auto dst = getDest().getType();
+  if (getSource().getType().getElementType() != dst.getElementType())
+    return emitOpError("changes the element type");
+  if (!dst.getIsMut())
+    return emitOpError("writes through a mutable view");
+  return success();
+}
+
+LogicalResult HbmToHbmViewOp::verify() {
+  auto src = getSource().getType();
+  auto dst = getDest().getType();
+  if (src.getElementType() != dst.getElementType())
+    return emitOpError("changes the element type");
+  if (src.getIsMut() || !dst.getIsMut())
+    return emitOpError("copies a view into a mutable view");
+  return success();
+}
+
+LogicalResult GatherOp::verify() {
+  auto table = getTable().getType();
+  auto offsets = getOffsets().getType();
+  if (!offsets.getElementType().isInteger(32))
+    return emitOpError("byte offsets are i32");
+  if (table.getElementType() != getResult().getType().getElementType())
+    return emitOpError("changes the element type");
+  return verifyPlacement(*this, getResult().getType().getCluster(), getResult().getType().getSlice());
+}
+
+static constexpr StringRef kFxpOps[] = {"AddFxp",  "AddFxpSat",       "SubFxp",         "SubFxpSat", "LeftShift",
+                                        "LeftShiftSat", "MulFxp", "MulInt", "LogicRightShift", "ArithRightShift"};
+
+LogicalResult VectorFxpOp::verify() {
+  if (failed(verifyOpName(*this, getOp(), kFxpOps)))
+    return failure();
+  if (!getInput().getType().getElementType().isInteger(32))
+    return emitOpError("fixed-point ops take i32 streams");
+  return verifyVectorStage(*this, getInput().getType(), getResult().getType());
+}

@@ -28,6 +28,7 @@ constexpr llvm::StringLiteral kChipAttr = "fopt.chip";   // #[device(chip = N)]
 constexpr llvm::StringLiteral kPeAttr = "fopt.pe";       // #[device(pe = N)]
 constexpr llvm::StringLiteral kAxesAttr = "fopt.axes";   // axes![NAME = SIZE, ...], in declaration order
 constexpr llvm::StringLiteral kNameAttr = "fopt.name";   // Rust name of an argument or value
+constexpr llvm::StringLiteral kInoutAttr = "fopt.inout"; // a parameter the kernel writes in place (&mut)
 
 /// Bytes per element of a furiosa-opt scalar type.
 int64_t elementBytes(Type type);

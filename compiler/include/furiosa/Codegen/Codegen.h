@@ -19,7 +19,8 @@ std::unique_ptr<Pass> createLinalgToFoptPass();
 LogicalResult translateFoptToRust(ModuleOp module, llvm::raw_ostream &os);
 
 /// The fopt kernel's interface as JSON, for the crate's host code: {"kernel", "chip", "pe", "inputs":
-/// [pointer-arg index per parameter], "outputs": [pointer-arg index per result]}.
+/// [pointer-arg index per parameter], "inouts": [parameters written in place, as &mut], "outputs":
+/// [pointer-arg index per result]}.
 FailureOr<std::string> foptSignature(ModuleOp module);
 
 /// The dialects the codegen passes read and create.

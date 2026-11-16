@@ -35,7 +35,14 @@ unsigned KernelBuilder::input(int64_t ptrArg, Type elementType, fopt::MapAttr el
   assert(!kernel && "inputs come before beginBody");
   inputTypes.push_back(hbmType(elementType, element));
   inputArgs.push_back(ptrArg);
+  inoutParams.push_back(false);
   return inputTypes.size() - 1;
+}
+
+unsigned KernelBuilder::inout(int64_t ptrArg, Type elementType, fopt::MapAttr element) {
+  unsigned i = input(ptrArg, elementType, element);
+  inoutParams[i] = true;
+  return i;
 }
 
 void KernelBuilder::output(int64_t ptrArg, Type elementType, fopt::MapAttr element) {
@@ -53,6 +60,8 @@ void KernelBuilder::beginBody() {
   for (auto [i, arg] : llvm::enumerate(inputArgs)) {
     kernel.setArgAttr(i, fopt::kNameAttr, b.getStringAttr(raised.argNames[arg]));
     kernel.setArgAttr(i, "fopt.arg", b.getI64IntegerAttr(arg));
+    if (inoutParams[i])
+      kernel.setArgAttr(i, fopt::kInoutAttr, b.getUnitAttr());
   }
   for (auto [i, arg] : llvm::enumerate(outputArgs)) {
     kernel.setResultAttr(i, fopt::kNameAttr, b.getStringAttr(raised.argNames[arg]));
@@ -107,7 +116,7 @@ struct LinalgToFoptPass : PassWrapper<LinalgToFoptPass, OperationPass<ModuleOp>>
   void getDependentDialects(DialectRegistry &registry) const override { registerCodegenDialects(registry); }
 
   void runOnOperation() override {
-    static const OpClass classes[] = {elementwiseClass(), contractionClass(), rowwiseClass()};
+    static const OpClass classes[] = {gatherClass(), elementwiseClass(), contractionClass(), rowwiseClass()};
     SmallVector<func::FuncOp> funcs(getOperation().getOps<func::FuncOp>());
     for (func::FuncOp func : funcs) {
       if (func->hasAttr(fopt::kChipAttr))
