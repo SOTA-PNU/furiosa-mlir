@@ -32,7 +32,11 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
 
+#include "llvm/ADT/MapVector.h"
+
 #include <functional>
+#include <map>
+#include <set>
 #include <optional>
 
 namespace mlir::furiosa {
@@ -127,6 +131,158 @@ std::optional<AffineExpr> toAffine(Value v, MLIRContext *ctx) {
   return std::nullopt;
 }
 
+/// An affine expression as coefficients of atoms (dims, digits, other non-linear sub-expressions) plus a constant.
+struct Form {
+  llvm::MapVector<AffineExpr, int64_t> terms;
+  int64_t constant = 0;
+
+  void add(const Form &o, int64_t scale) {
+    for (auto [atom, c] : o.terms)
+      terms[atom] += c * scale;
+    constant += o.constant * scale;
+  }
+  bool operator==(const Form &o) const {
+    auto live = [](const Form &f) {
+      llvm::DenseMap<AffineExpr, int64_t> m;
+      for (auto [a, c] : f.terms)
+        if (c)
+          m[a] = c;
+      return m;
+    };
+    return constant == o.constant && live(*this) == live(o);
+  }
+  AffineExpr expr(MLIRContext *ctx) const {
+    AffineExpr e = getAffineConstantExpr(constant, ctx);
+    for (auto [atom, c] : terms)
+      if (c)
+        e = e + atom * c;
+    return e;
+  }
+};
+
+/// The dims an expression mentions.
+std::set<unsigned> dimsOf(AffineExpr e) {
+  std::set<unsigned> out;
+  e.walk([&](AffineExpr x) {
+    if (auto d = dyn_cast<AffineDimExpr>(x))
+      out.insert(d.getPosition());
+  });
+  return out;
+}
+
+/// The divisors each dim is divided or reduced by in `exprs` (x floordiv c, x mod c with x mentioning that dim
+/// alone), when they nest.
+std::map<unsigned, SmallVector<int64_t>> divisors(ArrayRef<AffineExpr> exprs) {
+  std::map<unsigned, std::set<int64_t>> found;
+  for (AffineExpr e : exprs)
+    e.walk([&](AffineExpr x) {
+      if (x.getKind() != AffineExprKind::FloorDiv && x.getKind() != AffineExprKind::Mod)
+        return;
+      auto bin = cast<AffineBinaryOpExpr>(x);
+      auto c = dyn_cast<AffineConstantExpr>(bin.getRHS());
+      std::set<unsigned> dims = dimsOf(bin.getLHS());
+      if (c && c.getValue() > 1 && dims.size() == 1)
+        found[*dims.begin()].insert(c.getValue());
+    });
+  std::map<unsigned, SmallVector<int64_t>> out;
+  for (auto &[d, cs] : found) {
+    SmallVector<int64_t> chain(cs.begin(), cs.end());
+    bool nests = true;
+    for (unsigned i = 1; i < chain.size(); ++i)
+      nests &= chain[i] % chain[i - 1] == 0;
+    if (nests)
+      out[d] = chain;
+  }
+  return out;
+}
+
+/// `e` as a Form whose atoms are mixed-radix digits for every dim in `digits`: with divisors c1 < ... < cK,
+/// digit 0 = d mod c1, digit k = (d floordiv ck) mod (ck+1 / ck), digit K = d floordiv cK, so d is the sum of its
+/// digits times their place values. A floordiv or mod by a divisor of a sum of one dim's digits at their place
+/// values (d itself, d mod c, d floordiv c, ...) keeps the digits above or below that place.
+Form linearForm(AffineExpr e, const std::map<unsigned, SmallVector<int64_t>> &digits) {
+  MLIRContext *ctx = e.getContext();
+  llvm::DenseMap<AffineExpr, std::pair<unsigned, int64_t>> place; // digit -> (dim, place value)
+  std::map<unsigned, SmallVector<std::pair<AffineExpr, int64_t>>> table;
+  for (auto &[dim, cs] : digits) {
+    AffineExpr d = getAffineDimExpr(dim, ctx);
+    for (unsigned k = 0; k <= cs.size(); ++k) {
+      int64_t value = k == 0 ? 1 : cs[k - 1];
+      AffineExpr digit = k == 0 ? d % cs[0]
+                         : k == cs.size() ? d.floorDiv(cs[k - 1])
+                                          : d.floorDiv(cs[k - 1]) % (cs[k] / cs[k - 1]);
+      table[dim].push_back({digit, value});
+      place[digit] = {dim, value};
+    }
+  }
+  std::function<Form(AffineExpr)> walk = [&](AffineExpr x) -> Form {
+    Form f;
+    if (auto c = dyn_cast<AffineConstantExpr>(x)) {
+      f.constant = c.getValue();
+      return f;
+    }
+    if (auto d = dyn_cast<AffineDimExpr>(x)) {
+      auto it = table.find(d.getPosition());
+      if (it == table.end()) {
+        f.terms[x] = 1;
+        return f;
+      }
+      for (auto [digit, value] : it->second)
+        f.terms[digit] += value;
+      return f;
+    }
+    auto bin = cast<AffineBinaryOpExpr>(x);
+    if (x.getKind() == AffineExprKind::Add) {
+      f = walk(bin.getLHS());
+      f.add(walk(bin.getRHS()), 1);
+      return f;
+    }
+    if (x.getKind() == AffineExprKind::Mul) {
+      if (auto c = dyn_cast<AffineConstantExpr>(bin.getRHS())) {
+        f.add(walk(bin.getLHS()), c.getValue());
+        return f;
+      }
+      if (auto c = dyn_cast<AffineConstantExpr>(bin.getLHS())) {
+        f.add(walk(bin.getRHS()), c.getValue());
+        return f;
+      }
+    }
+    if (x.getKind() == AffineExprKind::FloorDiv || x.getKind() == AffineExprKind::Mod) {
+      auto c = dyn_cast<AffineConstantExpr>(bin.getRHS());
+      Form inner = walk(bin.getLHS());
+      // The inner form must be digits of one dim at exactly their place values, and c one of its divisors.
+      std::optional<unsigned> dim;
+      bool digitsOnly = c && inner.constant == 0;
+      for (auto [atom, coeff] : inner.terms) {
+        if (!coeff)
+          continue;
+        auto it = place.find(atom);
+        if (it == place.end() || it->second.second != coeff || (dim && *dim != it->second.first)) {
+          digitsOnly = false;
+          break;
+        }
+        dim = it->second.first;
+      }
+      if (digitsOnly && dim && llvm::is_contained(digits.at(*dim), c.getValue())) {
+        for (auto [atom, coeff] : inner.terms) {
+          if (!coeff)
+            continue;
+          int64_t value = place[atom].second;
+          bool above = value >= c.getValue();
+          if (x.getKind() == AffineExprKind::FloorDiv && above)
+            f.terms[atom] += value / c.getValue();
+          if (x.getKind() == AffineExprKind::Mod && !above)
+            f.terms[atom] += value;
+        }
+        return f;
+      }
+    }
+    f.terms[x] = 1;
+    return f;
+  };
+  return walk(e);
+}
+
 /// Coefficients of a linear expr's terms, with the non-linear sub-exprs as atoms.
 void terms(AffineExpr e, int64_t scale, SmallVectorImpl<std::pair<AffineExpr, int64_t>> &out, int64_t &constant) {
   if (auto c = dyn_cast<AffineConstantExpr>(e)) {
@@ -149,32 +305,53 @@ void terms(AffineExpr e, int64_t scale, SmallVectorImpl<std::pair<AffineExpr, in
   out.push_back({e, scale});
 }
 
-/// Splits a flat address over a row-major shape: each term goes to the dim with the largest stride dividing
-/// its coefficient; the constant is split greedily from the outermost dim (truncating toward zero, so small
-/// negative offsets such as padding stay in their own dim).
-SmallVector<AffineExpr> split(AffineExpr flat, ArrayRef<int64_t> shape, unsigned numDims) {
-  MLIRContext *ctx = flat.getContext();
+/// Splits a flat address over a row-major shape: each term goes to a dim whose stride is the largest one
+/// dividing its coefficient (several dims share that stride around size-1 dims: every choice is returned); the
+/// constant is split greedily from the outermost dim (truncating toward zero, so small negative offsets such as
+/// padding stay in their own dim).
+SmallVector<SmallVector<AffineExpr>> splits(const Form &flat, ArrayRef<int64_t> shape, MLIRContext *ctx) {
   SmallVector<int64_t> strides(shape.size(), 1);
   for (int i = (int)shape.size() - 2; i >= 0; --i)
     strides[i] = strides[i + 1] * shape[i + 1];
   SmallVector<std::pair<AffineExpr, int64_t>> ts;
-  int64_t constant = 0;
-  terms(flat, 1, ts, constant);
-  SmallVector<AffineExpr> idx(shape.size(), getAffineConstantExpr(0, ctx));
+  for (auto [atom, c] : flat.terms)
+    if (c)
+      ts.push_back({atom, c});
+  int64_t constant = flat.constant;
+  // The candidate dims of each term.
+  SmallVector<SmallVector<unsigned>> choices;
   for (auto [atom, coeff] : ts) {
     unsigned j = 0;
     while (j + 1 < shape.size() && coeff % strides[j] != 0)
       ++j;
-    idx[j] = idx[j] + atom * (coeff / strides[j]);
+    SmallVector<unsigned> c{j};
+    for (unsigned k = j + 1; k < shape.size() && strides[k] == strides[j]; ++k)
+      c.push_back(k);
+    choices.push_back(c);
   }
-  for (unsigned j = 0; j < shape.size(); ++j) {
-    int64_t q = constant / strides[j]; // toward zero
-    idx[j] = idx[j] + q;
-    constant -= q * strides[j];
+  SmallVector<SmallVector<AffineExpr>> out;
+  SmallVector<unsigned> pick(ts.size(), 0);
+  while (out.size() < 16) {
+    SmallVector<AffineExpr> idx(shape.size(), getAffineConstantExpr(0, ctx));
+    for (auto [t, choice] : llvm::enumerate(pick)) {
+      unsigned j = choices[t][choice];
+      idx[j] = idx[j] + ts[t].first * (ts[t].second / strides[j]);
+    }
+    int64_t rest = constant;
+    for (unsigned j = 0; j < shape.size(); ++j) {
+      int64_t q = rest / strides[j]; // toward zero
+      idx[j] = idx[j] + q;
+      rest -= q * strides[j];
+    }
+    out.push_back(idx);
+    // Next combination.
+    unsigned t = 0;
+    while (t < pick.size() && ++pick[t] == choices[t].size())
+      pick[t++] = 0;
+    if (t == pick.size())
+      break;
   }
-  for (AffineExpr &e : idx)
-    e = simplifyAffineExpr(e, numDims, 0);
-  return idx;
+  return out;
 }
 
 /// The conditions of a mask built from `cmpi sge, x, 0` and `andi`, or nullopt.
@@ -233,90 +410,92 @@ std::optional<Promotion> plan(tensor::ExtractOp extract, linalg::GenericOp gener
       }
     }
 
-  // The indices over the source's own shape, unfolding a full collapse to 1-D.
-  SmallVector<AffineExpr> idx;
-  Value base = source;
+  // Candidate index lists over the source's own shape (unfolding a full collapse to 1-D) or the flat source.
+  SmallVector<std::pair<Value, SmallVector<AffineExpr>>> candidates;
+  std::map<unsigned, SmallVector<int64_t>> digits;
   if (address) {
     auto flat = toAffine(address, ctx);
     if (!flat)
       return std::nullopt;
+    SmallVector<AffineExpr> all{*flat};
+    if (conds)
+      all.append(conds->begin(), conds->end());
+    digits = divisors(all);
+    Form form = linearForm(*flat, digits);
     auto collapse = source.getDefiningOp<tensor::CollapseShapeOp>();
     if (collapse && cast<RankedTensorType>(collapse.getSrc().getType()).getRank() > 1) {
       auto shape = cast<RankedTensorType>(collapse.getSrc().getType()).getShape();
-      SmallVector<AffineExpr> multi = split(*flat, shape, nd);
-      bool fits = true;
-      for (auto [e, s] : llvm::zip(multi, shape)) {
-        Range r = bounds(e, ranges);
-        fits &= select ? true : (r.lo >= 0 && r.hi < s);
-      }
-      if (fits) {
-        idx = multi;
-        base = collapse.getSrc();
-      }
+      for (SmallVector<AffineExpr> &multi : splits(form, shape, ctx))
+        candidates.push_back({collapse.getSrc(), multi});
     }
-    if (idx.empty())
-      idx.push_back(*flat);
+    candidates.push_back({source, {*flat}});
   } else {
+    SmallVector<AffineExpr> idx;
     for (Value i : extract.getIndices()) {
       auto e = toAffine(i, ctx);
       if (!e)
         return std::nullopt;
       idx.push_back(*e);
     }
+    candidates.push_back({source, idx});
   }
-  auto baseType = cast<RankedTensorType>(base.getType());
 
-  if (!select) {
-    for (auto [e, s] : llvm::zip(idx, baseType.getShape())) {
+  for (auto &[base, idx] : candidates) {
+    auto baseType = cast<RankedTensorType>(base.getType());
+    if (!select) {
+      bool fits = true;
+      for (auto [e, s] : llvm::zip(idx, baseType.getShape())) {
+        Range r = bounds(e, ranges);
+        fits &= r.lo >= 0 && r.hi < s;
+      }
+      if (fits)
+        return Promotion{extract, base, AffineMap::get(nd, 0, idx, ctx)};
+      continue;
+    }
+
+    // The mask must say exactly "every index inside its dim": each live condition is one of the bounds the
+    // indices can break, and each such bound is in the mask.
+    SmallVector<Form> needed;
+    SmallVector<int64_t> low(idx.size(), 0), high(idx.size(), 0);
+    for (auto [j, e] : llvm::enumerate(idx)) {
       Range r = bounds(e, ranges);
-      if (r.lo < 0 || r.hi >= s)
-        return std::nullopt; // a clamp or wrap we did not see; leave the read
+      int64_t s = baseType.getDimSize(j);
+      if (r.lo < 0) {
+        needed.push_back(linearForm(e, digits));
+        low[j] = -r.lo;
+      }
+      if (r.hi >= s) {
+        needed.push_back(linearForm(getAffineConstantExpr(s - 1, ctx) - e, digits));
+        high[j] = r.hi - (s - 1);
+      }
     }
-    return Promotion{extract, base, AffineMap::get(nd, 0, idx, ctx)};
-  }
+    SmallVector<Form> live;
+    for (AffineExpr c : *conds) {
+      Form f = linearForm(c, digits);
+      if (bounds(f.expr(ctx), ranges).lo < 0) // judged on digits: interval bounds of d - c*(d floordiv c) are loose
+        live.push_back(f);
+    }
+    if (!llvm::all_of(live, [&](const Form &c) { return llvm::is_contained(needed, c); }) ||
+        !llvm::all_of(needed, [&](const Form &n) { return llvm::is_contained(live, n); }))
+      continue;
 
-  // The mask must say exactly "every index inside its dim": each live condition is one of the bounds the
-  // indices can break, and each such bound is in the mask.
-  SmallVector<AffineExpr> needed;
-  SmallVector<int64_t> low(idx.size(), 0), high(idx.size(), 0);
-  for (auto [j, e] : llvm::enumerate(idx)) {
-    Range r = bounds(e, ranges);
-    int64_t s = baseType.getDimSize(j);
-    if (r.lo < 0) {
-      needed.push_back(simplifyAffineExpr(e, nd, 0));
-      low[j] = -r.lo;
+    Value padded = base;
+    if (!needed.empty()) {
+      OpBuilder::InsertionGuard guard(b);
+      b.setInsertionPoint(generic);
+      SmallVector<int64_t> shape(baseType.getShape());
+      for (unsigned j = 0; j < shape.size(); ++j)
+        shape[j] += low[j] + high[j];
+      Value pad = arith::ConstantOp::create(b, generic.getLoc(), cast<TypedAttr>(other));
+      padded = tensor::PadOp::create(b, generic.getLoc(), RankedTensorType::get(shape, baseType.getElementType()),
+                                     base, getAsIndexOpFoldResult(ctx, low), getAsIndexOpFoldResult(ctx, high), pad);
     }
-    if (r.hi >= s) {
-      needed.push_back(simplifyAffineExpr(getAffineConstantExpr(s - 1, ctx) - e, nd, 0));
-      high[j] = r.hi - (s - 1);
-    }
+    SmallVector<AffineExpr> shifted;
+    for (auto [j, e] : llvm::enumerate(idx))
+      shifted.push_back(e + low[j]);
+    return Promotion{select, padded, AffineMap::get(nd, 0, shifted, ctx)};
   }
-  SmallVector<AffineExpr> live;
-  for (AffineExpr c : *conds)
-    if (bounds(c, ranges).lo < 0)
-      live.push_back(simplifyAffineExpr(c, nd, 0));
-  for (AffineExpr c : live)
-    if (!llvm::is_contained(needed, c))
-      return std::nullopt;
-  for (AffineExpr n : needed)
-    if (!llvm::is_contained(live, n))
-      return std::nullopt;
-
-  Value padded = base;
-  if (!needed.empty()) {
-    OpBuilder::InsertionGuard guard(b);
-    b.setInsertionPoint(generic);
-    SmallVector<int64_t> shape(baseType.getShape());
-    for (unsigned j = 0; j < shape.size(); ++j)
-      shape[j] += low[j] + high[j];
-    Value pad = arith::ConstantOp::create(b, generic.getLoc(), cast<TypedAttr>(other));
-    padded = tensor::PadOp::create(b, generic.getLoc(), RankedTensorType::get(shape, baseType.getElementType()), base,
-                                   getAsIndexOpFoldResult(ctx, low), getAsIndexOpFoldResult(ctx, high), pad);
-  }
-  SmallVector<AffineExpr> shifted;
-  for (auto [j, e] : llvm::enumerate(idx))
-    shifted.push_back(simplifyAffineExpr(e + low[j], nd, 0));
-  return Promotion{select, padded, AffineMap::get(nd, 0, shifted, ctx)};
+  return std::nullopt;
 }
 
 /// Rebuilds `generic` with one more input per promotion.
