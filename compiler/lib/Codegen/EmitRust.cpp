@@ -109,6 +109,15 @@ private:
 
   std::string nameOf(Value v) { return names.lookup(v); }
 
+  /// An ALU op's second operand: an immediate, `&vrf`, or `Stash`.
+  template <typename Op> std::string operand(Op o) {
+    if (o.getStash())
+      return "Stash";
+    if (Value v = o.getVrf())
+      return "&" + nameOf(v);
+    return rustF32(o.getImm()->convertToFloat());
+  }
+
   /// The builder chain that ends in `stream`: device.<ctx>.begin(..).<stage>()...
   FailureOr<std::string> chain(Value stream);
 };
@@ -120,9 +129,9 @@ FailureOr<std::string> Emitter::chain(Value stream) {
     stages.push_back(op);
     if (isa<BeginOp, BeginInterleavedOp>(op))
       break;
-    // A chain link reads its stream as the first operand (contract_outer also reads a TRF).
+    // A chain link reads its stream as the first operand; any other operand (a TRF, a VRF) is a named value.
     if (op->getNumOperands() < 1 || !isa<StreamType>(op->getOperand(0).getType()) ||
-        (op->getNumOperands() != 1 && !isa<ContractOuterOp>(op)))
+        llvm::any_of(op->getOperands().drop_front(), [](Value v) { return isa<StreamType>(v.getType()); }))
       return op->emitOpError("cannot be printed as a builder chain link");
     v = op->getOperand(0);
   }
@@ -198,13 +207,24 @@ FailureOr<std::string> Emitter::chain(Value stream) {
               return success();
             })
             .Case([&](VectorClipOp o) {
-              out << "\n.vector_clip(ClipBinaryOpF32::" << o.getOp() << ", "
-                  << rustF32(o.getImm().convertToFloat()) << ")";
+              out << "\n.vector_clip(ClipBinaryOpF32::" << o.getOp() << ", " << operand(o) << ")";
               return success();
             })
             .Case([&](VectorFpBinaryOp o) {
-              out << "\n.vector_fp_binary(FpBinaryOp::" << o.getOp() << ", " << rustF32(o.getImm().convertToFloat())
-                  << ")";
+              out << "\n.vector_fp_binary(FpBinaryOp::" << o.getOp() << ", " << operand(o) << ")";
+              return success();
+            })
+            .Case([&](VectorFpDivOp o) {
+              out << "\n.vector_fp_div(" << operand(o) << ")";
+              return success();
+            })
+            .Case([&](VectorStashOp) {
+              out << "\n.vector_stash()";
+              return success();
+            })
+            .Case([&](VectorIntraSliceReduceOp o) {
+              out << "\n.vector_intra_slice_reduce::<" << o.getAxis() << ", " << tp() << ">(IntraSliceReduceOpF32::"
+                  << o.getOp() << ")";
               return success();
             })
             .Case([&](VectorFinalOp) {
@@ -324,6 +344,14 @@ LogicalResult Emitter::emit(func::FuncOp kernel) {
                 names[o] = fresh(nameOf(o.getSource()) + "_hbm");
                 os << "    let " << names[o] << ": " << rustType(o.getType()) << " = " << expr << ";\n";
               }
+              return success();
+            })
+            .Case([&](ToVrfOp o) -> LogicalResult {
+              FailureOr<std::string> c = chain(o.getInput());
+              if (failed(c))
+                return o.emitOpError("does not end a builder chain from a begin");
+              names[o] = fresh("vrf" + std::to_string(names.size()));
+              os << "    let " << names[o] << ": " << rustType(o.getType()) << " = " << *c << "\n.to_vrf();\n";
               return success();
             })
             .Case([&](ToTrfOp o) -> LogicalResult {

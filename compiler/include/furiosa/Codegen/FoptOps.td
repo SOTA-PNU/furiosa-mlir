@@ -221,9 +221,51 @@ class Fopt_VectorOp<string mnemonic, string summaryText, dag extra> : Fopt_Stage
 def Fopt_VectorClipZipOp : Fopt_VectorOp<"vector_clip_zip", ".vector_clip_zip(ClipBinaryOpF32::<op>)", (ins)>;
 def Fopt_VectorFpZipOp : Fopt_VectorOp<"vector_fp_zip", ".vector_fp_zip(FpBinaryOp::<op>)", (ins)>;
 def Fopt_VectorFpUnaryOp : Fopt_VectorOp<"vector_fp_unary", ".vector_fp_unary(FpUnaryOp::<op>)", (ins)>;
-def Fopt_VectorClipOp : Fopt_VectorOp<"vector_clip", ".vector_clip(ClipBinaryOpF32::<op>, imm)", (ins F32Attr:$imm)>;
-def Fopt_VectorFpBinaryOp : Fopt_VectorOp<"vector_fp_binary", ".vector_fp_binary(FpBinaryOp::<op>, imm)",
-                                          (ins F32Attr:$imm)>;
+// An ALU op whose second operand is exactly one of: an immediate (`imm`), a VRF tensor (`vrf`), or the stashed
+// stream (`stash`).
+class Fopt_VectorOperandOp<string mnemonic, string summaryText, dag opArgs> : Fopt_StageOp<mnemonic> {
+  let summary = summaryText;
+  let arguments = !con((ins Fopt_Stream:$input), opArgs,
+                       (ins OptionalAttr<F32Attr>:$imm, Optional<Fopt_VrfTensor>:$vrf, UnitAttr:$stash));
+}
+
+def Fopt_VectorClipOp : Fopt_VectorOperandOp<"vector_clip", ".vector_clip(ClipBinaryOpF32::<op>, operand)",
+                                             (ins StrAttr:$op)> {
+  let assemblyFormat = [{
+    $op $input (`vrf` $vrf^ `:` qualified(type($vrf)))? attr-dict `:` qualified(type($input)) `->`
+    qualified(type($result))
+  }];
+}
+def Fopt_VectorFpBinaryOp : Fopt_VectorOperandOp<"vector_fp_binary", ".vector_fp_binary(FpBinaryOp::<op>, operand)",
+                                                 (ins StrAttr:$op)> {
+  let assemblyFormat = [{
+    $op $input (`vrf` $vrf^ `:` qualified(type($vrf)))? attr-dict `:` qualified(type($input)) `->`
+    qualified(type($result))
+  }];
+}
+def Fopt_VectorFpDivOp : Fopt_VectorOperandOp<"vector_fp_div", ".vector_fp_div(operand)", (ins)> {
+  let assemblyFormat = [{
+    $input (`vrf` $vrf^ `:` qualified(type($vrf)))? attr-dict `:` qualified(type($input)) `->` qualified(type($result))
+  }];
+}
+
+def Fopt_VectorStashOp : Fopt_UnaryStageOp<"vector_stash", ".vector_stash()">;
+
+def Fopt_VectorIntraSliceReduceOp : Fopt_StageOp<"vector_intra_slice_reduce"> {
+  let summary = ".vector_intra_slice_reduce::<Axis, Time, Packet>(IntraSliceReduceOpF32::<op>)";
+  let arguments = (ins Fopt_Stream:$input, StrAttr:$op, StrAttr:$axis);
+  let assemblyFormat = [{
+    $op $input `axis` $axis attr-dict `:` qualified(type($input)) `->` qualified(type($result))
+  }];
+}
+
+def Fopt_ToVrfOp : Fopt_Op<"to_vrf", [Pure]> {
+  let summary = ".to_vrf() (a sub-context pass)";
+  let arguments = (ins Fopt_Stream:$input);
+  let results = (outs Fopt_VrfTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` qualified(type($input)) `->` qualified(type($result))";
+  let hasVerifier = 1;
+}
 
 // Contraction (main context): the TRF operand is loaded by a sub-context pass ending in to_trf.
 

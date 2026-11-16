@@ -500,10 +500,49 @@ LogicalResult VectorClipZipOp::verify() {
   return verifyVectorStage(*this, getInput().getType(), getResult().getType());
 }
 
+/// An ALU op's second operand is exactly one of an immediate, a VRF tensor sharing the stream's placement, or
+/// the stash.
+template <typename Op> static LogicalResult verifyOperand(Op op) {
+  int forms = int(bool(op.getImm())) + int(bool(op.getVrf())) + int(op.getStash());
+  if (forms != 1)
+    return op.emitOpError("takes exactly one operand: an immediate, a VRF tensor or the stash");
+  if (Value vrf = op.getVrf()) {
+    auto v = cast<VrfTensorType>(vrf.getType());
+    auto in = op.getInput().getType();
+    if (v.getChip() != in.getChip() || v.getCluster() != in.getCluster() || v.getSlice() != in.getSlice())
+      return op.emitOpError("a VRF operand shares the stream's chip, cluster and slice");
+  }
+  return success();
+}
+
 LogicalResult VectorClipOp::verify() {
-  if (failed(verifyOpName(*this, getOp(), kClipOps)))
+  if (failed(verifyOpName(*this, getOp(), kClipOps)) || failed(verifyOperand(*this)))
     return failure();
   return verifyVectorStage(*this, getInput().getType(), getResult().getType());
+}
+
+LogicalResult VectorFpDivOp::verify() {
+  if (failed(verifyOperand(*this)))
+    return failure();
+  return verifyVectorStage(*this, getInput().getType(), getResult().getType());
+}
+
+LogicalResult VectorStashOp::verify() { return verifyVectorStage(*this, getInput().getType(), getResult().getType()); }
+
+LogicalResult VectorIntraSliceReduceOp::verify() {
+  if (failed(verifyOpName(*this, getOp(), {"Add", "Max", "Min"})))
+    return failure();
+  if (failed(verifySamePlacement(*this, getInput().getType(), getResult().getType())))
+    return failure();
+  return verifyStreamUse(*this);
+}
+
+LogicalResult ToVrfOp::verify() {
+  auto in = getInput().getType();
+  auto out = getResult().getType();
+  if (in.getChip() != out.getChip() || in.getCluster() != out.getCluster() || in.getSlice() != out.getSlice())
+    return emitOpError("the VRF keeps the stream's chip, cluster and slice placement");
+  return success();
 }
 
 LogicalResult VectorFpZipOp::verify() {
@@ -513,7 +552,7 @@ LogicalResult VectorFpZipOp::verify() {
 }
 
 LogicalResult VectorFpBinaryOp::verify() {
-  if (failed(verifyOpName(*this, getOp(), kFpBinaryOps)))
+  if (failed(verifyOpName(*this, getOp(), kFpBinaryOps)) || failed(verifyOperand(*this)))
     return failure();
   return verifyVectorStage(*this, getInput().getType(), getResult().getType());
 }

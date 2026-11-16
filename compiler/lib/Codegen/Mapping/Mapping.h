@@ -83,6 +83,8 @@ struct OpClass {
 OpClass elementwiseClass();
 /// x(m, k) . w(n, k) over bf16 with fp32 accumulation, then an optional cast (Mapping/Contraction.cpp).
 OpClass contractionClass();
+/// Row-wise elementwise generics and row reductions over [rows, columns] (Mapping/Rowwise.cpp).
+OpClass rowwiseClass();
 
 } // namespace mlir::furiosa::mapping
 

@@ -107,7 +107,7 @@ struct LinalgToFoptPass : PassWrapper<LinalgToFoptPass, OperationPass<ModuleOp>>
   void getDependentDialects(DialectRegistry &registry) const override { registerCodegenDialects(registry); }
 
   void runOnOperation() override {
-    static const OpClass classes[] = {elementwiseClass(), contractionClass()};
+    static const OpClass classes[] = {elementwiseClass(), contractionClass(), rowwiseClass()};
     SmallVector<func::FuncOp> funcs(getOperation().getOps<func::FuncOp>());
     for (func::FuncOp func : funcs) {
       if (func->hasAttr(fopt::kChipAttr))
@@ -126,7 +126,7 @@ struct LinalgToFoptPass : PassWrapper<LinalgToFoptPass, OperationPass<ModuleOp>>
           func.emitError("the kernel reads buffers with tensor.extract (gather form); mapping needs structured "
                          "linalg (affine reads promoted to indexing-map inputs by furiosa-structure)");
         else
-          func.emitError("no op class maps this kernel (classes: elementwise, contraction)");
+          func.emitError("no op class maps this kernel (classes: elementwise, contraction, row-wise)");
         return signalPassFailure();
       }
       if (failed(chosen->map(kernel)))

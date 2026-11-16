@@ -260,7 +260,7 @@ LogicalResult map(RaisedKernel &kernel) {
     s = VectorIntraSliceTagOp::create(b, loc, stream(outer, flit), s);
     if (body->kind == Kind::ClipImm) {
       s = VectorClipOp::create(b, loc, stream(outer, flit), s, b.getStringAttr(body->op),
-                               b.getF32FloatAttr(body->imm));
+                               b.getF32FloatAttr(body->imm), Value(), UnitAttr());
     } else {
       // The float region is 4 lanes wide: an 8-element packet splits its top digit into time and back; a
       // 4-element one is trimmed from its padded flit and padded back.
@@ -276,7 +276,7 @@ LogicalResult map(RaisedKernel &kernel) {
         s = VectorFpUnaryOp::create(b, loc, stream(narrowTime, narrowPacket), s, b.getStringAttr(body->op));
       else
         s = VectorFpBinaryOp::create(b, loc, stream(narrowTime, narrowPacket), s, b.getStringAttr(body->op),
-                                     b.getF32FloatAttr(body->imm));
+                                     b.getF32FloatAttr(body->imm), Value(), UnitAttr());
       if (p == 8)
         s = VectorWidenConcatOp::create(b, loc, stream(outer, flit), s);
       else
