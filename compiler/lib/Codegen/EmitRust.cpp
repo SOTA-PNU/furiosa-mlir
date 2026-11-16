@@ -133,8 +133,8 @@ FailureOr<std::string> Emitter::view(Value v) {
     FailureOr<std::string> base = view(o.getSource());
     if (failed(base))
       return failure();
-    return *base + ".tile::<" + o.getIndex().rust() + ", " + std::to_string(o.getLen()) + ", " +
-           o.getType().getElement().rust() + ">(" + std::to_string(o.getStart()) + ")";
+    return *base + ".tile::<" + m(o.getIndex()) + ", " + std::to_string(o.getLen()) + ", " +
+           m(o.getType().getElement()) + ">(" + std::to_string(o.getStart()) + ")";
   }
   if (auto o = dyn_cast_or_null<PadOp>(op)) {
     FailureOr<std::string> base = view(o.getSource());

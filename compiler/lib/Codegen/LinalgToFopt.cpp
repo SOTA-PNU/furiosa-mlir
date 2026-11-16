@@ -108,6 +108,25 @@ SmallVector<int64_t> writtenArgs(func::FuncOp func) {
   return written;
 }
 
+} // namespace
+
+ArrayRef<OpClass> mapping::opClasses() {
+  static const OpClass classes[] = {gatherClass(), copyClass(), elementwiseClass(), contractionClass(),
+                                    rowwiseClass()};
+  return classes;
+}
+
+const OpClass *mapping::matchClass(RaisedKernel &kernel) {
+  for (const OpClass &c : opClasses())
+    if (c.match(kernel))
+      return &c;
+  return nullptr;
+}
+
+RaisedKernel mapping::raisedKernel(func::FuncOp func) { return {func, argNames(func), writtenArgs(func)}; }
+
+namespace {
+
 struct LinalgToFoptPass : PassWrapper<LinalgToFoptPass, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(LinalgToFoptPass)
 
@@ -116,18 +135,12 @@ struct LinalgToFoptPass : PassWrapper<LinalgToFoptPass, OperationPass<ModuleOp>>
   void getDependentDialects(DialectRegistry &registry) const override { registerCodegenDialects(registry); }
 
   void runOnOperation() override {
-    static const OpClass classes[] = {gatherClass(), elementwiseClass(), contractionClass(), rowwiseClass()};
     SmallVector<func::FuncOp> funcs(getOperation().getOps<func::FuncOp>());
     for (func::FuncOp func : funcs) {
       if (func->hasAttr(fopt::kChipAttr))
         continue;
-      RaisedKernel kernel{func, argNames(func), writtenArgs(func)};
-      const OpClass *chosen = nullptr;
-      for (const OpClass &c : classes)
-        if (c.match(kernel)) {
-          chosen = &c;
-          break;
-        }
+      RaisedKernel kernel = raisedKernel(func);
+      const OpClass *chosen = matchClass(kernel);
       if (!chosen) {
         bool gather = false;
         func.walk([&](tensor::ExtractOp) { gather = true; });

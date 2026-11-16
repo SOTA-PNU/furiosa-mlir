@@ -491,7 +491,8 @@ static LogicalResult verifyOpName(Operation *op, StringRef name, ArrayRef<String
 }
 
 static constexpr StringRef kClipOps[] = {"Min", "Max", "AbsMin", "AbsMax", "Add"};
-static constexpr StringRef kFpBinaryOps[] = {"AddF", "SubF", "MulF(FpMulAlu::Mul0)", "DivF"};
+static constexpr StringRef kFpBinaryOps[] = {"AddF", "SubF", "MulF(FpMulAlu::Mul0)", "MulF(FpMulAlu::Mul1)",
+                                             "MulF(FpMulAlu::Fma)", "DivF"};
 static constexpr StringRef kFpUnaryOps[] = {"Exp", "NegExp", "Sqrt", "Tanh", "Sigmoid", "Erf", "Log", "Sin", "Cos"};
 
 LogicalResult VectorClipZipOp::verify() {

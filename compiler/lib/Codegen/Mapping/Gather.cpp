@@ -188,7 +188,10 @@ FailureOr<Gather> find(RaisedKernel &kernel, std::string &why) {
   SmallVector<int64_t> ranges = g.generic.getStaticLoopRanges();
   AffineMap indexMap = g.generic.getMatchingIndexingMap(indexOperand);
   SmallVector<unsigned> indexDims, payloadDims;
-  for (AffineExpr e : indexMap.getResults()) {
+  for (auto [i, e] : llvm::enumerate(indexMap.getResults())) {
+    // A constant 0 indexes a dimension of one entry.
+    if (auto c = dyn_cast<AffineConstantExpr>(e); c && c.getValue() == 0 && indexType.getDimSize(i) == 1)
+      continue;
     auto d = dyn_cast<AffineDimExpr>(e);
     if (!d || (!indexDims.empty() && d.getPosition() <= indexDims.back())) {
       why = "the index operand's map is not an ordered projection";
@@ -203,8 +206,9 @@ FailureOr<Gather> find(RaisedKernel &kernel, std::string &why) {
     why = "the index buffer is not exactly the gathered index list";
     return failure();
   }
+  // Dims of one iteration select nothing.
   for (unsigned d = 0; d < ranges.size(); ++d)
-    if (!llvm::is_contained(indexDims, d))
+    if (!llvm::is_contained(indexDims, d) && ranges[d] != 1)
       payloadDims.push_back(d);
   // The payload dims run row-major over a whole row, after the index dims.
   int64_t expect = 1;

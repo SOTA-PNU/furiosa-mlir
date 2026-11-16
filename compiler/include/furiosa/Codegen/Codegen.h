@@ -23,6 +23,19 @@ LogicalResult translateFoptToRust(ModuleOp module, llvm::raw_ostream &os);
 /// [pointer-arg index per result]}.
 FailureOr<std::string> foptSignature(ModuleOp module);
 
+/// Evaluates every value of a linalg.generic body that depends only on the iteration indices at compile time,
+/// over the dims it reads, and replaces it with a constant tensor input (lib/Codegen/Hoist.cpp).
+void hoistIndexOnly(ModuleOp module);
+
+/// Splits each kernel that no op class maps whole into steps (lib/Codegen/Steps.cpp): sub-kernel functions,
+/// each one an op class maps, called in order from the kernel on its buffers and HBM temporaries.
+LogicalResult splitSteps(ModuleOp module);
+
+/// The step plan of a split module as JSON, or "null" when the kernel is not split: {"kernel", "temps":
+/// [{"dtype", "shape"}], "consts": [{"dtype", "shape", "data": base64}], "steps": [{"func", "args":
+/// [{"buffer": i} | {"temp": j} | {"const": k}], "module": text}]}.
+FailureOr<std::string> stepsPlan(ModuleOp module);
+
 /// The dialects the codegen passes read and create.
 void registerCodegenDialects(DialectRegistry &registry);
 

@@ -7,7 +7,9 @@ HbmTensor type that kernel declares (`HbmTensor: TryFrom<HbmBuffer>` relabels wi
 with different axis declarations share buffers, and intermediates never leave the device.
 """
 
+import base64
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -16,6 +18,7 @@ from pathlib import Path
 from triton._C.libtriton import furiosa
 
 RUST_DTYPES = {"fp32": "f32", "bf16": "bf16", "i32": "i32"}
+MLIR_DTYPES = {"f32": "f32", "bf16": "bf16", "i32": "i32"}  # element types of step temporaries
 ELEMENT_BYTES = {"fp32": 4, "bf16": 2, "i32": 4}
 
 CARGO_TOML = """\
@@ -153,31 +156,57 @@ def ident(text: str) -> str:
     return name if name and not name[0].isdigit() else "_" + name
 
 
-def codegen(kernel_dir: Path) -> tuple[str, dict]:
-    """The kernel's Rust module and signature, from its structured linalg; also writes fopt.mlir and kernel.rs."""
-    linalg = (kernel_dir / "structured.mlir").read_text()
-    if linalg.startswith("// furiosa codegen failed:"):
-        raise CrateError(f"{kernel_dir.name}: furiosa-structure: {linalg.strip()}")
+def map_kernel(linalg: str, kernel_dir: Path, stem: str, what: str) -> tuple[str, dict]:
+    """One raised kernel's Rust module and signature; also writes <stem>.fopt.mlir and <stem>.rs."""
     try:
         fopt = furiosa.codegen.linalg_to_fopt(linalg)
     except RuntimeError as e:
-        raise CrateError(f"{kernel_dir.name}: linalg -> fopt: {str(e).strip()}") from None
-    (kernel_dir / "fopt.mlir").write_text(fopt)
+        raise CrateError(f"{what}: linalg -> fopt: {str(e).strip()}") from None
+    (kernel_dir / ("fopt.mlir" if stem == "kernel" else f"{stem}.fopt.mlir")).write_text(fopt)
     try:
         rust = furiosa.codegen.fopt_to_rust(fopt)
         signature = json.loads(furiosa.codegen.fopt_signature(fopt))
     except RuntimeError as e:
-        raise CrateError(f"{kernel_dir.name}: fopt -> Rust: {str(e).strip()}") from None
-    (kernel_dir / "kernel.rs").write_text(rust)
+        raise CrateError(f"{what}: fopt -> Rust: {str(e).strip()}") from None
+    (kernel_dir / f"{stem}.rs").write_text(rust)
     return rust, signature
+
+
+def codegen(kernel_dir: Path) -> tuple[dict, dict]:
+    """The kernel's Rust modules with their signatures ({module symbol: (rust, signature)}) and its launch
+    plan, from its steps stage (the structured kernel, split into sub-kernels where no op class maps it
+    whole). The plan lists the modules to launch in order, with the slot (a buffer of the launch, by
+    pointer-argument index, or a temporary) behind each pointer argument."""
+    symbol = kernel_dir.name
+    source = kernel_dir / "steps.mlir"
+    linalg = (source if source.exists() else kernel_dir / "structured.mlir").read_text()
+    if linalg.startswith("// furiosa codegen failed:"):
+        raise CrateError(f"{symbol}: furiosa-structure: {linalg.strip()}")
+    try:
+        plan = json.loads(furiosa.codegen.steps_plan(linalg))
+    except RuntimeError as e:
+        raise CrateError(f"{symbol}: steps: {str(e).strip()}") from None
+    if plan is None:
+        return {symbol: map_kernel(linalg, kernel_dir, "kernel", symbol)}, {"temps": [], "steps": [{"module": symbol, "args": None}]}
+    modules, errors = {}, []
+    for k, step in enumerate(plan["steps"]):
+        text, step["module"] = step["module"], f"{symbol}__s{k}"
+        try:
+            modules[step["module"]] = map_kernel(text, kernel_dir, f"s{k}", f"{symbol} step {k} ({step['func']})")
+        except CrateError as e:
+            errors.append(str(e))
+    if errors:
+        raise CrateError("\n".join(errors))
+    return modules, plan
 
 
 class RunGraph:
     """Writes src/run_graph.rs: one async fn per graph, replaying its launches over HbmBuffers."""
 
-    def __init__(self, graphs: list, signatures: dict, crate: str):
+    def __init__(self, graphs: list, signatures: dict, plans: dict, crate: str):
         self.graphs = graphs
-        self.signatures = signatures
+        self.signatures = signatures  # module symbol -> fopt signature
+        self.plans = plans  # kernel symbol -> launch plan (codegen)
         self.crate = crate
         self.axes = []  # (name, size) host-side axes, one per buffer dimension
 
@@ -214,9 +243,20 @@ class RunGraph:
                 raise CrateError(f"buffer {buffer}: dtype {d} has no furiosa-opt host type")
             return RUST_DTYPES[d]
 
+        def zeros(variable_name: str, rust_dtype: str, elements: int):
+            """A fresh device buffer of zeros, for a buffer or temporary read before anything writes it."""
+            axis = f"Z{elements}"
+            if (axis, elements) not in self.axes:
+                self.axes.append((axis, elements))
+            lines.append(
+                f"    let {variable_name} = HostTensor::<{rust_dtype}, m![{axis}]>::zero()"
+                f".to_hbm::<m![1], m![{axis}]>(&mut device.pdma).await?.into_buffer();"
+            )
+            defined.add(variable_name)
+
         lines.append(f"/// Graph {g}: {graph['name']}")
         lines.append(f"async fn graph_{g}(device: &mut Device, inputs: &Inputs, files: &mut Outputs) -> eyre::Result<()> {{")
-        defined = set()
+        defined = set()  # variables holding a device buffer
         for buffer, info in graph["buffers"].items():
             if info["kind"] in ("input", "weight", "state"):
                 mapping = self.host_mapping(g, names, buffer, info["shape"])
@@ -224,34 +264,71 @@ class RunGraph:
                     f"    let {variable(buffer)} = inputs.host::<{dtype(buffer)}, {mapping}>({json.dumps(buffer)})?"
                     f".to_hbm::<m![1], {mapping}>(&mut device.pdma).await?.into_buffer();"
                 )
-                defined.add(buffer)
+                defined.add(variable(buffer))
         for i, launch in enumerate(graph["launches"]):
             symbol = launch["kernel"]
-            sig = self.signatures[symbol]
-            module = f"kernel::{symbol}"
+            plan = self.plans[symbol]
             lines.append(f"    // launch {i}: {symbol}")
-            params = []
-            for p, arg in enumerate(sig["inputs"]):
-                buffer = launch["args"][arg]
-                if buffer not in defined:
-                    raise CrateError(f"graph {g} launch {i}: {buffer} is read before anything writes it")
-                lines.append(f"    let a{i}_{p} = {module}::Arg{p}::try_from({variable(buffer)}.alias(..)?)?;")
-                params.append(f"&a{i}_{p}")
-            call = f"launch({module}::{sig['kernel']}, (&mut *device{''.join(', ' + p for p in params)})).await?"
-            outs = [launch["args"][arg] for arg in sig["outputs"]]
-            if len(outs) == 1:
-                lines.append(f"    let {variable(outs[0])} = {call}.into_buffer();")
-            elif outs:
-                results = ", ".join(f"r{i}_{k}" for k in range(len(outs)))
-                lines.append(f"    let ({results}) = {call};")
-                for k, buffer in enumerate(outs):
-                    lines.append(f"    let {variable(buffer)} = r{i}_{k}.into_buffer();")
-            else:
-                lines.append(f"    {call};")
-            defined.update(outs)
+            for k, step in enumerate(plan["steps"]):
+                sig = self.signatures[step["module"]]
+                module = f"kernel::{step['module']}"
+                tag = f"{i}_{k}" if len(plan["steps"]) > 1 else f"{i}"
+
+                def slot(arg: int) -> tuple[str, str, int, bool]:
+                    """The variable behind a pointer argument of the step, its Rust dtype and element count, and
+                    whether it is a temporary."""
+                    where = {"buffer": arg} if step["args"] is None else step["args"][arg]
+                    if "const" in where:
+                        const = plan["consts"][where["const"]]
+                        if const["dtype"] not in MLIR_DTYPES:
+                            raise CrateError(f"{symbol}: table of {const['dtype']} has no furiosa-opt host type")
+                        name, elements = f"c_{ident(symbol).lower()}_{where['const']}", math.prod(const["shape"])
+                        if name not in defined:
+                            axis = f"Z{elements}"
+                            if (axis, elements) not in self.axes:
+                                self.axes.append((axis, elements))
+                            lines.append(
+                                f"    let {name} = HostTensor::<{MLIR_DTYPES[const['dtype']]}, m![{axis}]>::from_buf("
+                                f"include_bytes!(\"consts/{symbol}_{where['const']}.bin\").to_vec())"
+                                f".to_hbm::<m![1], m![{axis}]>(&mut device.pdma).await?.into_buffer();"
+                            )
+                            defined.add(name)
+                        return name, MLIR_DTYPES[const["dtype"]], elements, False
+                    if "buffer" in where:
+                        buffer = launch["args"][where["buffer"]]
+                        info = graph["buffers"][buffer]
+                        return variable(buffer), dtype(buffer), math.prod(info["shape"]), False
+                    temp = plan["temps"][where["temp"]]
+                    if temp["dtype"] not in MLIR_DTYPES:
+                        raise CrateError(f"{symbol}: temporary of {temp['dtype']} has no furiosa-opt host type")
+                    return f"t{i}_{where['temp']}", MLIR_DTYPES[temp["dtype"]], math.prod(temp["shape"]), True
+
+                params = []
+                for p, arg in enumerate(sig["inputs"]):
+                    name, rust_dtype, elements, temp = slot(arg)
+                    mut = p in sig.get("inouts", [])
+                    if name not in defined:
+                        # Only a buffer the kernel updates in place may start as zeros; a read one must exist.
+                        if not mut and not temp:
+                            raise CrateError(f"graph {g} launch {i}: {name} is read before anything writes it")
+                        zeros(name, rust_dtype, elements)
+                    lines.append(f"    let {'mut ' if mut else ''}a{tag}_{p} = {module}::Arg{p}::try_from({name}.alias(..)?)?;")
+                    params.append(f"&mut a{tag}_{p}" if mut else f"&a{tag}_{p}")
+                call = f"launch({module}::{sig['kernel']}, (&mut *device{''.join(', ' + p for p in params)})).await?"
+                outs = [slot(arg)[0] for arg in sig["outputs"]]
+                if len(outs) == 1:
+                    lines.append(f"    let {outs[0]} = {call}.into_buffer();")
+                elif outs:
+                    results = ", ".join(f"r{tag}_{r}" for r in range(len(outs)))
+                    lines.append(f"    let ({results}) = {call};")
+                    for r, name in enumerate(outs):
+                        lines.append(f"    let {name} = r{tag}_{r}.into_buffer();")
+                else:
+                    lines.append(f"    {call};")
+                defined.update(outs)
         for buffer, info in graph["buffers"].items():
             if info["kind"] in ("output", "state"):
-                if buffer not in defined:
+                if variable(buffer) not in defined:
                     raise CrateError(f"graph {g}: output {buffer} is never written")
                 mapping = self.host_mapping(g, names, buffer, info["shape"])
                 shape = ", ".join(str(d) for d in info["shape"])
@@ -264,7 +341,6 @@ class RunGraph:
         return "\n".join(lines)
 
     def source(self, model: str) -> str:
-        first = self.signatures[self.graphs[0]["launches"][0]["kernel"]] if self.graphs and self.graphs[0]["launches"] else None
         topologies = {(s["chip"], s["pe"]) for s in self.signatures.values()}
         if len(topologies) > 1:
             raise CrateError(f"kernels need different topologies {sorted(topologies)}; one device runs them all")
@@ -272,7 +348,6 @@ class RunGraph:
         fns = [self.graph_fn(g, graph) for g, graph in enumerate(self.graphs)]
         arms = "\n".join(f"        {g} => graph_{g}(&mut device, &inputs, &mut files).await?," for g in range(len(self.graphs)))
         axes = ", ".join(f"{n} = {s}" for n, s in self.axes)
-        del first
         return f"""\
 //! Generated by furiosa-compile from {model}; do not edit.
 //! The harness crate contract (harness/README.md): runs graph <index> of the model on the device.
@@ -329,18 +404,21 @@ def build_crate(result: dict, out: Path, crate: Path) -> Path:
     failed = {s: k["error"] for s, k in result["kernels"].items() if "error" in k}
     if failed:
         raise CrateError("kernels failed to compile: " + "; ".join(f"{s}: {e}" for s, e in failed.items()))
-    modules, signatures = {}, {}
+    modules, signatures, plans = {}, {}, {}
     errors = []
     for symbol in result["kernels"]:
         try:
-            modules[symbol], signatures[symbol] = codegen(out / "kernels" / symbol)
+            units, plans[symbol] = codegen(out / "kernels" / symbol)
         except CrateError as e:
             errors.append(str(e))
+            continue
+        for module, (rust, signature) in units.items():
+            modules[module], signatures[module] = rust, signature
     if errors:
         raise CrateError("\n".join(errors))
 
     name = ident(model.stem).lower()
-    run_graph = RunGraph(result["graphs"], signatures, name).source(model.name)
+    run_graph = RunGraph(result["graphs"], signatures, plans, name).source(model.name)
     reset(crate)
     (crate / "src" / "kernel").mkdir(parents=True, exist_ok=True)
     (crate / "Cargo.toml").write_text(CARGO_TOML.format(name=name, model=model.name))
@@ -353,6 +431,10 @@ def build_crate(result: dict, out: Path, crate: Path) -> Path:
     )
     for symbol, rust in modules.items():
         (crate / "src" / "kernel" / f"{symbol}.rs").write_text(rust)
+    for symbol, plan in plans.items():
+        for k, const in enumerate(plan.get("consts", [])):
+            (crate / "src" / "consts").mkdir(exist_ok=True)
+            (crate / "src" / "consts" / f"{symbol}_{k}.bin").write_bytes(base64.b64decode(const["data"]))
     (crate / "src" / "run_graph.rs").write_text(run_graph)
     # Formatting is cosmetic: skip it if the toolchain's rustfmt is unavailable.
     subprocess.run(["cargo", "fmt"], cwd=crate, capture_output=True)

@@ -100,7 +100,8 @@ def compare(got: dict, want: dict, rtol: float, atol: float) -> tuple[bool, str]
     return True, f"rel {worst:.2g} @ {worst_name}" if worst_name else ""
 
 
-STAGES = ("linalg", "structured")  # the raised form, and the structured form codegen consumes
+# The raised form, the structured form, and the structured form split into the steps codegen maps.
+STAGES = ("linalg", "structured", "steps")
 
 
 def judge(out_dir: Path, golden_dir: Path, rtol: float, atol: float) -> tuple[bool, str]:

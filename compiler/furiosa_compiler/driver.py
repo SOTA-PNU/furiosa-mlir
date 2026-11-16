@@ -75,6 +75,18 @@ def specialize(launch):
     return ASTSource(fn, signature, constexprs, attrs), options, names, pointer_args
 
 
+def steps(structured: str) -> str:
+    """The structured kernel split into sub-kernels where no op class maps it whole (compiler/README.md)."""
+    from triton._C.libtriton import furiosa
+
+    if structured.startswith("// furiosa codegen failed:"):
+        return structured
+    try:
+        return furiosa.codegen.split_steps(structured)
+    except RuntimeError as e:
+        return "// furiosa codegen failed: steps\n" + "".join(f"// {line}\n" for line in str(e).splitlines())
+
+
 def compile_model(model_path: Path, out: Path, keep_going: bool = False) -> dict:
     """Compiles every launch specialization of the model's graphs into ``out`` and writes graph.json."""
     model = load_model(model_path)
@@ -110,6 +122,7 @@ def compile_model(model_path: Path, out: Path, keep_going: bool = False) -> dict
             directory.mkdir(parents=True, exist_ok=True)
             for stage in ("ttir", "linalg", "structured"):
                 (directory / f"{stage}.mlir").write_text(kernel.stage(stage))
+            (directory / "steps.mlir").write_text(steps(kernel.stage("structured")))
             entry["written"] = kernel.written()
             entry["linalg"] = f"kernels/{symbol}/linalg.mlir"
         summary[symbol] = entry

@@ -31,6 +31,16 @@ CASES = {
     "tutorial_softmax": Case("harness/cases/tutorial_softmax.py"),
     "tutorial_matmul": Case("harness/cases/tutorial_matmul.py", exact=Tol(rtol=2e-3, atol=2e-3)),
     "tutorial_layer_norm": Case("harness/cases/tutorial_layer_norm.py", exact=Tol(rtol=2e-3, atol=2e-3)),
+    # Held-out kernels, written apart from the corpus (harness/README.md). NPU tolerances: data movement
+    # and max are exact; contractions allow twice the measured drift of rounding their operands to bf16
+    # (bmm 0.34%, depthwise 0.32% of max|out|); a bf16 output allows one bf16 ulp at max|golden|; fp32
+    # through Vector Engine exp/log is provisional (1e-4) until the NPU's transcendentals are measured.
+    "heldout_transpose": Case("harness/cases/heldout_transpose.py", npu=Tol(rtol=0, atol=0)),
+    "heldout_bmm": Case("harness/cases/heldout_bmm.py", npu=Tol(rtol=7e-3, atol=0)),
+    "heldout_maxpool": Case("harness/cases/heldout_maxpool.py", npu=Tol(rtol=0, atol=0)),
+    "heldout_gelu": Case("harness/cases/heldout_gelu.py", npu=Tol(rtol=8e-3, atol=0)),
+    "heldout_logsumexp": Case("harness/cases/heldout_logsumexp.py", npu=Tol(rtol=1e-4, atol=0)),
+    "heldout_depthwise": Case("harness/cases/heldout_depthwise.py", npu=Tol(rtol=6.5e-3, atol=0)),
     # fp32 models: the NPU contracts in bf16, so L3/L4 allow twice the logit drift of the same Triton
     # graph run in bf16 on the GPU (measured: lenet5 0.16%, alexnet 0.37%, vgg16 0.66%, resnet101 2.4%,
     # mobilenetv3 6.5% of max|logit|), and the top-1 class must not change.

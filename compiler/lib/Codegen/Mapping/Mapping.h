@@ -91,6 +91,15 @@ OpClass contractionClass();
 OpClass rowwiseClass();
 /// Rows of a table read at data-dependent indices, as an indirect DMA (Mapping/Gather.cpp).
 OpClass gatherClass();
+/// A buffer copied into a box of another, in place, as an HBM-to-HBM DMA (Mapping/Copy.cpp).
+OpClass copyClass();
+
+/// Every op class, in the order a kernel tries them (LinalgToFopt.cpp).
+ArrayRef<OpClass> opClasses();
+/// The first op class that matches the kernel, or null.
+const OpClass *matchClass(RaisedKernel &kernel);
+/// The pointer-argument names (from NameLocs on the arguments) and `furiosa.written` of a raised function.
+RaisedKernel raisedKernel(func::FuncOp func);
 
 } // namespace mlir::furiosa::mapping
 

@@ -96,7 +96,11 @@ The compiler must handle Triton code it has never seen, so it may not recognise 
 - A kernel outside the supported subset must fail compilation with a diagnostic naming the op; silently
   wrong output is a harness failure at L1.
 - Progress is the pass rate per corpus layer: micro cases, Triton tutorial kernels (code we did not write),
-  and the models.
+  held-out kernels, and the models.
+- Held-out cases (`harness/cases/heldout_*.py`) are kernels written apart from the corpus, in other
+  styles (NCHW layout, 3-D grids, `acc += tl.dot`, transposed stores, online reductions), to measure
+  whether the compiler generalizes. A held-out failure is fixed only by a general mechanism that the
+  corpus also exercises; a change that only a held-out case motivates does not count.
 
 ## Running
 

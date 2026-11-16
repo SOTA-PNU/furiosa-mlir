@@ -60,6 +60,25 @@ void init_furiosa_codegen(nb::module_ &m) {
     });
   });
 
+  codegen.def("split_steps", [](const std::string &text) {
+    return withModule(text, [](mlir::ModuleOp module, llvm::raw_ostream &os) {
+      if (mlir::failed(mlir::furiosa::splitSteps(module)))
+        return mlir::failure();
+      module.print(os, mlir::OpPrintingFlags().enableDebugInfo(true, false));
+      return mlir::success();
+    });
+  });
+
+  codegen.def("steps_plan", [](const std::string &text) {
+    return withModule(text, [](mlir::ModuleOp module, llvm::raw_ostream &os) {
+      mlir::FailureOr<std::string> plan = mlir::furiosa::stepsPlan(module);
+      if (mlir::failed(plan))
+        return mlir::failure();
+      os << *plan;
+      return mlir::success();
+    });
+  });
+
   codegen.def("fopt_signature", [](const std::string &text) {
     return withModule(text, [](mlir::ModuleOp module, llvm::raw_ostream &os) {
       mlir::FailureOr<std::string> sig = mlir::furiosa::foptSignature(module);
