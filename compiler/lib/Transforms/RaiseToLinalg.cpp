@@ -710,6 +710,10 @@ struct StoreSpace {
   bool full = false;
   SmallVector<AffineExpr> global;              // per stored axis, over view dims (null: unit axis)
   SmallVector<int64_t> extent, phase;          // per stored axis: tile extent and origin phase (-1: unaligned)
+  // Per stored axis: its step along its view dim (coordinate = origin + step * axis); origins of a
+  // stepped axis lie in [0, step), so axis = G floordiv step and origin = G mod step.
+  SmallVector<int64_t> step;
+  SmallVector<unsigned> loops;                 // ids of the loops around the store: its leading axes
   SmallVector<unsigned> freeDims;              // view dims no axis moves along
   // Per instance: the origin of each stored axis, then the coordinate of each free dim.
   std::vector<SmallVector<int64_t>> origin;
@@ -934,9 +938,17 @@ bool components(AffineExpr e, int64_t scale, SmallVectorImpl<Component> &out) {
 } // namespace
 
 FailureOr<StoreSpace> Raiser::storeSpace(tt::StoreOp store) {
-  if (store->getParentOfType<scf::ForOp>())
-    return store.emitError("furiosa: stores inside loops are not raised yet"), failure();
-  SmallVector<int64_t> shape = shapeOf(store.getValue().getType());
+  // The loops around the store become its leading axes: each iteration is one more stored tile.
+  SmallVector<unsigned> encl;
+  for (Operation *op = store->getParentOp(); op && op != kernel.getOperation(); op = op->getParentOp())
+    if (auto f = dyn_cast<scf::ForOp>(op))
+      encl.insert(encl.begin(), loopIds.lookup(f));
+  unsigned nl = encl.size();
+  SmallVector<int64_t> vshape = shapeOf(store.getValue().getType());
+  SmallVector<int64_t> shape;
+  for (unsigned id : encl)
+    shape.push_back(loopTrip[id]);
+  shape.append(vshape.begin(), vshape.end());
   unsigned rank = shape.size();
   const Sym *p0 = act[0]->get(store.getPtr());
   if (!p0 || p0->kind != Sym::Ptr || !p0->data.empty())
@@ -944,6 +956,36 @@ FailureOr<StoreSpace> Raiser::storeSpace(tt::StoreOp store) {
   int arg = p0->base;
   const BufferInfo &buf = buffers[arg];
   int64_t numel = buf.numel();
+  // Per instance: the address and mask over the store's axes, and the extent of each axis there.
+  SmallVector<AffineExpr> toDims;
+  for (unsigned i = 0; i < vshape.size(); ++i)
+    toDims.push_back(getAffineDimExpr(nl + i, ctx));
+  SmallVector<AffineExpr> toSyms;
+  for (unsigned l = 0; l < loopTrip.size(); ++l) {
+    auto it = llvm::find(encl, l);
+    toSyms.push_back(it != encl.end() ? getAffineDimExpr(it - encl.begin(), ctx) : getAffineConstantExpr(0, ctx));
+  }
+  std::vector<AffineExpr> address(act.size());
+  std::vector<SmallVector<AffineExpr>> maskConds(act.size());
+  std::vector<bool> maskNever(act.size(), false);
+  std::vector<SmallVector<int64_t>> extentsOf(act.size());
+  for (auto [n, ev] : llvm::enumerate(act)) {
+    const Sym *p = ev->get(store.getPtr());
+    if (!p || p->kind != Sym::Ptr || p->base != arg || !p->data.empty())
+      return store.emitError("furiosa: store base differs between program instances"), failure();
+    address[n] = simplify(p->expr.replaceDimsAndSymbols(toDims, toSyms), rank, 0);
+    if (store.getMask()) {
+      const Sym *m = ev->get(store.getMask());
+      if (!m || m->kind != Sym::Mask)
+        return store.emitError("furiosa: store mask is not an index predicate"), failure();
+      for (AffineExpr c : m->conds)
+        maskConds[n].push_back(simplify(c.replaceDimsAndSymbols(toDims, toSyms), rank, 0));
+      maskNever[n] = m->never;
+    }
+    for (unsigned id : encl)
+      extentsOf[n].push_back(ev->trips.lookup(id));
+    extentsOf[n].append(vshape.begin(), vshape.end());
+  }
 
   // Axes the address takes apart with div/mod get a per-instance origin read off the atoms
   // (`origin + axis` inside each), so the address becomes one expression of their global indices.
@@ -952,11 +994,8 @@ FailureOr<StoreSpace> Raiser::storeSpace(tt::StoreOp store) {
   SmallVector<AffineExpr> rest(act.size());
   SmallVector<int64_t> constant(act.size());
   for (auto [n, ev] : llvm::enumerate(act)) {
-    const Sym *p = ev->get(store.getPtr());
-    if (!p || p->kind != Sym::Ptr || p->base != arg || !p->data.empty())
-      return store.emitError("furiosa: store base differs between program instances"), failure();
     SmallVector<AffineExpr> inner;
-    atoms(p->expr, inner);
+    atoms(address[n], inner);
     SmallVector<bool> seen(rank, false);
     for (AffineExpr form : inner) {
       auto lin = linearize(form, rank);
@@ -983,7 +1022,7 @@ FailureOr<StoreSpace> Raiser::storeSpace(tt::StoreOp store) {
     SmallVector<AffineExpr> sub;
     for (unsigned i = 0; i < rank; ++i)
       sub.push_back(getAffineDimExpr(i, ctx) - (isDigit[i] ? digitOrigin[n][i] : 0));
-    auto [r, c] = splitConstant(simplify(p->expr.replaceDims(sub), rank, 0));
+    auto [r, c] = splitConstant(simplify(address[n].replaceDims(sub), rank, 0));
     if (n && r != rest[0])
       return store.emitError("furiosa: store addresses differ between program instances"), failure();
     rest[n] = r;
@@ -1037,10 +1076,16 @@ FailureOr<StoreSpace> Raiser::storeSpace(tt::StoreOp store) {
   std::string why = "store strides do not nest: " + show(rest[0]);
   SmallVector<int64_t> probeStrides;
   std::vector<SmallVector<int64_t>> probeOrigins;
+  // A linear term whose stride does not divide the buffer (a persistent loop striding rows by the grid
+  // size) cannot be a view dim; it moves along the view dim of the largest stride dividing it.
+  SmallVector<bool> stepped;
+  for (const Component &c : comps)
+    stepped.push_back(!c.digit && numel % c.stride != 0);
   for (int attempt = 0; attempt < 4; ++attempt) {
     std::set<int64_t, std::greater<int64_t>> strides{1};
-    for (const Component &c : comps)
-      strides.insert(c.stride);
+    for (auto [k, c] : llvm::enumerate(comps))
+      if (!stepped[k])
+        strides.insert(c.stride);
     if (attempt == 0 || attempt == 2)
       strides.insert(bufStrides.begin(), bufStrides.end());
     if (attempt >= 2) {
@@ -1071,13 +1116,22 @@ FailureOr<StoreSpace> Raiser::storeSpace(tt::StoreOp store) {
     SmallVector<int> dimOf(comps.size());
     SmallVector<bool> used(nd, false);
     bool clash = false;
+    sp.step.assign(rank, 1);
     for (auto [k, c] : llvm::enumerate(comps)) {
-      dimOf[k] = llvm::find(st, c.stride) - st.begin();
+      if (stepped[k]) {
+        auto it = llvm::find_if(st, [&](int64_t v) { return v < c.stride && c.stride % v == 0; });
+        dimOf[k] = it - st.begin();
+        sp.step[c.axis] = c.stride / *it;
+      } else {
+        dimOf[k] = llvm::find(st, c.stride) - st.begin();
+      }
       clash |= used[dimOf[k]];
       used[dimOf[k]] = true;
     }
-    if (clash)
-      return store.emitError("furiosa: two store address terms share a stride"), failure();
+    if (clash) {
+      why = "two store address terms share a view dim";
+      continue;
+    }
     sp.global.assign(rank, AffineExpr());
     for (auto [k, c] : llvm::enumerate(comps)) {
       AffineExpr term = getAffineDimExpr(dimOf[k], ctx) * c.a;
@@ -1125,27 +1179,25 @@ FailureOr<StoreSpace> Raiser::storeSpace(tt::StoreOp store) {
     std::vector<uint8_t> covered(numel, 0);
     sp.boxLo.assign(nd, std::numeric_limits<int64_t>::max());
     sp.boxHi.assign(nd, std::numeric_limits<int64_t>::min());
-    int64_t count = 0, total = 1;
-    for (int64_t d : shape)
-      total *= d;
+    int64_t count = 0;
     SmallVector<int64_t> idx(rank), coord(nd);
     why.clear();
     for (auto [n, ev] : llvm::enumerate(act)) {
-      const Sym *p = ev->get(store.getPtr());
-      const Sym *m = store.getMask() ? ev->get(store.getMask()) : nullptr;
-      if (store.getMask() && (!m || m->kind != Sym::Mask))
-        return store.emitError("furiosa: store mask is not an index predicate"), failure();
-      if (m && m->never)
+      if (maskNever[n])
         continue;
+      ArrayRef<int64_t> ext = extentsOf[n];
+      int64_t total = 1;
+      for (int64_t d : ext)
+        total *= d;
       for (int64_t f = 0; f < total && why.empty(); ++f) {
         int64_t r = f;
         for (int i = rank - 1; i >= 0; --i) {
-          idx[i] = r % shape[i];
-          r /= shape[i];
+          idx[i] = r % ext[i];
+          r /= ext[i];
         }
-        if (m && llvm::any_of(m->conds, [&](AffineExpr c) { return evalAt(c, idx) < 0; }))
+        if (llvm::any_of(maskConds[n], [&](AffineExpr c) { return evalAt(c, idx) < 0; }))
           continue;
-        int64_t addr = evalAt(p->expr, idx);
+        int64_t addr = evalAt(address[n], idx);
         if (addr < 0 || addr >= numel) {
           why = "a store lands outside its buffer";
           break;
@@ -1156,7 +1208,7 @@ FailureOr<StoreSpace> Raiser::storeSpace(tt::StoreOp store) {
           a %= st[j];
         }
         for (unsigned i = 0; i < rank && why.empty(); ++i)
-          if (sp.global[i] && evalAt(sp.global[i], coord) - sp.origin[n][i] != idx[i])
+          if (sp.global[i] && evalAt(sp.global[i], coord) - sp.origin[n][i] != idx[i] * sp.step[i])
             why = "a store tile crosses a view boundary";
         for (auto [k, fdim] : llvm::enumerate(sp.freeDims))
           if (coord[fdim] != sp.origin[n][rank + k])
@@ -1194,8 +1246,17 @@ FailureOr<StoreSpace> Raiser::storeSpace(tt::StoreOp store) {
     // Tile phase per axis, for recovering origins from global indices.
     sp.extent.assign(rank, 0);
     sp.phase.assign(rank, -1);
+    sp.loops = encl;
+    bool steppedOk = true;
+    for (unsigned i = 0; i < rank; ++i)
+      if (sp.step[i] > 1)
+        steppedOk &= llvm::all_of(sp.origin, [&](auto &o) { return o[i] >= 0 && o[i] < sp.step[i]; });
+    if (!steppedOk) {
+      why = "a stepped store axis starts outside its first step";
+      continue;
+    }
     for (unsigned i = 0; i < rank; ++i) {
-      if (!sp.global[i])
+      if (!sp.global[i] || sp.step[i] > 1)
         continue;
       int64_t e = shape[i], ph = ((sp.origin[0][i] % e) + e) % e;
       bool aligned = llvm::all_of(sp.origin, [&](auto &o) { return ((o[i] % e) + e) % e == ph; });
@@ -1218,7 +1279,15 @@ AffineExpr Raiser::originExpr(const Gen &g, unsigned k) {
     unsigned f = space->freeDims[k - rank];
     return viewToGen[f];
   }
-  if (!space->global[k] || space->phase[k] < 0)
+  if (!space->global[k])
+    return AffineExpr();
+  if (space->step[k] > 1) {
+    SmallVector<AffineExpr> sub;
+    for (AffineExpr e : viewToGen)
+      sub.push_back(e ? e : getAffineConstantExpr(0, ctx));
+    return space->global[k].replaceDims(sub) % space->step[k];
+  }
+  if (space->phase[k] < 0)
     return AffineExpr();
   for (unsigned j = 0; j < viewToGen.size(); ++j)
     if (!viewToGen[j] && space->global[k].isFunctionOfDim(j))
@@ -1251,7 +1320,8 @@ FailureOr<AffineExpr> Raiser::rewrite(Operation *at, const Gen &g, ArrayRef<Axis
         for (unsigned j = 0; j < g.coordPos.size(); ++j)
           if (g.coordPos[j] < 0 && gl.isFunctionOfDim(j))
             return at->emitError("furiosa: internal: coordinate dim not in this generic"), failure();
-        dims.push_back(gl.replaceDims(viewToGen) - space->origin[n][a.dim]);
+        dims.push_back(space->step[a.dim] > 1 ? gl.replaceDims(viewToGen).floorDiv(space->step[a.dim])
+                                              : gl.replaceDims(viewToGen) - space->origin[n][a.dim]);
       } else if (a.kind == Axis::Iter) {
         dims.push_back(getAffineDimExpr(a.dim, ctx));
       } else {
@@ -1261,14 +1331,21 @@ FailureOr<AffineExpr> Raiser::rewrite(Operation *at, const Gen &g, ArrayRef<Axis
     SmallVector<AffineExpr> syms;
     for (unsigned l = 0; l < loopTrip.size(); ++l) {
       auto it = g.loopPos.find(l);
+      auto around = llvm::find(space->loops, l);
       if (it != g.loopPos.end())
         syms.push_back(getAffineDimExpr(it->second, ctx));
-      else
-        syms.push_back(g.loopIv.count(l) ? getAffineSymbolExpr(l, ctx) : getAffineConstantExpr(0, ctx));
+      else if (g.loopIv.count(l))
+        syms.push_back(getAffineSymbolExpr(l, ctx));
+      else if (around != space->loops.end()) {
+        unsigned axis = around - space->loops.begin();
+        AffineExpr gl = space->global[axis] ? space->global[axis].replaceDims(viewToGen) : getAffineConstantExpr(0, ctx);
+        syms.push_back(space->step[axis] > 1 ? gl.floorDiv(space->step[axis]) : gl - space->origin[n][axis]);
+      } else
+        syms.push_back(getAffineConstantExpr(0, ctx));
     }
     AffineExpr e = select(*s);
     for (unsigned l = 0; l < loopTrip.size(); ++l)
-      if (e.isFunctionOfSymbol(l) && !g.loopPos.count(l) && !g.loopIv.count(l))
+      if (e.isFunctionOfSymbol(l) && !g.loopPos.count(l) && !g.loopIv.count(l) && !llvm::is_contained(space->loops, l))
         return at->emitError("furiosa: a loop counter is used outside its loop"), failure();
     per.push_back(simplify(e.replaceDimsAndSymbols(dims, syms), nd, loopTrip.size()));
   }
@@ -1351,7 +1428,8 @@ FailureOr<AffineExpr> Raiser::rewriteSymbolic(Operation *at, const Gen &g, Array
       AffineExpr origin = getAffineConstantExpr(basisOf[a.dim][3], ctx);
       for (unsigned d = 0; d < 3; ++d)
         origin = origin + pidExpr[d] * basisOf[a.dim][d];
-      dims.push_back(space->global[a.dim].replaceDims(viewToGen) - origin);
+      AffineExpr gl = space->global[a.dim].replaceDims(viewToGen);
+      dims.push_back(space->step[a.dim] > 1 ? gl.floorDiv(space->step[a.dim]) : gl - origin);
     } else if (a.kind == Axis::Iter) {
       dims.push_back(getAffineDimExpr(a.dim, ctx));
     } else {
@@ -1361,10 +1439,27 @@ FailureOr<AffineExpr> Raiser::rewriteSymbolic(Operation *at, const Gen &g, Array
   SmallVector<AffineExpr> syms;
   for (unsigned l = 0; l < nl; ++l) {
     auto it = g.loopPos.find(l);
+    auto around = llvm::find(space->loops, l);
     if (it != g.loopPos.end())
       syms.push_back(getAffineDimExpr(it->second, ctx));
+    else if (g.loopIv.count(l))
+      syms.push_back(getAffineSymbolExpr(l, ctx));
+    else if (around != space->loops.end())
+      syms.push_back(AffineExpr()); // filled below
     else
-      syms.push_back(g.loopIv.count(l) ? getAffineSymbolExpr(l, ctx) : getAffineConstantExpr(0, ctx));
+      syms.push_back(getAffineConstantExpr(0, ctx));
+  }
+  // Counters of the loops around the store: their store axis, as for an env axis.
+  for (unsigned l = 0; l < nl; ++l) {
+    auto around = llvm::find(space->loops, l);
+    if (syms[l] || around == space->loops.end())
+      continue;
+    unsigned axis = around - space->loops.begin();
+    AffineExpr origin = getAffineConstantExpr(basisOf[axis][3], ctx);
+    for (unsigned d = 0; d < 3; ++d)
+      origin = origin + pidExpr[d] * basisOf[axis][d];
+    AffineExpr gl = space->global[axis] ? space->global[axis].replaceDims(viewToGen) : getAffineConstantExpr(0, ctx);
+    syms[l] = space->step[axis] > 1 ? gl.floorDiv(space->step[axis]) : gl - origin;
   }
   for (unsigned d = 0; d < 3; ++d)
     syms.push_back(pidExpr[d]);
@@ -2354,9 +2449,9 @@ LogicalResult Raiser::raiseStore(tt::StoreOp store) {
   int arg = sp->arg;
   unsigned nd = sp->viewShape.size();
   SmallVector<Axis> env;
-  for (auto [i, gl] : llvm::enumerate(sp->global)) {
+  for (unsigned i = sp->loops.size(); i < sp->global.size(); ++i) {
     Axis a;
-    if (gl) {
+    if (sp->global[i]) {
       a.kind = Axis::Store;
       a.dim = i;
     }
