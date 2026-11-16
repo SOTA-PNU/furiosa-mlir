@@ -81,6 +81,8 @@ struct OpClass {
 
 /// Elementwise linalg.generic over f32 (Mapping/Elementwise.cpp).
 OpClass elementwiseClass();
+/// x(m, k) . w(n, k) over bf16 with fp32 accumulation, then an optional cast (Mapping/Contraction.cpp).
+OpClass contractionClass();
 
 } // namespace mlir::furiosa::mapping
 

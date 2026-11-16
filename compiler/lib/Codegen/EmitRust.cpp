@@ -120,7 +120,9 @@ FailureOr<std::string> Emitter::chain(Value stream) {
     stages.push_back(op);
     if (isa<BeginOp, BeginInterleavedOp>(op))
       break;
-    if (op->getNumOperands() != 1)
+    // A chain link reads its stream as the first operand (contract_outer also reads a TRF).
+    if (op->getNumOperands() < 1 || !isa<StreamType>(op->getOperand(0).getType()) ||
+        (op->getNumOperands() != 1 && !isa<ContractOuterOp>(op)))
       return op->emitOpError("cannot be printed as a builder chain link");
     v = op->getOperand(0);
   }
@@ -217,6 +219,23 @@ FailureOr<std::string> Emitter::chain(Value stream) {
               out << "\n.commit_trim::<" << m(st.getPacket()) << ">()";
               return success();
             })
+            .Case([&](ContractOuterOp o) {
+              out << "\n.contract_outer::<" << tp() << ", _, _, _>(&" << nameOf(o.getTrf()) << ")";
+              return success();
+            })
+            .Case([&](ContractPacketOp) {
+              out << "\n.contract_packet::<" << m(st.getPacket()) << ">()";
+              return success();
+            })
+            .Case([&](ContractTimeOp) {
+              out << "\n.contract_time::<" << m(st.getTime()) << ">()";
+              return success();
+            })
+            .Case([&](ContractLaneOp o) {
+              out << "\n.contract_lane::<" << tp() << ">(LaneMode::"
+                  << (o.getMode() == LaneMode::Interleaved ? "Interleaved" : "Sequential") << ")";
+              return success();
+            })
             .Default([&](Operation *op) -> LogicalResult {
               return op->emitOpError("has no Rust form in a builder chain");
             });
@@ -305,6 +324,14 @@ LogicalResult Emitter::emit(func::FuncOp kernel) {
                 names[o] = fresh(nameOf(o.getSource()) + "_hbm");
                 os << "    let " << names[o] << ": " << rustType(o.getType()) << " = " << expr << ";\n";
               }
+              return success();
+            })
+            .Case([&](ToTrfOp o) -> LogicalResult {
+              FailureOr<std::string> c = chain(o.getInput());
+              if (failed(c))
+                return o.emitOpError("does not end a builder chain from a begin");
+              names[o] = fresh("trf" + std::to_string(names.size()));
+              os << "    let " << names[o] << ": " << rustType(o.getType()) << " = " << *c << "\n.to_trf();\n";
               return success();
             })
             .Case([&](CommitOp o) -> LogicalResult {

@@ -2,6 +2,7 @@ add_triton_library(FuriosaCodegen
   Dialect.cpp
   EmitRust.cpp
   LinalgToFopt.cpp
+  Mapping/Contraction.cpp
   Mapping/Elementwise.cpp
 
   DEPENDS

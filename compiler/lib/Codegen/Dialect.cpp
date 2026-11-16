@@ -540,6 +540,42 @@ LogicalResult CommitTrimOp::verify() {
   return verifyStreamUse(*this);
 }
 
+LogicalResult ToTrfOp::verify() {
+  auto in = getInput().getType();
+  auto out = getResult().getType();
+  if (in.getChip() != out.getChip() || in.getCluster() != out.getCluster() || in.getSlice() != out.getSlice())
+    return emitOpError("the TRF keeps the stream's chip, cluster and slice placement");
+  return success();
+}
+
+LogicalResult ContractOuterOp::verify() {
+  auto in = getInput().getType();
+  auto trf = getTrf().getType();
+  if (in.getChip() != trf.getChip() || in.getCluster() != trf.getCluster() || in.getSlice() != trf.getSlice())
+    return emitOpError("the stream and the TRF share chip, cluster and slice");
+  if (failed(verifySamePlacement(*this, in, getResult().getType())))
+    return failure();
+  return verifyStreamUse(*this);
+}
+
+LogicalResult ContractPacketOp::verify() {
+  if (failed(verifySamePlacement(*this, getInput().getType(), getResult().getType())))
+    return failure();
+  return verifyStreamUse(*this);
+}
+
+LogicalResult ContractTimeOp::verify() {
+  if (failed(verifySamePlacement(*this, getInput().getType(), getResult().getType())))
+    return failure();
+  return verifyStreamUse(*this);
+}
+
+LogicalResult ContractLaneOp::verify() {
+  if (failed(verifySamePlacement(*this, getInput().getType(), getResult().getType())))
+    return failure();
+  return verifyStreamUse(*this);
+}
+
 LogicalResult CommitOp::verify() {
   auto in = getInput().getType();
   auto out = getResult().getType();

@@ -225,6 +225,40 @@ def Fopt_VectorClipOp : Fopt_VectorOp<"vector_clip", ".vector_clip(ClipBinaryOpF
 def Fopt_VectorFpBinaryOp : Fopt_VectorOp<"vector_fp_binary", ".vector_fp_binary(FpBinaryOp::<op>, imm)",
                                           (ins F32Attr:$imm)>;
 
+// Contraction (main context): the TRF operand is loaded by a sub-context pass ending in to_trf.
+
+def Fopt_LaneMode : I32EnumAttr<"LaneMode", "contract_lane mode", [
+  I32EnumAttrCase<"Interleaved", 0, "interleaved">,
+  I32EnumAttrCase<"Sequential", 1, "sequential">
+]> {
+  let cppNamespace = "::mlir::furiosa::fopt";
+}
+
+def Fopt_ToTrfOp : Fopt_Op<"to_trf", [Pure]> {
+  let summary = ".to_trf()";
+  let arguments = (ins Fopt_Stream:$input);
+  let results = (outs Fopt_TrfTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` qualified(type($input)) `->` qualified(type($result))";
+  let hasVerifier = 1;
+}
+
+def Fopt_ContractOuterOp : Fopt_StageOp<"contract_outer"> {
+  let summary = ".contract_outer::<Time, Packet, _, _, _>(&trf)";
+  let arguments = (ins Fopt_Stream:$input, Fopt_TrfTensor:$trf);
+  let assemblyFormat = [{
+    $input `,` $trf attr-dict `:` qualified(type($input)) `,` qualified(type($trf)) `->` qualified(type($result))
+  }];
+}
+
+def Fopt_ContractPacketOp : Fopt_UnaryStageOp<"contract_packet", ".contract_packet::<Packet>()">;
+def Fopt_ContractTimeOp : Fopt_UnaryStageOp<"contract_time", ".contract_time::<Time>()">;
+
+def Fopt_ContractLaneOp : Fopt_StageOp<"contract_lane"> {
+  let summary = ".contract_lane::<Time, Packet>(LaneMode::<mode>)";
+  let arguments = (ins Fopt_Stream:$input, Fopt_LaneMode:$mode);
+  let assemblyFormat = "$mode $input attr-dict `:` qualified(type($input)) `->` qualified(type($result))";
+}
+
 def Fopt_CommitOp : Fopt_Op<"commit", [Pure]> {
   let summary = ".commit::<Element>()";
   let arguments = (ins Fopt_Stream:$input);
