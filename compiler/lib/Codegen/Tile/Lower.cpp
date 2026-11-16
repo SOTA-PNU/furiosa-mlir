@@ -102,6 +102,7 @@ private:
   int64_t colLocalSize = 1, colPad = kLanes; // local columns, and padded to whole packets
   std::optional<Digit> colBlock, colLocalD;
   int64_t colExtent = 0; // the column axis padded to whole column tiles (0: no padding)
+  MapAttr cpAxis;         // the padded column as a live axis
   SmallVector<Digit> tileD, sliceD, localD; // row digits by role, most significant first
   SmallVector<MapAttr> outDims;
 
@@ -127,7 +128,9 @@ private:
   MapAttr pairOf(ArrayRef<MapAttr> parts) { return MapAttr::pair(ctx, parts); }
   MapAttr digit(const Digit &d) {
     int64_t extent = d.extent ? d.extent : p.axes[d.axis].size;
-    MapAttr base = extent > p.axes[d.axis].size ? ax(d.axis).padTo(extent) : ax(d.axis);
+    // A column padded to whole tiles is a live axis of the padded extent inside the kernel (digits of a padded
+    // axis do not tile); only the final relayout reads it as the column.
+    MapAttr base = extent > p.axes[d.axis].size ? cpAxis : ax(d.axis);
     MapAttr m = d.place > 1 ? base.stride(d.place) : base;
     return d.place * d.size < extent ? m.modulo(d.size) : m;
   }
@@ -690,6 +693,8 @@ LogicalResult Lowering::declare() {
     axisMap.push_back(kb.axis("A" + std::to_string(i), a.size));
   if (gemm)
     kf = kb.axis("KF", kl.size());
+  if (colExtent)
+    cpAxis = kb.axis("CP", colExtent);
   interleave = kb.axis("I", 2);
   std::set<unsigned> readArgs;
   for (const Read &r : p.reads)
@@ -1641,8 +1646,13 @@ LogicalResult Lowering::emit() {
     DmToHbmViewOp::create(b, loc(), convert(v->dm, p.outType),
                           tileDigits(view(outCanonical, true), outParts, tileAt(layout, index), true));
   }
-  // The relayout into the written buffer's own layout.
+  // The relayout into the written buffer's own layout (a padded column read back as the column).
   Value out = allocHbm(pairOf(outDims), p.outType);
+  if (colExtent) {
+    SmallVector<MapAttr> asColumn = canonical(rows, true);
+    asColumn.push_back(ax(*col).padTo(colExtent));
+    outCanonical = reshapeHbm(outCanonical, pairOf(asColumn));
+  }
   copy(view(outCanonical, false), view(out, true));
   kb.finish({out});
   return success();
