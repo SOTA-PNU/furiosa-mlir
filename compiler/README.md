@@ -50,6 +50,14 @@ One `builtin.module` per kernel specialization holding one public `func.func @<k
   more arithmetic). A generic with reduction dims carries their extents on a `tensor.empty` input it never
   reads. A later generic pass (`furiosa-structure`) promotes affine extracts to indexing-map inputs, so the
   mapping stage sees ordinary structured linalg.
+- Iteration spaces follow the buffers: a store's generic iterates a view of the stored buffer whose dims
+  are the buffer's own dims where the tiles allow (a flattened index tiled across dims, such as a pixel
+  index over `[N, OH, OW]`, becomes those dims). A tile index that the computation uses on its own (a
+  head index within a `[T, H*D]` row) gets a dim of its own. Floor-divisions and remainders that the
+  dims' ranges decide are resolved.
+- Generics and kept loop states span only the dims they depend on, and a reduction over a padded tile
+  (`BLOCK_K > K`, masked to zero) runs over the live extent.
+- Function arguments keep the Triton parameter names as `NameLoc`s.
 
 Running the function on the buffers must give exactly what the Triton grid gives (judged by harness L1).
 
