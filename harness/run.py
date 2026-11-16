@@ -164,6 +164,10 @@ def judge(name: str, level: str, impl: str) -> Result:
     if not (crate / "Cargo.toml").exists():
         return Result("SKIP", f"no {impl} crate")
     if level == "L2":
+        failed = crate / "CODEGEN_FAILED"
+        if failed.exists():  # the compiler wrote a crate that only carries its codegen diagnostic
+            reason = failed.read_text().strip().replace(str(ROOT) + "/", "")
+            return Result("FAIL", f"codegen: {reason[:300]}")
         # A target dir per crate: every crate's binary is named run_graph, so a shared one could run
         # another crate's binary (cargo#6313).
         target = str(crate / "target" / "npu")
