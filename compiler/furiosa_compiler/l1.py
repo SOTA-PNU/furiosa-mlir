@@ -66,8 +66,14 @@ def run_graph(graph: dict, buffers: dict, kernels: Kernels) -> None:
             buffers[launch["args"][w]] = out
 
 
+# One unit in the last place, relative: Triton leaves fp32 accumulation order unspecified, so a raised
+# kernel may round the final value one ulp differently (harness/README.md, L1).
+ULP = {"bfloat16": 2.0**-7, "float16": 2.0**-10}
+
+
 def compare(got: dict, want: dict, rtol: float, atol: float) -> tuple[bool, str]:
-    """harness/run.py's rule: integers exact; floats max|err| <= atol + rtol * max|golden|, NaN fails."""
+    """harness/run.py's rule: integers exact; floats max|err| <= atol + rtol * max|golden|, NaN fails;
+    rtol is at least one ulp of the output dtype."""
     worst, worst_name = 0.0, ""
     for name, ref in want.items():
         if name not in got:
@@ -83,8 +89,9 @@ def compare(got: dict, want: dict, rtol: float, atol: float) -> tuple[bool, str]
         o, r = out.astype(np.float64), ref.astype(np.float64)
         err = float(np.abs(o - r).max()) if r.size else 0.0
         scale = float(np.abs(r).max()) if r.size else 0.0
-        if not err <= atol + rtol * scale:
-            return False, f"{name}: max err {err:.3g} > {atol} + {rtol}*{scale:.3g}"
+        tol = max(rtol, ULP.get(ref.dtype.name, 0.0))
+        if not err <= atol + tol * scale:
+            return False, f"{name}: max err {err:.3g} > {atol} + {tol:.3g}*{scale:.3g}"
         if scale and err / scale >= worst:
             worst, worst_name = err / scale, name
     return True, f"rel {worst:.2g} @ {worst_name}" if worst_name else ""

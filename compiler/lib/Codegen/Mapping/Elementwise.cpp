@@ -1,9 +1,8 @@
 // Op class: an elementwise linalg.generic over f32 (identity maps, all parallel, one or two inputs), whose
 // body is one Vector Engine op.
 //
-// Layout: the flattened axis A splits into
-// 32-byte packets (8 x f32) spread over the 256 slices of cluster 0; past 256 packets the rest goes to time
-// (A / 2048), and sizes that do not divide are padded (`A # n`). Two inputs stream interleaved through one
+// Layout: the buffers, flattened to one axis A, split exactly into packets, slices of cluster 0 and time (see
+// map()). Two inputs stream interleaved through one
 // pass (axis I, innermost in time) and meet in the clip stage; one input meets an immediate in the clip
 // stage, or a float op in the 4-wide float region between narrow_split and widen_concat.
 
@@ -190,14 +189,11 @@ LogicalResult map(RaisedKernel &kernel) {
   KernelBuilder kb(kernel);
   MLIRContext *ctx = kb.getContext();
   Type f32 = Float32Type::get(ctx);
-  // One axis per dimension (A, B, ...; I is the interleave axis); the layout flattens them row-major.
+  // Elementwise over identity maps reads every buffer in the same row-major order, so the kernel declares
+  // each buffer as one flat axis of all its elements (the host relabels buffers by size, so the logical
+  // shape does not reach the kernel); splitting a multi-axis pair across its rows is not expressible.
   int64_t n = tensorType.getNumElements();
-  SmallVector<MapAttr> dims;
-  for (auto [d, size] : llvm::enumerate(tensorType.getShape())) {
-    std::string name(1, char('A' + d + (d >= 8)));  // skip 'I'
-    dims.push_back(kb.axis(name, size));
-  }
-  MapAttr a = MapAttr::pair(ctx, dims);
+  MapAttr a = kb.axis("A", n);
 
   // Each input is a distinct pointer argument, declared in generic operand order.
   SmallVector<int64_t> inputArgs;
@@ -218,26 +214,27 @@ LogicalResult map(RaisedKernel &kernel) {
   OpBuilder &b = kb.builder();
   Location loc = kb.loc();
 
-  // Layout: packets of one flit, 256 slices, the rest in time.
-  constexpr int64_t kPacket = 8, kSlices = 256;
-  int64_t packets = (n + kPacket - 1) / kPacket;
-  MapAttr base = a, slice, element, outer = kb.one();
-  if (packets <= kSlices) {
-    if (packets * kPacket != n)
-      base = a.padTo(packets * kPacket);
-    slice = base.stride(kPacket);
-    if (packets < kSlices)
-      slice = slice.padTo(kSlices);
-    element = base.modulo(kPacket);
-  } else {
-    int64_t steps = (packets + kSlices - 1) / kSlices;
-    if (steps * kSlices * kPacket != n)
-      base = a.padTo(steps * kSlices * kPacket);
-    slice = base.stride(kPacket).modulo(kSlices);
-    outer = base.stride(kSlices * kPacket);
-    element = MapAttr::pair(ctx, {outer, base.modulo(kPacket)});
-  }
-  MapAttr packet = base.modulo(kPacket);
+  // Layout, exact (DMA writes to DM must stay 8-byte aligned, so no element is padded): the packet is the
+  // largest of 8 / 4 / 2 elements dividing n (collect pads it to one flit); the packets split into S slices,
+  // the largest divisor of their count up to 256 (the slice digit padded to 256), and T time steps; each
+  // slice holds one contiguous run of T packets.
+  constexpr int64_t kFlit = 8, kSlices = 256;
+  int64_t p = kFlit;
+  while (p > 1 && n % p)
+    p /= 2;
+  if (p < 2)
+    return func.emitError("elementwise: an odd number of f32 elements (") << n << ") breaks the 8-byte DMA alignment";
+  int64_t q = n / p, slices = std::min(q, kSlices);
+  while (q % slices)
+    --slices;
+  int64_t steps = q / slices;
+  MapAttr slice = a.stride(steps * p);
+  if (slices < kSlices)
+    slice = slice.padTo(kSlices);
+  MapAttr element = slices == 1 ? a : a.modulo(steps * p);
+  MapAttr outer = steps == 1 ? kb.one() : element.stride(p);
+  MapAttr packet = p == n ? a : a.modulo(p);
+  MapAttr flit = p < kFlit ? packet.padTo(kFlit) : packet;
   DmTensorType dmType = kb.dmType(f32, slice, element);
 
   SmallVector<Value> dms;
@@ -251,33 +248,42 @@ LogicalResult map(RaisedKernel &kernel) {
     MapAttr time = MapAttr::pair(ctx, {outer, i});
     s = BeginInterleavedOp::create(b, loc, stream(i, element), dms[0], dms[1], ContextKind::Main, i);
     s = FetchOp::create(b, loc, stream(time, packet), s);
-    s = CollectOp::create(b, loc, stream(time, packet), s);
-    s = VectorInitOp::create(b, loc, stream(time, packet), s);
-    s = VectorIntraSliceUnzipOp::create(b, loc, stream(outer, packet), s, i);
-    s = VectorClipZipOp::create(b, loc, stream(outer, packet), s, b.getStringAttr(body->op));
+    s = CollectOp::create(b, loc, stream(time, flit), s);
+    s = VectorInitOp::create(b, loc, stream(time, flit), s);
+    s = VectorIntraSliceUnzipOp::create(b, loc, stream(outer, flit), s, i);
+    s = VectorClipZipOp::create(b, loc, stream(outer, flit), s, b.getStringAttr(body->op));
   } else {
     s = BeginOp::create(b, loc, stream(kb.one(), element), dms[0], ContextKind::Main);
     s = FetchOp::create(b, loc, stream(outer, packet), s);
-    s = CollectOp::create(b, loc, stream(outer, packet), s);
-    s = VectorInitOp::create(b, loc, stream(outer, packet), s);
-    s = VectorIntraSliceTagOp::create(b, loc, stream(outer, packet), s);
+    s = CollectOp::create(b, loc, stream(outer, flit), s);
+    s = VectorInitOp::create(b, loc, stream(outer, flit), s);
+    s = VectorIntraSliceTagOp::create(b, loc, stream(outer, flit), s);
     if (body->kind == Kind::ClipImm) {
-      s = VectorClipOp::create(b, loc, stream(outer, packet), s, b.getStringAttr(body->op),
+      s = VectorClipOp::create(b, loc, stream(outer, flit), s, b.getStringAttr(body->op),
                                b.getF32FloatAttr(body->imm));
     } else {
-      // The float region is 4 lanes wide: split the packet's top digit into time, and back.
-      MapAttr narrowTime = MapAttr::pair(ctx, {outer, base.modulo(kPacket).stride(4)});
-      MapAttr narrowPacket = base.modulo(4);
-      s = VectorNarrowSplitOp::create(b, loc, stream(narrowTime, narrowPacket), s);
+      // The float region is 4 lanes wide: an 8-element packet splits its top digit into time and back; a
+      // 4-element one is trimmed from its padded flit and padded back.
+      if (p != 8 && p != 4)
+        return func.emitError("elementwise: float ops need 4- or 8-element packets; ") << n << " elements give " << p;
+      MapAttr narrowTime = p == 8 ? MapAttr::pair(ctx, {outer, packet.stride(4)}) : outer;
+      MapAttr narrowPacket = p == 8 ? a.modulo(4) : packet;
+      if (p == 8)
+        s = VectorNarrowSplitOp::create(b, loc, stream(narrowTime, narrowPacket), s);
+      else
+        s = VectorNarrowTrimOp::create(b, loc, stream(narrowTime, narrowPacket), s);
       if (body->kind == Kind::FpUnary)
         s = VectorFpUnaryOp::create(b, loc, stream(narrowTime, narrowPacket), s, b.getStringAttr(body->op));
       else
         s = VectorFpBinaryOp::create(b, loc, stream(narrowTime, narrowPacket), s, b.getStringAttr(body->op),
-                                       b.getF32FloatAttr(body->imm));
-      s = VectorWidenConcatOp::create(b, loc, stream(outer, packet), s);
+                                     b.getF32FloatAttr(body->imm));
+      if (p == 8)
+        s = VectorWidenConcatOp::create(b, loc, stream(outer, flit), s);
+      else
+        s = VectorWidenPadOp::create(b, loc, stream(outer, flit), s);
     }
   }
-  s = VectorFinalOp::create(b, loc, stream(outer, packet), s);
+  s = VectorFinalOp::create(b, loc, stream(outer, flit), s);
   s = CommitTrimOp::create(b, loc, stream(outer, packet), s);
   Value out = CommitOp::create(b, loc, dmType, s);
   Value hbm = ToHbmOp::create(b, loc, kb.hbmType(f32, a), out);

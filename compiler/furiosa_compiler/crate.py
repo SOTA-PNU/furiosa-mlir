@@ -308,11 +308,12 @@ def failed_crate(crate: Path, model: str, error: str) -> Path:
     message = json.dumps("furiosa codegen: " + " | ".join(error.splitlines()))
     (crate / "src" / "lib.rs").write_text(f"compile_error!({message});\n")
     (crate / "src" / "run_graph.rs").write_text(f"compile_error!({message});\nfn main() {{}}\n")
+    (crate / "CODEGEN_FAILED").write_text(error.rstrip() + "\n")
     return crate
 
 
 def reset(crate: Path):
-    for stale in ("src", "Cargo.toml"):
+    for stale in ("src", "Cargo.toml", "CODEGEN_FAILED"):
         target = crate / stale
         if target.is_dir():
             shutil.rmtree(target)

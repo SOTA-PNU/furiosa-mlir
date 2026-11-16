@@ -50,6 +50,10 @@ files are always the canonical host layout.
 | L3 `cpu` | the crate | plain `cargo run --bin run_graph` (furiosa-opt's CPU backend) matches golden | furiosa-opt |
 | L4 `npu` | the crate | the NPU build on npu3 matches golden | an idle npu3 |
 
+L1 compares with the case's exact tolerance, raised to one unit in the last place of the output dtype
+(bf16 2^-7, fp16 2^-10, relative to max|golden|): the kernel's arithmetic is reproduced in its own dtypes,
+but Triton leaves the order of fp32 accumulation unspecified, so a final rounding may differ by one ulp.
+
 L3 and L4 compare with the case's NPU tolerance, which allows for the dtype policy the NPU forces
 (no fp32 or fp16 contraction: dots run in bf16 with fp32 accumulation). A match means
 `max|out - golden| <= atol + rtol * max|golden|` for every output.

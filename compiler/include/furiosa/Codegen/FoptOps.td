@@ -192,6 +192,8 @@ def Fopt_VectorInitOp : Fopt_UnaryStageOp<"vector_init", ".vector_init()">;
 def Fopt_VectorFinalOp : Fopt_UnaryStageOp<"vector_final", ".vector_final()">;
 def Fopt_VectorNarrowSplitOp : Fopt_UnaryStageOp<"vector_narrow_split", ".vector_narrow_split::<Time, Packet>()">;
 def Fopt_VectorWidenConcatOp : Fopt_UnaryStageOp<"vector_widen_concat", ".vector_widen_concat::<Time, Packet>()">;
+def Fopt_VectorNarrowTrimOp : Fopt_UnaryStageOp<"vector_narrow_trim", ".vector_narrow_trim::<Packet>()">;
+def Fopt_VectorWidenPadOp : Fopt_UnaryStageOp<"vector_widen_pad", ".vector_widen_pad::<Packet>()">;
 def Fopt_CastOp : Fopt_UnaryStageOp<"cast", ".cast::<D, Packet>()">;
 def Fopt_CommitTrimOp : Fopt_UnaryStageOp<"commit_trim", ".commit_trim::<Packet>()">;
 

@@ -458,6 +458,22 @@ LogicalResult VectorWidenConcatOp::verify() {
   return verifyVectorStage(*this, getInput().getType(), getResult().getType());
 }
 
+LogicalResult VectorNarrowTrimOp::verify() {
+  if (packetBytes(getResult().getType()) != 16)
+    return emitOpError("trims to a 4-element (16-byte) packet, got ") << packetBytes(getResult().getType());
+  if (getInput().getType().getTime() != getResult().getType().getTime())
+    return emitOpError("keeps time");
+  return verifyVectorStage(*this, getInput().getType(), getResult().getType());
+}
+
+LogicalResult VectorWidenPadOp::verify() {
+  if (packetBytes(getResult().getType()) != 32)
+    return emitOpError("pads to an 8-element (32-byte) packet, got ") << packetBytes(getResult().getType());
+  if (getInput().getType().getTime() != getResult().getType().getTime())
+    return emitOpError("keeps time");
+  return verifyVectorStage(*this, getInput().getType(), getResult().getType());
+}
+
 LogicalResult VectorIntraSliceTagOp::verify() {
   return verifyVectorStage(*this, getInput().getType(), getResult().getType());
 }

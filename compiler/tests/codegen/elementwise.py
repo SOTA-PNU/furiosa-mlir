@@ -36,6 +36,12 @@ VARIANTS = [
     ("scale_4096", 4096, "%c = arith.constant 0.5 : f32\n      %r = arith.mulf %a, %c : f32", lambda x: x * 0.5, 1),
     ("sub_2048", 2048, "%c = arith.constant 1.5 : f32\n      %r = arith.subf %a, %c : f32", lambda x: x - 1.5, 1),
     ("neg_2048", 2048, "%r = arith.negf %a : f32", lambda x: -x, 1),
+    ("exp_100", 100, "%r = math.exp %a : f32", np.exp, 1),
+    ("relu_100", 100, "%c = arith.constant 0.0 : f32\n      %r = arith.maximumf %a, %c : f32",
+     lambda x: np.maximum(x, 0), 1),
+    ("add_6", 6, "%r = arith.addf %a, %b : f32", lambda x, y: x + y, 2),
+    ("scale_8x1000", (8, 1000), "%c = arith.constant -2.0 : f32\n      %r = arith.mulf %a, %c : f32",
+     lambda x: x * -2.0, 1),
 ]
 
 

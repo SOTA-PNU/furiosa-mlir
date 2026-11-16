@@ -25,6 +25,7 @@ template <typename F> std::string withModule(const std::string &text, F body) {
   mlir::furiosa::registerCodegenDialects(registry);
   mlir::MLIRContext context(registry);
   context.allowUnregisteredDialects(true); // e.g. tt.divisibility left on raised arguments
+  context.printOpOnDiagnostic(false);       // the message names the problem; the IR is in the stage file
   std::string diagnostics;
   llvm::raw_string_ostream diag(diagnostics);
   mlir::ScopedDiagnosticHandler handler(&context, [&](mlir::Diagnostic &d) {

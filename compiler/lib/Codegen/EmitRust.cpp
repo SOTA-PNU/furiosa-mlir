@@ -175,6 +175,14 @@ FailureOr<std::string> Emitter::chain(Value stream) {
               out << "\n.vector_widen_concat::<" << tp() << ">()";
               return success();
             })
+            .Case([&](VectorNarrowTrimOp) {
+              out << "\n.vector_narrow_trim::<" << m(st.getPacket()) << ">()";
+              return success();
+            })
+            .Case([&](VectorWidenPadOp) {
+              out << "\n.vector_widen_pad::<" << m(st.getPacket()) << ">()";
+              return success();
+            })
             .Case([&](VectorClipZipOp o) {
               out << "\n.vector_clip_zip(ClipBinaryOpF32::" << o.getOp() << ")";
               return success();

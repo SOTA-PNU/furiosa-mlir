@@ -120,7 +120,13 @@ struct LinalgToFoptPass : PassWrapper<LinalgToFoptPass, OperationPass<ModuleOp>>
           break;
         }
       if (!chosen) {
-        func.emitError("no op class maps this kernel (classes: elementwise)");
+        bool gather = false;
+        func.walk([&](tensor::ExtractOp) { gather = true; });
+        if (gather)
+          func.emitError("the kernel reads buffers with tensor.extract (gather form); mapping needs structured "
+                         "linalg (affine reads promoted to indexing-map inputs by furiosa-structure)");
+        else
+          func.emitError("no op class maps this kernel (classes: elementwise)");
         return signalPassFailure();
       }
       if (failed(chosen->map(kernel)))

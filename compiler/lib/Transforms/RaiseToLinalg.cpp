@@ -33,10 +33,12 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/IR/Verifier.h"
 
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/JSON.h"
 
 #include <cmath>
@@ -1183,9 +1185,13 @@ Raiser::buildGeneric(Gen &parent, ArrayRef<unsigned> parentDims, ArrayRef<int64_
                      SmallVector<unsigned> &used) -> FailureOr<Value> {
     OpBuilder::InsertionGuard guard(b);
     b.setInsertionPoint(parent.anchor);
+    // What the bodies below read gets built before this placeholder, ahead of both generics.
+    Operation *anchor = arith::ConstantIndexOp::create(b, loc, 0);
+    llvm::scope_exit dropAnchor([&] { anchor->erase(); });
     // remap: parent dim -> this generic's dim (-1: dropped)
     SmallVector<int> remap(parent.extent.size(), -1);
     Gen g;
+    g.anchor = anchor;
     for (auto [i, d] : llvm::enumerate(keep)) {
       remap[d] = i;
       g.lo.push_back(parent.lo[d]);
@@ -1231,7 +1237,6 @@ Raiser::buildGeneric(Gen &parent, ArrayRef<unsigned> parentDims, ArrayRef<int64_
           }
           linalg::YieldOp::create(ob, loc, ValueRange{*v});
         });
-    gi.anchor = initOp;
     if (failed(status))
       return failure();
     if (ownExtents.empty())
@@ -1268,7 +1273,6 @@ Raiser::buildGeneric(Gen &parent, ArrayRef<unsigned> parentDims, ArrayRef<int64_
             }
             linalg::YieldOp::create(ob, loc, ValueRange{*v});
           });
-      g.anchor = op;
       if (failed(status))
         return failure();
       result = op.getResult(0);
@@ -1592,6 +1596,8 @@ LogicalResult Raiser::run() {
   }
   func::ReturnOp::create(b, loc, results);
   func->setAttr("furiosa.written", b.getI64ArrayAttr(written));
+  if (failed(verify(func)))
+    return kernel.emitError("furiosa: internal error: the raised function does not verify");
   kernel.erase();
   return success();
 }
