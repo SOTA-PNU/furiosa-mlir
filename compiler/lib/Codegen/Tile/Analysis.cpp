@@ -162,8 +162,41 @@ std::set<unsigned> dimsOf(AffineExpr e) {
   return out;
 }
 
-/// The constants each dim is divided or reduced by (x floordiv c, x mod c with x mentioning that dim alone).
-std::map<unsigned, std::set<int64_t>> divisors(ArrayRef<AffineExpr> exprs) {
+/// `e` as sum(coefficient * dim) + constant, if it is one.
+std::optional<std::pair<std::map<unsigned, int64_t>, int64_t>> linearInDims(AffineExpr e) {
+  if (auto c = dyn_cast<AffineConstantExpr>(e))
+    return std::make_pair(std::map<unsigned, int64_t>{}, c.getValue());
+  if (auto d = dyn_cast<AffineDimExpr>(e))
+    return std::make_pair(std::map<unsigned, int64_t>{{d.getPosition(), 1}}, int64_t(0));
+  auto bin = dyn_cast<AffineBinaryOpExpr>(e);
+  if (!bin)
+    return std::nullopt;
+  if (e.getKind() == AffineExprKind::Add) {
+    auto l = linearInDims(bin.getLHS()), r = linearInDims(bin.getRHS());
+    if (!l || !r)
+      return std::nullopt;
+    for (auto [d, c] : r->first)
+      l->first[d] += c;
+    l->second += r->second;
+    return l;
+  }
+  if (e.getKind() == AffineExprKind::Mul) {
+    auto c = dyn_cast<AffineConstantExpr>(bin.getRHS());
+    auto x = linearInDims(bin.getLHS());
+    if (!c || !x)
+      return std::nullopt;
+    for (auto &[d, k] : x->first)
+      k *= c.getValue();
+    x->second *= c.getValue();
+    return x;
+  }
+  return std::nullopt;
+}
+
+/// The places each dim must split at: the constants a map divides or reduces it by (x floordiv c, x mod c with
+/// x mentioning that dim alone), and, for a divided sum of several dims (a flattened index), the place within
+/// each dim where the divisor falls (c / coefficient, when it is a proper divisor of the dim's extent).
+std::map<unsigned, std::set<int64_t>> divisors(ArrayRef<AffineExpr> exprs, ArrayRef<int64_t> extents) {
   std::map<unsigned, std::set<int64_t>> found;
   for (AffineExpr e : exprs)
     e.walk([&](AffineExpr x) {
@@ -171,9 +204,23 @@ std::map<unsigned, std::set<int64_t>> divisors(ArrayRef<AffineExpr> exprs) {
         return;
       auto bin = cast<AffineBinaryOpExpr>(x);
       auto c = dyn_cast<AffineConstantExpr>(bin.getRHS());
+      if (!c || c.getValue() <= 1)
+        return;
       std::set<unsigned> dims = dimsOf(bin.getLHS());
-      if (c && c.getValue() > 1 && dims.size() == 1)
+      if (dims.size() == 1) {
         found[*dims.begin()].insert(c.getValue());
+        return;
+      }
+      auto lin = linearInDims(bin.getLHS());
+      if (!lin)
+        return;
+      for (auto [d, k] : lin->first) {
+        if (k <= 0 || c.getValue() % k)
+          continue;
+        int64_t place = c.getValue() / k;
+        if (place > 1 && place < extents[d] && extents[d] % place == 0)
+          found[d].insert(place);
+      }
     });
   return found;
 }
@@ -198,6 +245,7 @@ public:
                                              : dim.floorDiv(cs[k - 1]) % (cs[k] / cs[k - 1]);
         ds.push_back({e, place, size});
         place_[e] = {unsigned(d), place};
+        size_[e] = size;
       }
       table[d] = ds;
     }
@@ -240,6 +288,38 @@ public:
     if (e.getKind() == AffineExprKind::FloorDiv || e.getKind() == AffineExprKind::Mod) {
       auto c = dyn_cast<AffineConstantExpr>(bin.getRHS());
       Form inner = linear(bin.getLHS());
+      // A sum of digits (of any dims) that splits at c without a carry: every term at or above c is a multiple of
+      // c, and the terms below c (at their largest) plus the constant stay below c.
+      if (c && c.getValue() > 0 && inner.constant >= 0) {
+        int64_t cv = c.getValue(), below = inner.constant;
+        bool ok = true;
+        for (auto [atom, coeff] : inner.terms) {
+          if (!coeff)
+            continue;
+          auto it = size_.find(atom);
+          if (it == size_.end() || coeff < 0) {
+            ok = false;
+            break;
+          }
+          if (coeff >= cv)
+            ok &= coeff % cv == 0;
+          else
+            below += coeff * (it->second - 1);
+        }
+        if (ok && below < cv) {
+          for (auto [atom, coeff] : inner.terms) {
+            if (!coeff)
+              continue;
+            if (e.getKind() == AffineExprKind::FloorDiv && coeff >= cv)
+              f.terms[atom] += coeff / cv;
+            if (e.getKind() == AffineExprKind::Mod && coeff < cv)
+              f.terms[atom] += coeff;
+          }
+          if (e.getKind() == AffineExprKind::Mod)
+            f.constant += inner.constant;
+          return f;
+        }
+      }
       // Digits of one dim at exactly their place values (plus a constant below the divisor for floordiv), and
       // a divisor of that dim's chain: the digits above (floordiv) or below (mod) the divisor survive.
       std::optional<unsigned> dim;
@@ -290,6 +370,7 @@ public:
 
   MLIRContext *ctx;
   llvm::DenseMap<AffineExpr, std::pair<unsigned, int64_t>> place_; // digit -> (dim, place value)
+  llvm::DenseMap<AffineExpr, int64_t> size_;                      // digit -> extent
 };
 
 //===----------------------------------------------------------------------===//
@@ -438,6 +519,14 @@ public:
       return valueAt(expand.getSrc(), src, fill);
     }
     if (auto collapse = dyn_cast<tensor::CollapseShapeOp>(op)) {
+      // A collapsed buffer is read as the flat buffer it is: its index stays linear however it was formed.
+      if (auto arg = dyn_cast<BlockArgument>(collapse.getSrc()); arg && arg.getOwner() == &func.getBody().front()) {
+        auto type = collapse.getResultType();
+        reads.push_back({arg.getArgNumber(), type.getElementType(), SmallVector<int64_t>(type.getShape()), idx, fill});
+        RawNode n{Node::Leaf};
+        n.read = reads.size() - 1;
+        return add(n);
+      }
       // Source dims = the digits of the collapsed index.
       auto srcShape = collapse.getSrcType().getShape();
       SmallVector<AffineExpr> src(srcShape.size());
@@ -720,7 +809,7 @@ FailureOr<Program> mlir::furiosa::tile::analyze(func::FuncOp func, ArrayRef<int6
   for (const RawRead &r : folder.reads)
     llvm::append_range(all, r.index);
   std::map<unsigned, SmallVector<int64_t>> chains;
-  for (auto &[d, cs] : divisors(all)) {
+  for (auto &[d, cs] : divisors(all, folder.extents)) {
     SmallVector<int64_t> chain(cs.begin(), cs.end());
     bool ok = true;
     for (unsigned i = 0; i < chain.size(); ++i)

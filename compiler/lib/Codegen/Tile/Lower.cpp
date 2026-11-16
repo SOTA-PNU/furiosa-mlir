@@ -26,6 +26,7 @@
 #include "furiosa/Codegen/Fopt.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <map>
 #include <set>
 
@@ -45,6 +46,7 @@ int64_t roundUp(int64_t x, int64_t m) { return (x + m - 1) / m * m; }
 struct Digit {
   unsigned axis;
   int64_t place, size;
+  int64_t extent = 0; // the axis padded to this extent (0: unpadded)
 };
 
 /// A contraction: the sum `node` over `k` of the product of two reads. `stream` reads the rows `m`, `trf` the
@@ -53,6 +55,7 @@ struct Gemm {
   unsigned node;
   unsigned stream, trf;
   SmallVector<unsigned> m, n, k;
+  SmallVector<unsigned> streamExtras, trfExtras; // further factors of each operand (reads)
 };
 
 /// The K layout of a contraction's operands: taps (axes peeled into one DMA each) times the inner axis.
@@ -93,10 +96,12 @@ private:
 
   std::optional<Gemm> gemm;
   KLayout kl;
+  int64_t kTile = 0; // the K extent of one contraction pass (KF when K is not tiled)
   SmallVector<unsigned> rows;
   std::optional<unsigned> col;              // the column axis
   int64_t colLocalSize = 1, colPad = kLanes; // local columns, and padded to whole packets
   std::optional<Digit> colBlock, colLocalD;
+  int64_t colExtent = 0; // the column axis padded to whole column tiles (0: no padding)
   SmallVector<Digit> tileD, sliceD, localD; // row digits by role, most significant first
   SmallVector<MapAttr> outDims;
 
@@ -113,6 +118,7 @@ private:
   }
 
   LogicalResult findGemm();
+  LogicalResult tryGemm(unsigned node);
   LogicalResult planLayout();
   LogicalResult declare();
 
@@ -120,9 +126,13 @@ private:
   MapAttr ax(unsigned a) { return axisMap[a]; }
   MapAttr pairOf(ArrayRef<MapAttr> parts) { return MapAttr::pair(ctx, parts); }
   MapAttr digit(const Digit &d) {
-    MapAttr m = d.place > 1 ? ax(d.axis).stride(d.place) : ax(d.axis);
-    return d.place * d.size < p.axes[d.axis].size ? m.modulo(d.size) : m;
+    int64_t extent = d.extent ? d.extent : p.axes[d.axis].size;
+    MapAttr base = extent > p.axes[d.axis].size ? ax(d.axis).padTo(extent) : ax(d.axis);
+    MapAttr m = d.place > 1 ? base.stride(d.place) : base;
+    return d.place * d.size < extent ? m.modulo(d.size) : m;
   }
+  /// The extent the layout pads axis `a` to (its size unless it is the tiled column).
+  int64_t extentOf(unsigned a) { return col && a == *col && colExtent ? colExtent : p.axes[a].size; }
   /// The slice mapping: row slice digits, then the column block. Every digit inside the outermost is padded to a
   /// power of two (the NPU addresses slices by bit fields; a padded pair with a non-power-of-two inner digit
   /// places data on the wrong slices), the whole padded to the 256 slices.
@@ -144,7 +154,7 @@ private:
     SmallVector<MapAttr> r;
     auto in = [&](unsigned a) { return llvm::is_contained(axes, a); };
     for (const Digit &d : tileD)
-      if (in(d.axis))
+      if (in(d.axis) && !(col && d.axis == *col))
         r.push_back(digit(d));
     for (const Digit &d : sliceD)
       if (in(d.axis))
@@ -152,13 +162,30 @@ private:
     for (const Digit &d : localD)
       if (in(d.axis))
         r.push_back(digit(d));
+    if (rf && llvm::any_of(ext, in))
+      r.push_back(rf);
     if (col && in(*col)) {
+      for (const Digit &d : tileD)
+        if (d.axis == *col)
+          r.push_back(digit(d));
       if (colBlock)
         r.push_back(digit(*colBlock));
       r.push_back(padCol ? colLocal() : digit(*colLocalD));
     }
     return r;
   }
+  // The reduction being evaluated on the Vector Engine: its axes, flattened into one axis in time.
+  SmallVector<unsigned> ext;
+  MapAttr rf;
+  int64_t kTiles() { return kTile ? kl.size() / kTile : 1; }
+  /// KF in canonical HBM operands: one axis, or tile and local digits when K is tiled.
+  SmallVector<MapAttr> kParts() {
+    if (kTiles() == 1)
+      return {kf};
+    return {kf.stride(kTile), kf.modulo(kTile)};
+  }
+  /// The K of one contraction pass.
+  MapAttr kLocal() { return kTiles() == 1 ? kf : kf.modulo(kTile); }
   MapAttr colLocal() {
     if (!col)
       return kb.one().padTo(colPad);
@@ -170,6 +197,8 @@ private:
     SmallVector<MapAttr> e;
     for (const Digit &d : localD)
       e.push_back(digit(d));
+    if (rf)
+      e.push_back(rf);
     e.push_back(colLocal());
     return pairOf(e);
   }
@@ -220,11 +249,16 @@ private:
 
   // Operands.
   FailureOr<Value> materialize(const Read &r, ArrayRef<unsigned> rowAxes, const KLayout *k);
-  Value toDm(Value hbm, ArrayRef<unsigned> axes, ArrayRef<int64_t> tileIndex, MapAttr element, bool withK = false) {
+  Value toDm(Value hbm, ArrayRef<unsigned> axes, ArrayRef<int64_t> tileIndex, MapAttr element, bool withK = false,
+             int64_t kIndex = 0) {
     auto parts = canonical(axes, false);
-    if (withK)
-      parts.push_back(kf);
-    Value v = tileDigits(view(hbm, false), parts, tileAt(axes, tileIndex), false);
+    auto at = tileAt(axes, tileIndex);
+    if (withK) {
+      llvm::append_range(parts, kParts());
+      if (kTiles() > 1)
+        at.push_back({kf.stride(kTile), kIndex});
+    }
+    Value v = tileDigits(view(hbm, false), parts, at, false);
     return ViewToDmOp::create(b, loc(), kb.dmType(f32, sliceMap(), element), v);
   }
 
@@ -246,28 +280,63 @@ private:
   FailureOr<Val> binary(const std::string &op, Val l, Val r);
   FailureOr<Val> select(const Node &n, ArrayRef<int64_t> tileIndex);
   FailureOr<Val> leaf(unsigned read, ArrayRef<int64_t> tileIndex);
+  FailureOr<Val> reduce(unsigned node, ArrayRef<int64_t> tileIndex);
 
   // Contraction.
-  Value trf;
   FailureOr<Value> contract(ArrayRef<int64_t> tileIndex);
+  /// A further factor of a contraction operand, in that operand's K layout (cached).
+  FailureOr<Value> extraHbm(unsigned read, ArrayRef<unsigned> rowAxes) {
+    auto it = hbmOfRead.find(~read - (1u << 20));
+    if (it != hbmOfRead.end())
+      return it->second;
+    auto h = materialize(p.reads[read], rowAxes, &kl);
+    if (failed(h))
+      return failure();
+    return hbmOfRead[~read - (1u << 20)] = *h;
+  }
 };
 
 //===----------------------------------------------------------------------===//
 // Planning
 //===----------------------------------------------------------------------===//
 
+/// A reduction with the reductions nested directly in it merged (same combiner): (op, axes, body).
+std::tuple<std::string, SmallVector<unsigned>, unsigned> flatReduce(const Program &p, unsigned node) {
+  const Node &n = p.nodes[node];
+  SmallVector<unsigned> axes(n.axes);
+  unsigned body = n.args[0];
+  while (p.nodes[body].kind == Node::Reduce && p.nodes[body].op == n.op) {
+    llvm::append_range(axes, p.nodes[body].axes);
+    body = p.nodes[body].args[0];
+  }
+  return {n.op, axes, body};
+}
+
 LogicalResult Lowering::findGemm() {
+  // Reductions that head a nest (not the body of a reduction with the same combiner).
+  std::set<unsigned> nested;
+  for (const Node &n : p.nodes)
+    if (n.kind == Node::Reduce && p.nodes[n.args[0]].kind == Node::Reduce && p.nodes[n.args[0]].op == n.op)
+      nested.insert(n.args[0]);
   SmallVector<unsigned> reduces;
   for (auto [i, n] : llvm::enumerate(p.nodes))
-    if (n.kind == Node::Reduce)
+    if (n.kind == Node::Reduce && !nested.count(i) && !std::get<1>(flatReduce(p, i)).empty())
       reduces.push_back(i);
-  if (reduces.empty())
+  // A sum of the product of two reads is a contraction; every other reduction runs on the Vector Engine.
+  for (unsigned r : reduces) {
+    if (failed(tryGemm(r)))
+      return failure();
+  }
+  return success();
+}
+
+LogicalResult Lowering::tryGemm(unsigned node) {
+  auto [op, axes, body] = flatReduce(p, node);
+  if (op != "add")
     return success();
-  if (reduces.size() > 1)
-    return fail("more than one reduction");
-  const Node &red = p.nodes[reduces[0]];
-  if (red.op != "add")
-    return fail("a " + red.op + " reduction (only sums of products are mapped yet)");
+  Node red = p.nodes[node];
+  red.axes = axes;
+  red.args = {body};
   SmallVector<unsigned> factors;
   std::function<bool(unsigned)> collect = [&](unsigned n) {
     const Node &x = p.nodes[n];
@@ -279,8 +348,8 @@ LogicalResult Lowering::findGemm() {
     }
     return false;
   };
-  if (!collect(red.args[0]) || factors.size() != 2)
-    return fail("a reduction that is not a product of two reads");
+  if (!collect(red.args[0]) || factors.size() < 2)
+    return success(); // not a contraction: the Vector Engine reduces it
   std::set<unsigned> k(red.axes.begin(), red.axes.end());
   auto outAxes = [&](unsigned read) {
     SmallVector<unsigned> o;
@@ -289,20 +358,66 @@ LogicalResult Lowering::findGemm() {
         o.push_back(a);
     return o;
   };
-  SmallVector<unsigned> o[2] = {outAxes(factors[0]), outAxes(factors[1])};
-  for (unsigned a : o[0])
-    if (llvm::is_contained(o[1], a))
-      return fail("a contraction with a batch axis (both operands index it)");
-  for (unsigned f : factors)
-    for (unsigned a : red.axes)
-      if (!llvm::is_contained(p.reads[f].axes(), a))
-        return fail("a contraction axis one operand does not read");
   auto rowsOf = [&](ArrayRef<unsigned> axes) {
     int64_t n = 1;
     for (unsigned a : axes)
       n *= p.axes[a].size;
     return n;
   };
+  // Factors fall into two operands by the output axes they share; a factor with only contraction axes (a
+  // per-K scale) joins the smaller operand. Each operand is its largest factor times the others, multiplied in
+  // on the Vector Engine.
+  SmallVector<SmallVector<unsigned>> groups; // factor indices
+  SmallVector<std::set<unsigned>> groupAxes;
+  SmallVector<unsigned> free;
+  for (unsigned f = 0; f < factors.size(); ++f) {
+    SmallVector<unsigned> o = outAxes(factors[f]);
+    if (o.empty()) {
+      free.push_back(f);
+      continue;
+    }
+    SmallVector<unsigned> joined;
+    for (unsigned gi = 0; gi < groups.size(); ++gi)
+      if (llvm::any_of(o, [&](unsigned a) { return groupAxes[gi].count(a); }))
+        joined.push_back(gi);
+    if (joined.empty()) {
+      groups.push_back({f});
+      groupAxes.push_back(std::set<unsigned>(o.begin(), o.end()));
+      continue;
+    }
+    // Merge every group this factor touches into the first.
+    unsigned first = joined.front();
+    groups[first].push_back(f);
+    groupAxes[first].insert(o.begin(), o.end());
+    for (int gi = joined.size() - 1; gi >= 1; --gi) {
+      llvm::append_range(groups[first], groups[joined[gi]]);
+      groupAxes[first].insert(groupAxes[joined[gi]].begin(), groupAxes[joined[gi]].end());
+      groups.erase(groups.begin() + joined[gi]);
+      groupAxes.erase(groupAxes.begin() + joined[gi]);
+    }
+  }
+  if (groups.size() == 1 && groups[0].size() >= 1 && !free.empty()) {
+    // One operand with output axes and per-K factors: the largest per-K factor is the other operand.
+    groups.push_back({free.pop_back_val()});
+    groupAxes.push_back({});
+  }
+  if (groups.size() != 2)
+    return groups.size() == 1 ? fail("a contraction with a batch axis (both operands index it)") : success();
+  SmallVector<unsigned> o[2] = {SmallVector<unsigned>(groupAxes[0].begin(), groupAxes[0].end()),
+                                SmallVector<unsigned>(groupAxes[1].begin(), groupAxes[1].end())};
+  for (unsigned f : free)
+    groups[rowsOf(o[0]) <= rowsOf(o[1]) ? 0 : 1].push_back(f);
+  // The main factor of each operand reads every contraction axis.
+  unsigned mainOf[2];
+  for (int gi = 0; gi < 2; ++gi) {
+    auto best = llvm::max_element(groups[gi], [&](unsigned x, unsigned y) {
+      return p.reads[factors[x]].axes().size() < p.reads[factors[y]].axes().size();
+    });
+    mainOf[gi] = *best;
+    for (unsigned a : red.axes)
+      if (!llvm::is_contained(p.reads[factors[*best]].axes(), a))
+        return fail("a contraction axis one operand does not read");
+  }
   // The TRF operand holds one column axis; the stream operand has the rest (possibly none).
   int s;
   if (o[0].size() > 1 && o[1].size() > 1)
@@ -315,10 +430,18 @@ LogicalResult Lowering::findGemm() {
     s = rowsOf(o[0]) >= rowsOf(o[1]) ? 0 : 1;
   if (o[1 - s].size() != 1)
     return fail("a contraction without a column axis");
+  if (gemm)
+    return fail("more than one contraction");
   Gemm g;
-  g.node = reduces[0];
-  g.stream = factors[s];
-  g.trf = factors[1 - s];
+  g.node = node;
+  g.stream = factors[mainOf[s]];
+  g.trf = factors[mainOf[1 - s]];
+  for (unsigned f : groups[s])
+    if (f != mainOf[s])
+      g.streamExtras.push_back(factors[f]);
+  for (unsigned f : groups[1 - s])
+    if (f != mainOf[1 - s])
+      g.trfExtras.push_back(factors[f]);
   g.m = o[s];
   g.n = o[1 - s];
   g.k = SmallVector<unsigned>(red.axes);
@@ -368,19 +491,50 @@ LogicalResult Lowering::planLayout() {
     if (in > 32)
       kl.innerPad = roundUp(in, 32);
     kl.tapPad = roundUp(t, std::max<int64_t>(1, 32 / kl.innerPad));
-    // Columns per slice: the most whole lane groups the TRF holds that divide the columns.
-    int64_t maxGroups = kTrfLaneBytes / (2 * kl.size());
-    if (maxGroups < 1)
-      return fail("K = " + std::to_string(kl.size()) + " exceeds a TRF lane (K tiling is not implemented yet)");
+    // K tiles and columns per slice: the largest K tile (a multiple of 32 dividing K) for which some whole number
+    // of lane groups dividing the columns fits a TRF lane (groups x tile bf16) on at most 256 column blocks.
+    // K tiles beyond the first accumulate through a Vector Engine add.
+    int64_t kf = kl.size();
     colLocalSize = 0;
-    if (c % kLanes == 0)
-      for (int64_t g = std::min(maxGroups, c / kLanes); g >= 1; --g)
-        if ((c / kLanes) % g == 0 && c / (g * kLanes) <= kSlices) {
-          colLocalSize = g * kLanes;
+    for (int64_t t = kf; t >= 32 && !colLocalSize; t -= 32) {
+      if (kf % t)
+        continue;
+      int64_t maxGroups = kTrfLaneBytes / (2 * t);
+      if (maxGroups < 1)
+        continue;
+      if (c % kLanes == 0) {
+        for (int64_t g = std::min(maxGroups, c / kLanes); g >= 1; --g)
+          if ((c / kLanes) % g == 0 && c / (g * kLanes) <= kSlices) {
+            colLocalSize = g * kLanes;
+            kTile = t;
+            break;
+          }
+      } else {
+        kTile = t; // one lane group: up to 8 columns per slice
+        break;
+      }
+    }
+    if (!colLocalSize && c % kLanes == 0) {
+      // More columns than 256 blocks of whole lane groups: tiles of 256 blocks, the last one padded. The K tile
+      // and lane groups fill a TRF lane.
+      for (int64_t t = kf; t >= 32; t -= 32)
+        if (kf % t == 0 && kTrfLaneBytes / (2 * t) >= 1) {
+          kTile = t;
+          colLocalSize = std::min<int64_t>(kTrfLaneBytes / (2 * t), 128 / kLanes) * kLanes;
           break;
         }
+    }
+    if (!kTile)
+      return fail("no K tile fits the TRF for " + std::to_string(c) + " columns");
   } else if (c % kLanes == 0) {
+    // Vector Engine work: whole columns when few, else blocks over the slices (all of them when there are no rows).
     colLocalSize = c;
+    if (c > 64)
+      for (int64_t d = kLanes; d < c; d += kLanes)
+        if (c % d == 0 && c / d <= (rows.empty() ? kSlices : 16)) {
+          colLocalSize = d;
+          break;
+        }
   }
   // A column count that is not a multiple of the packet: up to 8 columns is one padded packet; beyond, one packet
   // per slice block of the largest power of two dividing it (a padded packet digit cannot be split for the float
@@ -393,17 +547,25 @@ LogicalResult Lowering::planLayout() {
         colLocalSize = d;
         break;
       }
-  if (c / colLocalSize > kSlices)
-    return fail(std::to_string(c) + " columns need more than 256 slices (column tiling is not implemented yet)");
   colPad = roundUp(colLocalSize, kLanes);
-  int64_t blocks = c / colLocalSize;
+  int64_t blocks = (c + colLocalSize - 1) / colLocalSize;
+  if (blocks > kSlices) {
+    // Column tiles of 256 blocks; the column axis pads to whole tiles.
+    int64_t tileCols = colLocalSize * kSlices;
+    int64_t tiles = (c + tileCols - 1) / tileCols;
+    colExtent = tiles * tileCols == c ? 0 : tiles * tileCols;
+    blocks = kSlices;
+    tileD.push_back({*col, tileCols, tiles, colExtent});
+  } else if (c % colLocalSize) {
+    return fail(std::to_string(c) + " columns do not split into blocks of " + std::to_string(colLocalSize));
+  }
   if (blocks > 1)
-    colBlock = Digit{*col, colLocalSize, blocks};
-  colLocalD = Digit{*col, 1, colLocalSize};
+    colBlock = Digit{*col, colLocalSize, blocks, colExtent};
+  colLocalD = Digit{*col, 1, colLocalSize, colExtent};
   int64_t rowSlices = kSlices / int64_t(llvm::PowerOf2Ceil(blocks));
 
   // Rows: slices first (as many as the rows allow), local digits up to the DM budget, then tiles.
-  int64_t perRow = 4 * colPad * 4 + (gemm ? 4 * kl.size() : 0);
+  int64_t perRow = 4 * colPad * 4 + (gemm ? 4 * kTile : 0);
   int64_t maxLocal = std::max<int64_t>(1, kDmBudget / perRow);
   int64_t total = 1;
   for (unsigned a : rows)
@@ -670,7 +832,9 @@ FailureOr<Value> Lowering::materialize(const Read &r, ArrayRef<unsigned> rowAxes
   SmallVector<MapAttr> dstParts;
   for (unsigned a : rowAxes) {
     auto it = named.find(a);
-    dstParts.push_back(it != named.end() ? it->second : kb.axis(tag + "R" + std::to_string(a), p.axes[a].size));
+    MapAttr m = it != named.end() ? it->second : kb.axis(tag + "R" + std::to_string(a), p.axes[a].size);
+    // The tiled column pads to whole column tiles (cells the DMAs never write).
+    dstParts.push_back(extentOf(a) > p.axes[a].size ? m.padTo(extentOf(a)) : m);
   }
   MapAttr tq;
   if (k) {
@@ -739,7 +903,7 @@ FailureOr<Value> Lowering::materialize(const Read &r, ArrayRef<unsigned> rowAxes
 
   SmallVector<MapAttr> canon = canonical(rowAxes, false);
   if (k)
-    canon.push_back(kf);
+    llvm::append_range(canon, kParts());
   return reshapeHbm(dst, pairOf(canon));
 }
 
@@ -844,14 +1008,18 @@ FailureOr<Val> Lowering::leaf(unsigned read, ArrayRef<int64_t> tileIndex) {
   SmallVector<unsigned> axes = r.axes();
   bool colOnly = llvm::all_of(axes, [&](unsigned a) { return a == *col; });
   SmallVector<unsigned> layout = colOnly ? SmallVector<unsigned>{*col} : rows;
-  if (!colOnly)
+  if (!colOnly) {
+    llvm::append_range(layout, ext);
     layout.push_back(*col);
-  auto it = hbmOfRead.find(read);
+  }
+  // Reads keyed by the reduction they sit in (their layout includes its axis).
+  unsigned key = read * 1024 + (colOnly ? 0 : unsigned(ext.size() ? ext.front() + 1 : 0));
+  auto it = hbmOfRead.find(key);
   if (it == hbmOfRead.end()) {
     auto h = materialize(r, layout, nullptr);
     if (failed(h))
       return failure();
-    it = hbmOfRead.insert({read, *h}).first;
+    it = hbmOfRead.insert({key, *h}).first;
   }
   if (colOnly) // with no rows a column vector is the whole tile
     return Val{rows.empty() ? Val::Tile : Val::Vec, toDm(it->second, layout, tileIndex, colLocal())};
@@ -1013,8 +1181,14 @@ FailureOr<Val> Lowering::evaluate(unsigned node, ArrayRef<int64_t> tileIndex) {
     v = leaf(n.read, tileIndex);
     break;
   case Node::Reduce: {
-    if (!gemm || node != gemm->node)
-      return fail("an unmapped reduction");
+    if (n.axes.empty()) {
+      v = evaluate(n.args[0], tileIndex);
+      break;
+    }
+    if (!gemm || node != gemm->node) {
+      v = reduce(node, tileIndex);
+      break;
+    }
     auto acc = contract(tileIndex);
     if (failed(acc))
       return failure();
@@ -1092,6 +1266,57 @@ FailureOr<Val> Lowering::evaluate(unsigned node, ArrayRef<int64_t> tileIndex) {
   return vals[node] = *v;
 }
 
+/// A reduction on the Vector Engine: its body evaluated over tiles extended by the reduction axes (flattened
+/// into one axis in time), then one intra-slice reduce pass over that axis.
+FailureOr<Val> Lowering::reduce(unsigned node, ArrayRef<int64_t> tileIndex) {
+  auto [op, axes, body] = flatReduce(p, node);
+  if (!ext.empty())
+    return fail("a reduction inside a reduction");
+  int64_t size = 1;
+  for (unsigned a : axes)
+    size *= p.axes[a].size;
+  MapAttr flat = kb.axis("RF" + std::to_string(fresh++), size);
+  ext = axes;
+  rf = flat;
+  auto saved = std::move(vals);
+  vals.clear();
+  FailureOr<Val> x = evaluate(body, tileIndex);
+  vals = std::move(saved);
+  MapAttr element = tileElement();
+  ext.clear();
+  rf = MapAttr();
+  if (failed(x))
+    return failure();
+  if (x->kind != Val::Tile)
+    return fail("a reduction whose body does not vary over its axes");
+  // Fetch [local..., RF, (col / 8)] x packet, narrow to four lanes, reduce RF away, widen back.
+  auto t = cast<DmTensorType>(x->dm.getType());
+  auto [timeParts, packet] = timePacket(element);
+  SmallVector<MapAttr> outParts;
+  for (MapAttr m : timeParts)
+    if (m != flat)
+      outParts.push_back(m);
+  MapAttr time = pairOf(timeParts), outTime = pairOf(outParts);
+  auto st = [&](MapAttr tm, MapAttr pk) { return kb.streamType(f32, t.getSlice(), tm, pk); };
+  Value s = BeginOp::create(b, loc(), st(kb.one(), element), x->dm, ContextKind::Main);
+  s = FetchOp::create(b, loc(), st(time, packet), s);
+  s = CollectOp::create(b, loc(), st(time, packet), s);
+  s = VectorInitOp::create(b, loc(), st(time, packet), s);
+  s = VectorIntraSliceTagOp::create(b, loc(), st(time, packet), s);
+  SmallVector<MapAttr> t4(timeParts), o4(outParts);
+  t4.push_back(packet.stride(4));
+  o4.push_back(packet.stride(4));
+  MapAttr p4 = packet.modulo(4);
+  s = VectorNarrowSplitOp::create(b, loc(), st(pairOf(t4), p4), s);
+  std::string rop = op == "add" ? "Add" : op == "max" ? "Max" : "Min";
+  s = VectorIntraSliceReduceOp::create(b, loc(), st(pairOf(o4), p4), s, b.getStringAttr(rop),
+                                       b.getStringAttr(flat.getName()));
+  s = VectorWidenConcatOp::create(b, loc(), st(outTime, packet), s);
+  s = VectorFinalOp::create(b, loc(), st(outTime, packet), s);
+  s = CommitTrimOp::create(b, loc(), st(outTime, packet), s);
+  return Val{Val::Tile, CommitOp::create(b, loc(), kb.dmType(f32, t.getSlice(), tileElement()), s).getResult()};
+}
+
 //===----------------------------------------------------------------------===//
 // Contraction
 //===----------------------------------------------------------------------===//
@@ -1104,49 +1329,80 @@ FailureOr<Value> Lowering::contract(ArrayRef<int64_t> tileIndex) {
   MapAttr cl = colLocal();
   MapAttr lane = colPad > kLanes ? cl.modulo(kLanes) : cl;
   MapAttr group = colPad > kLanes ? cl.stride(kLanes) : kb.one();
-  if (!trf) {
-    // The TRF operand, loaded once: columns over lanes (and lane groups), K in the element.
+  MapAttr k = kLocal();
+  auto trfHbm = hbmOfRead.find(~g.trf);
+  if (trfHbm == hbmOfRead.end()) {
     auto h = materialize(p.reads[g.trf], g.n, &kl);
     if (failed(h))
       return failure();
-    Value bDm = toDm(*h, g.n, tileIndex, pairOf({cl, kf}), true);
-    MapAttr tt = pairOf({lane, group, kf.stride(16)});
-    Value s = BeginOp::create(b, loc(), st(f32, kb.one(), pairOf({cl, kf})), bDm, ContextKind::Sub);
-    s = FetchOp::create(b, loc(), st(f32, tt, kf.modulo(16)), s);
-    s = FetchCastOp::create(b, loc(), st(bf16, tt, kf.modulo(16)), s);
-    s = CollectOp::create(b, loc(), st(bf16, tt, kf.modulo(16)), s);
-    trf = ToTrfOp::create(b, loc(), TrfTensorType::get(ctx, bf16, kb.chip(), kb.cluster(), slice, lane,
-                                                       pairOf({group, kf})),
-                          s);
+    trfHbm = hbmOfRead.insert({~g.trf, *h}).first;
   }
-  auto it = hbmOfRead.find(g.stream);
-  if (it == hbmOfRead.end()) {
+  auto aHbm = hbmOfRead.find(~g.stream);
+  if (aHbm == hbmOfRead.end()) {
     auto h = materialize(p.reads[g.stream], rows, &kl);
     if (failed(h))
       return failure();
-    it = hbmOfRead.insert({g.stream, *h}).first;
+    aHbm = hbmOfRead.insert({~g.stream, *h}).first;
   }
   SmallVector<MapAttr> localE;
   for (const Digit &d : localD)
     localE.push_back(digit(d));
   SmallVector<MapAttr> ae(localE);
-  ae.push_back(kf);
-  Value aDm = toDm(it->second, rows, tileIndex, pairOf(ae), true);
+  ae.push_back(k);
   SmallVector<MapAttr> t16(localE), t32(localE), tg(localE);
-  t16.push_back(kf.stride(16));
-  t32.push_back(kf.stride(32));
+  t16.push_back(k.stride(16));
+  t32.push_back(k.stride(32));
   t32.push_back(group);
   tg.push_back(group);
-  Value s = BeginOp::create(b, loc(), st(f32, kb.one(), pairOf(ae)), aDm, ContextKind::Main);
-  s = FetchOp::create(b, loc(), st(f32, pairOf(t16), kf.modulo(16)), s);
-  s = FetchCastOp::create(b, loc(), st(bf16, pairOf(t16), kf.modulo(16)), s);
-  s = CollectOp::create(b, loc(), st(bf16, pairOf(t16), kf.modulo(16)), s);
-  s = ContractOuterOp::create(b, loc(), st(bf16, pairOf(t32), kf.modulo(32)), s, trf);
-  s = ContractPacketOp::create(b, loc(), st(f32, pairOf(t32), kb.one()), s);
-  s = ContractTimeOp::create(b, loc(), st(f32, pairOf(tg), kb.one()), s);
-  s = ContractLaneOp::create(b, loc(), st(f32, pairOf(tg), lane), s, LaneMode::Interleaved);
-  s = CommitTrimOp::create(b, loc(), st(f32, pairOf(tg), lane), s);
-  return CommitOp::create(b, loc(), kb.dmType(f32, slice, tileElement()), s).getResult();
+  Value acc;
+  for (int64_t kt = 0; kt < kTiles(); ++kt) {
+    // The TRF operand: columns over lanes (and lane groups), this K tile in the element.
+    Value bDm = toDm(trfHbm->second, g.n, tileIndex, pairOf({cl, k}), true, kt);
+    for (unsigned e : g.trfExtras) {
+      auto h = extraHbm(e, g.n);
+      if (failed(h))
+        return failure();
+      AluSpec mul{"vector_fp_zip", "FpBinaryOp::MulF(FpMulAlu::Mul0)"};
+      mul.fp = true;
+      bDm = zip(bDm, toDm(*h, g.n, tileIndex, pairOf({cl, k}), true, kt), mul);
+    }
+    MapAttr tt = pairOf({lane, group, k.stride(16)});
+    Value s = BeginOp::create(b, loc(), st(f32, kb.one(), pairOf({cl, k})), bDm, ContextKind::Sub);
+    s = FetchOp::create(b, loc(), st(f32, tt, k.modulo(16)), s);
+    s = FetchCastOp::create(b, loc(), st(bf16, tt, k.modulo(16)), s);
+    s = CollectOp::create(b, loc(), st(bf16, tt, k.modulo(16)), s);
+    Value trf = ToTrfOp::create(
+        b, loc(), TrfTensorType::get(ctx, bf16, kb.chip(), kb.cluster(), slice, lane, pairOf({group, k})), s);
+    // The stream operand's tile.
+    Value aDm = toDm(aHbm->second, rows, tileIndex, pairOf(ae), true, kt);
+    for (unsigned e : g.streamExtras) {
+      auto h = extraHbm(e, rows);
+      if (failed(h))
+        return failure();
+      AluSpec mul{"vector_fp_zip", "FpBinaryOp::MulF(FpMulAlu::Mul0)"};
+      mul.fp = true;
+      aDm = zip(aDm, toDm(*h, rows, tileIndex, pairOf(ae), true, kt), mul);
+    }
+    s = BeginOp::create(b, loc(), st(f32, kb.one(), pairOf(ae)), aDm, ContextKind::Main);
+    s = FetchOp::create(b, loc(), st(f32, pairOf(t16), k.modulo(16)), s);
+    s = FetchCastOp::create(b, loc(), st(bf16, pairOf(t16), k.modulo(16)), s);
+    s = CollectOp::create(b, loc(), st(bf16, pairOf(t16), k.modulo(16)), s);
+    s = ContractOuterOp::create(b, loc(), st(bf16, pairOf(t32), k.modulo(32)), s, trf);
+    s = ContractPacketOp::create(b, loc(), st(f32, pairOf(t32), kb.one()), s);
+    s = ContractTimeOp::create(b, loc(), st(f32, pairOf(tg), kb.one()), s);
+    s = ContractLaneOp::create(b, loc(), st(f32, pairOf(tg), lane), s, LaneMode::Interleaved);
+    s = CommitTrimOp::create(b, loc(), st(f32, pairOf(tg), lane), s);
+    Value partial = CommitOp::create(b, loc(), kb.dmType(f32, slice, tileElement()), s);
+    if (!acc) {
+      acc = partial;
+      continue;
+    }
+    AluSpec add;
+    add.method = "vector_clip_zip";
+    add.op = "ClipBinaryOpF32::Add";
+    acc = zip(acc, partial, add);
+  }
+  return acc;
 }
 
 //===----------------------------------------------------------------------===//
@@ -1187,11 +1443,20 @@ LogicalResult Lowering::emit() {
 }
 
 bool match(RaisedKernel &kernel) {
+  // FURIOSA_TILED_DEBUG=1 reports why the class passes on a kernel (to stderr).
+  bool debug = std::getenv("FURIOSA_TILED_DEBUG");
   std::string why;
   FailureOr<Program> p = analyze(kernel.func, kernel.written, why);
-  if (failed(p))
+  if (failed(p)) {
+    if (debug)
+      llvm::errs() << "tiled: " << kernel.func.getName() << ": " << why << "\n";
     return false;
-  Lowering l(kernel, *p, /*quiet=*/true);
+  }
+  if (debug) {
+    llvm::errs() << "tiled: " << kernel.func.getName() << ":\n";
+    p->print(llvm::errs());
+  }
+  Lowering l(kernel, *p, /*quiet=*/!debug);
   return succeeded(l.plan());
 }
 

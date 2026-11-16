@@ -309,7 +309,8 @@ void terms(AffineExpr e, int64_t scale, SmallVectorImpl<std::pair<AffineExpr, in
 /// dividing its coefficient (several dims share that stride around size-1 dims: every choice is returned); the
 /// constant is split greedily from the outermost dim (truncating toward zero, so small negative offsets such as
 /// padding stay in their own dim).
-SmallVector<SmallVector<AffineExpr>> splits(const Form &flat, ArrayRef<int64_t> shape, MLIRContext *ctx) {
+SmallVector<SmallVector<AffineExpr>> splits(const Form &flat, ArrayRef<int64_t> shape, ArrayRef<Range> ranges,
+                                            MLIRContext *ctx) {
   SmallVector<int64_t> strides(shape.size(), 1);
   for (int i = (int)shape.size() - 2; i >= 0; --i)
     strides[i] = strides[i + 1] * shape[i + 1];
@@ -337,11 +338,29 @@ SmallVector<SmallVector<AffineExpr>> splits(const Form &flat, ArrayRef<int64_t> 
       unsigned j = choices[t][choice];
       idx[j] = idx[j] + ts[t].first * (ts[t].second / strides[j]);
     }
+    // The constant, innermost dim first: each dim takes the offset in its residue class that keeps its index
+    // inside the dim (or closest to it, for a masked read), and carries the rest outward. -7104 over strides
+    // (7168, 64, 1) under 2*d1, 2*d2, d3 gives (-1, +1, 0), not the truncated (0, -111, 0).
     int64_t rest = constant;
-    for (unsigned j = 0; j < shape.size(); ++j) {
-      int64_t q = rest / strides[j]; // toward zero
-      idx[j] = idx[j] + q;
-      rest -= q * strides[j];
+    for (int j = shape.size() - 1; j >= 0; --j) {
+      if (j == 0) {
+        idx[0] = idx[0] + rest;
+        break;
+      }
+      int64_t radix = shape[j];
+      int64_t base = ((rest % radix) + radix) % radix;
+      Range r = bounds(simplifyAffineExpr(idx[j], ranges.size(), 0), ranges);
+      int64_t best = base, bestViolation = INT64_MAX;
+      for (int64_t k = -2; k <= 2; ++k) {
+        int64_t off = base + k * radix;
+        int64_t violation = std::max<int64_t>(0, -(r.lo + off)) + std::max<int64_t>(0, r.hi + off - (radix - 1));
+        if (violation < bestViolation || (violation == bestViolation && std::abs(off) < std::abs(best))) {
+          best = off;
+          bestViolation = violation;
+        }
+      }
+      idx[j] = idx[j] + best;
+      rest = (rest - best) / radix;
     }
     out.push_back(idx);
     // Next combination.
@@ -454,10 +473,12 @@ std::optional<Promotion> plan(tensor::ExtractOp extract, linalg::GenericOp gener
         sel && sel.getTrueValue() == extract.getResult()) {
       auto mn = address.getDefiningOp<arith::MinSIOp>();
       auto mx = mn ? mn.getLhs().getDefiningOp<arith::MaxSIOp>() : arith::MaxSIOp();
-      if (mx && matchPattern(mx.getRhs(), m_Zero()) && matchPattern(sel.getFalseValue(), m_Constant(&other)) &&
-          (conds = maskConditions(sel.getCondition(), ctx))) {
+      bool clamped = mx && matchPattern(mx.getRhs(), m_Zero());
+      // The address is clamped into the buffer, or already inside it (the raise drops a clamp it proves idle).
+      if (matchPattern(sel.getFalseValue(), m_Constant(&other)) && (conds = maskConditions(sel.getCondition(), ctx))) {
         select = sel;
-        address = mx.getLhs();
+        if (clamped)
+          address = mx.getLhs();
       }
     }
 
@@ -476,7 +497,7 @@ std::optional<Promotion> plan(tensor::ExtractOp extract, linalg::GenericOp gener
     auto collapse = source.getDefiningOp<tensor::CollapseShapeOp>();
     if (collapse && cast<RankedTensorType>(collapse.getSrc().getType()).getRank() > 1) {
       auto shape = cast<RankedTensorType>(collapse.getSrc().getType()).getShape();
-      for (SmallVector<AffineExpr> &multi : splits(form, shape, ctx))
+      for (SmallVector<AffineExpr> &multi : splits(form, shape, ranges, ctx))
         candidates.push_back({collapse.getSrc(), multi});
     }
     candidates.push_back({source, {*flat}});
@@ -491,6 +512,11 @@ std::optional<Promotion> plan(tensor::ExtractOp extract, linalg::GenericOp gener
     candidates.push_back({source, idx});
   }
 
+  bool unclamped = select && address == extract.getIndices()[0];
+  for (int attempt = 0; attempt < 2; ++attempt, select = arith::SelectOp()) {
+  // An unclamped masked read whose mask is not its bounds is promoted unmasked, the select left in the body.
+  if (attempt == 1 && !unclamped)
+    break;
   for (auto &[base, idx] : candidates) {
     auto baseType = cast<RankedTensorType>(base.getType());
     if (!select) {
@@ -528,8 +554,28 @@ std::optional<Promotion> plan(tensor::ExtractOp extract, linalg::GenericOp gener
       if (bounds(f.expr(ctx), ranges).lo < 0) // judged on digits: interval bounds of d - c*(d floordiv c) are loose
         live.push_back(f);
     }
-    if (!llvm::all_of(live, [&](const Form &c) { return llvm::is_contained(needed, c); }) ||
-        !llvm::all_of(needed, [&](const Form &n) { return llvm::is_contained(live, n); }))
+    // Conditions match when equal, or when one is a positive multiple of the other plus a remainder that cannot
+    // reach the multiple: 100351 - (c + 2048 q) >= 0 is 48 - q >= 0 for c in [0, 2048).
+    auto same = [&](const Form &a, const Form &c) {
+      if (a == c)
+        return true;
+      for (auto [atom, ca] : a.terms) {
+        int64_t cc = c.terms.lookup(atom);
+        if (!ca || !cc || ca % cc || ca / cc <= 0)
+          continue;
+        int64_t k = ca / cc;
+        Form rest = a;
+        rest.add(c, -k);
+        Range r = bounds(rest.expr(ctx), ranges);
+        return r.lo >= 0 && r.hi < k;
+      }
+      return false;
+    };
+    auto covered = [&](const Form &f, ArrayRef<Form> in) {
+      return llvm::any_of(in, [&](const Form &g) { return same(f, g) || same(g, f); });
+    };
+    if (!llvm::all_of(live, [&](const Form &c) { return covered(c, needed); }) ||
+        !llvm::all_of(needed, [&](const Form &n) { return covered(n, live); }))
       continue;
 
     Value padded = base;
@@ -550,6 +596,7 @@ std::optional<Promotion> plan(tensor::ExtractOp extract, linalg::GenericOp gener
       return p;
     if (padded != base)
       padded.getDefiningOp()->erase();
+  }
   }
   return std::nullopt;
 }
