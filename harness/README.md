@@ -50,9 +50,18 @@ files are always the canonical host layout.
 | L3 `cpu` | the crate | plain `cargo run --bin run_graph` (furiosa-opt's CPU backend) matches golden | furiosa-opt |
 | L4 `npu` | the crate | the NPU build on npu3 matches golden | an idle npu3 |
 
-L1 compares with the case's exact tolerance, raised to one unit in the last place of the output dtype
-(bf16 2^-7, fp16 2^-10, relative to max|golden|): the kernel's arithmetic is reproduced in its own dtypes,
-but Triton leaves the order of fp32 accumulation unspecified, so a final rounding may differ by one ulp.
+L1 is two checks, both required:
+
+- **Per launch** (teacher forcing): golden records, per launch, the buffers it binds after it ran
+  (`harness/golden/<case>/<i>/launches/<j>.safetensors`). Each raised kernel runs on the golden state just
+  before its launch, and the buffers it writes must match the golden state just after it, within the
+  case's `exact` tolerance raised to one unit in the last place of the dtype (bf16 2^-7, fp16 2^-10,
+  relative to max|golden|): the kernel's arithmetic is reproduced in its own dtypes, but Triton leaves
+  the order of fp32 accumulation unspecified, so a final rounding may differ by one ulp. Errors cannot
+  compound, so a failure names the wrong kernel.
+- **Whole graph**: the launches chained from the graph's inputs, compared with the case's `graph`
+  tolerance (default: `exact`). Only deep reduced-precision models set it, with the reason in
+  `registry.py`, because one-ulp differences compound over their depth.
 
 L3 and L4 compare with the case's NPU tolerance, which allows for the dtype policy the NPU forces
 (no fp32 or fp16 contraction: dots run in bf16 with fp32 accumulation). A match means
@@ -64,6 +73,7 @@ L3 and L4 compare with the case's NPU tolerance, which allows for the dtype poli
 
 ```
 python -m furiosa_compiler <case.py> -o harness/out/<case>/compiler --crate harness/out/<case>/crate
+python -m furiosa_compiler.l1_launch harness/out/<case>/compiler harness/golden/<case> --rtol R --atol A
 python -m furiosa_compiler.l1 harness/out/<case>/compiler harness/golden/<case> --rtol R --atol A
 ```
 

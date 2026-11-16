@@ -12,7 +12,8 @@ class Tol:
 @dataclass(frozen=True)
 class Case:
     path: str  # pure-Triton file defining graphs()
-    exact: Tol = Tol(rtol=1e-5, atol=1e-5)  # L1: the raised IR keeps the case's dtypes
+    exact: Tol = Tol(rtol=1e-5, atol=1e-5)  # L1 per launch: the raised IR keeps the case's dtypes
+    graph: Tol | None = None  # L1 over a whole graph (None: same as exact); see harness/README.md
     npu: Tol = Tol(rtol=2e-2, atol=1e-2)  # L3/L4: dots run in bf16 with fp32 accumulation on the NPU
     int_ranges: dict = field(default_factory=dict)  # integer input buffer -> [low, high)
     weights: str | None = None  # a loader in harness/weights.py; None means seeded random weights
@@ -34,5 +35,8 @@ CASES = {
     "vgg16": Case("models/vgg16.py", weights="torchvision"),
     "resnet101": Case("models/resnet101.py", weights="torchvision"),
     "mobilenetv3_large": Case("models/mobilenetv3_large.py", weights="torchvision"),
-    "qwen3_0_6b": Case("models/qwen3_0_6b.py", weights="huggingface", int_ranges={"input_ids": (0, 151936)}),
+    # 28 bf16 layers: each kernel is held to one ulp per launch, but one-ulp differences compound over
+    # the depth of a whole graph (logits drift ~2% of their scale; the greedy token still agrees).
+    "qwen3_0_6b": Case("models/qwen3_0_6b.py", weights="huggingface", int_ranges={"input_ids": (0, 151936)},
+                       graph=Tol(rtol=3e-2, atol=0)),
 }

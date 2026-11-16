@@ -155,15 +155,21 @@ def judge(name: str, level: str, impl: str) -> Result:
             return compiled
         if not (GOLDEN / name / "meta.json").exists():
             return Result("SKIP", f"no golden (run: python -m harness.golden {name})")
-        tol = case.exact
-        cmd = compiler_cmd("-m", "furiosa_compiler.l1", str(OUT / name / "compiler"), str(GOLDEN / name),
-                           "--rtol", str(tol.rtol), "--atol", str(tol.atol))
-        code, log = sh(cmd, ROOT, compiler_env())
-        try:
-            verdict = json.loads(log.strip().splitlines()[-1])
-            return Result(verdict["status"], verdict.get("detail", ""))
-        except (ValueError, IndexError, KeyError):
-            return Result("FAIL", f"l1 exited {code}: {tail(log)}")
+        # Two checks: every launch on golden inputs (one ulp), then the whole graph chained.
+        verdicts = []
+        for module, tol in (("furiosa_compiler.l1_launch", case.exact), ("furiosa_compiler.l1", case.graph or case.exact)):
+            cmd = compiler_cmd("-m", module, str(OUT / name / "compiler"), str(GOLDEN / name),
+                               "--rtol", str(tol.rtol), "--atol", str(tol.atol))
+            code, log = sh(cmd, ROOT, compiler_env())
+            try:
+                verdict = json.loads(log.strip().splitlines()[-1])
+            except (ValueError, IndexError):
+                return Result("FAIL", f"{module} exited {code}: {tail(log)}")
+            if verdict["status"] != "PASS":
+                kind = "per launch" if module.endswith("l1_launch") else "graph"
+                return Result("FAIL", f"{kind}: {verdict.get('detail', '')}")
+            verdicts.append(verdict.get("detail", ""))
+        return Result("PASS", "; ".join(d for d in verdicts if d))
     if impl == "compiler":
         compiled = compile_case(name)
         if compiled.status != "PASS":

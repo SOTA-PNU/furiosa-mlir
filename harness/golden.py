@@ -62,7 +62,17 @@ def generate(name: str):
         ins = {b.name: tensors[b.name] for b in graph.buffers.values() if b.kind in ("input", "weight", "state")}
         (out_dir / str(i)).mkdir(parents=True, exist_ok=True)
         save_file({k: v.contiguous().cpu() for k, v in ins.items()}, out_dir / str(i) / "inputs.safetensors")
-        run(graph, tensors)
+        # Per launch, the buffers it writes (pointer args the kernel stores to are not known here, so
+        # every non-input buffer the launch binds), for L1's per-launch check.
+        launch_dir = out_dir / str(i) / "launches"
+        launch_dir.mkdir(parents=True, exist_ok=True)
+
+        def snapshot(j, launch, tensors_):
+            names = {v.name for v in launch.args.values() if hasattr(v, "kind") and v.kind not in ("input", "weight")}
+            torch.cuda.synchronize()
+            save_file({n: tensors_[n].contiguous().cpu() for n in sorted(names)}, launch_dir / f"{j}.safetensors")
+
+        run(graph, tensors, after_launch=snapshot)
         torch.cuda.synchronize()
         outs = {b.name: tensors[b.name] for b in graph.buffers.values() if b.kind in ("output", "state")}
         for key, value in outs.items():
