@@ -63,6 +63,11 @@ L1 is two checks, both required:
   tolerance (default: `exact`). Only deep reduced-precision models set it, with the reason in
   `registry.py`, because one-ulp differences compound over their depth.
 
+For the fp32 models, the NPU tolerance is measured, not chosen: twice the logit drift of the same
+Triton graph run entirely in bf16 on the GPU (recorded in `registry.py`), plus the top-1 class must be
+unchanged (`top1`). Qwen3 is a bf16 graph; its NPU tolerance equals its graph-level L1 tolerance and its
+greedy `next_token` must match exactly (integers are always exact).
+
 L3 and L4 compare with the case's NPU tolerance, which allows for the dtype policy the NPU forces
 (no fp32 or fp16 contraction: dots run in bf16 with fp32 accumulation). A match means
 `max|out - golden| <= atol + rtol * max|golden|` for every output.

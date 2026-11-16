@@ -153,6 +153,11 @@ def run_graphs(name: str, crate: Path, npu: bool, tol) -> Result:
         if code != 0 or not out.exists():
             return Result("FAIL", f"graph {i}: run_graph exited {code}: {tail(log)}")
         result = compare(out, GOLDEN / name / str(i) / "outputs.safetensors", tol)
+        top1 = CASES[name].top1
+        if result.status == "PASS" and top1:
+            got, want = load_file(out)[top1].float(), load_file(GOLDEN / name / str(i) / "outputs.safetensors")[top1].float()
+            if not torch.equal(got.reshape(-1, got.shape[-1]).argmax(-1), want.reshape(-1, want.shape[-1]).argmax(-1)):
+                result = Result("FAIL", f"{top1}: top-1 differs from golden")
         if result.status != "PASS":
             result.detail = f"graph {i}: {result.detail}"
             return result
