@@ -842,6 +842,8 @@ private:
   const StoreSpace *space = nullptr;
   // Stored axes whose tile origin (not just their global index) an expression of this store used.
   std::set<unsigned> originUses;
+  // (view dim, divisor) pairs an expression of this store took apart with floordiv/mod.
+  std::set<std::pair<unsigned, int64_t>> digitUses;
 
   LogicalResult parseLaunch();
   LogicalResult evaluate();
@@ -1423,7 +1425,23 @@ AffineExpr Raiser::tidy(const Gen &g, AffineExpr e) {
     dims.push_back({g.lo[d], g.lo[d] + g.extent[d] - 1});
   for (int64_t t : loopTrip)
     syms.push_back({0, std::max<int64_t>(t, 1) - 1});
-  return simplify(resolveDigits(simplify(e, nd, nl), dims, syms), nd, nl);
+  AffineExpr r = simplify(resolveDigits(simplify(e, nd, nl), dims, syms), nd, nl);
+  // A store-view dim this generic iterates that the expression divides into digits.
+  if (space)
+    r.walk([&](AffineExpr x) {
+      if (x.getKind() != AffineExprKind::FloorDiv && x.getKind() != AffineExprKind::Mod)
+        return;
+      auto bin = cast<AffineBinaryOpExpr>(x);
+      auto d = dyn_cast<AffineDimExpr>(bin.getLHS());
+      auto c = dyn_cast<AffineConstantExpr>(bin.getRHS());
+      if (!d || !c)
+        return;
+      for (auto [j, pos] : llvm::enumerate(g.coordPos))
+        if (pos == (int)d.getPosition() && c.getValue() > 1 && c.getValue() < space->viewShape[j] &&
+            space->viewShape[j] % c.getValue() == 0)
+          digitUses.insert({(unsigned)j, c.getValue()});
+    });
+  return r;
 }
 
 /// One expression of the generic's dims for a per-instance symbolic value: substitute each axis of `v`
@@ -2788,6 +2806,7 @@ LogicalResult Raiser::raiseStore(tt::StoreOp store) {
   auto currentBefore = current;
   auto storesBefore = stores;
   originUses.clear();
+  digitUses.clear();
   if (failed(raiseStoreIn(store, *sp)))
     return failure();
   // When an expression used a stored axis's tile origin, the computation depends on that tile index
@@ -2800,6 +2819,10 @@ LogicalResult Raiser::raiseStore(tt::StoreOp store) {
       if (sp->extent[k] < sp->viewShape[j] && sp->viewShape[j] % sp->extent[k] == 0)
         extra.push_back(sp->viewStrides[j] * sp->extent[k]);
     }
+  // A view dim the computation divides into digits (a head index read as head // 2 by grouped-query
+  // attention) splits into them, so those reads become projections of the split dims.
+  for (auto [j, c] : digitUses)
+    extra.push_back(sp->viewStrides[j] * c);
   if (extra.empty())
     return success();
   ScopedDiagnosticHandler quiet(ctx, [](Diagnostic &) { return success(); });
