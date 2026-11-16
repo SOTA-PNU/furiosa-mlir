@@ -291,6 +291,18 @@ def main():
     print(f"{'case':<{width}}  " + "  ".join(f"{lv:<4}" for lv in levels))
     for name in names:
         print(f"{name:<{width}}  " + "  ".join(f"{report[name][lv]['status']:<4}" for lv in levels))
+    # Progress is the pass rate per corpus layer (harness/README.md).
+    def layer(name):
+        if CASES[name].path.startswith("models/"):
+            return "models"
+        prefix = name.split("_")[0]
+        return prefix if prefix in ("tutorial", "heldout") else "micro"
+    print()
+    for group in ("micro", "tutorial", "heldout", "models"):
+        members = [n for n in names if layer(n) == group]
+        if members:
+            rates = [f"{lv} {sum(report[n][lv]['status'] == 'PASS' for n in members)}/{len(members)}" for lv in levels]
+            print(f"{group:<8}  " + "  ".join(rates))
     failed = bool(hits) or any(r["status"] == "FAIL" for levels_ in report.values() for r in levels_.values())
     sys.exit(1 if failed else 0)
 
