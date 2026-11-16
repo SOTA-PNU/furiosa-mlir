@@ -57,6 +57,8 @@ struct Node {
   Shape shape = Shape::Scalar;
   int arg = -1;            // Input: pointer-argument index
   Type type;               // Input: the buffer's element type
+  unsigned rows = 0;       // Input: the row dims it varies along (bit i: row dim i), broadcast along the others
+  bool col = false;        // Input: whether it varies along the columns
   float value = 0;         // Const
   std::string op;          // Op: add, sub, mul, div, max, min, exp, sqrt, neg, ...; Reduce: Add, Max, Min
   SmallVector<int> args;   // Op / Reduce operands
@@ -66,13 +68,15 @@ struct Dag {
   std::vector<Node> nodes;
   SmallVector<int> roots;     // one per written buffer, in result order
   SmallVector<Type> outTypes; // their stored element types
+  SmallVector<int64_t> rowExtents; // the row dims (all but the last output dim); r is their product
   int64_t r = 0, h = 0;
 
   /// Adds a node, or returns the equal one already there: generics recompute shared subexpressions (each
   /// reads the buffers again), and the DAG keeps one of each.
   int add(Node n) {
     std::string key = std::to_string(int(n.kind)) + "|" + std::to_string(n.arg) + "|" +
-                      std::to_string(llvm::bit_cast<uint32_t>(n.value)) + "|" + n.op + "|" + std::to_string(int(n.shape));
+                      std::to_string(llvm::bit_cast<uint32_t>(n.value)) + "|" + n.op + "|" + std::to_string(int(n.shape)) +
+                      "|" + std::to_string(n.rows) + "|" + std::to_string(n.col);
     for (int a : n.args)
       key += "," + std::to_string(a);
     if (auto it = interned.find(key); it != interned.end())
@@ -91,68 +95,123 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
     why = "expected a result per written buffer";
     return failure();
   }
+  // The outputs: [rows..., columns] (the highest rank), or [rows...] for values of a row.
+  RankedTensorType full;
   for (Value result : ret.getOperands()) {
-    auto outType = cast<RankedTensorType>(result.getType());
-    if (outType.getRank() != 2 || (dag.r && (outType.getDimSize(0) != dag.r || outType.getDimSize(1) != dag.h))) {
-      why = "expected rank-2 [rows, columns] outputs of one shape";
+    auto t = cast<RankedTensorType>(result.getType());
+    if (!full || t.getRank() > full.getRank())
+      full = t;
+    dag.outTypes.push_back(t.getElementType());
+  }
+  if (full.getRank() < 2) {
+    why = "expected a [rows..., columns] output";
+    return failure();
+  }
+  for (Value result : ret.getOperands()) {
+    auto t = cast<RankedTensorType>(result.getType());
+    if (t.getShape() != full.getShape() && t.getShape() != full.getShape().drop_back()) {
+      why = "expected [rows..., columns] outputs of one shape, and [rows...] ones";
       return failure();
     }
-    dag.r = outType.getDimSize(0);
-    dag.h = outType.getDimSize(1);
-    dag.outTypes.push_back(outType.getElementType());
   }
+  dag.rowExtents.assign(full.getShape().begin(), full.getShape().end() - 1);
+  dag.r = full.getNumElements() / full.getShape().back();
+  dag.h = full.getShape().back();
+  const unsigned k = dag.rowExtents.size();
 
   std::map<Operation *, int> genericNode; // a generic's yielded value at a point of its domain
   std::function<FailureOr<int>(linalg::GenericOp)> genericValue;
 
-  // What a tensor read through `m` in a generic with `iters` varies along. The space is (row, column) for two
-  // loops, rows for one parallel loop, a row's columns for one reduction loop (a single row, rank-reduced). A
-  // constant 0 indexes a dimension of size 1: the single row (or a row's only column).
-  auto shapeOfMap = [&](AffineMap m, ArrayRef<utils::IteratorType> iters, RankedTensorType t) -> std::optional<Shape> {
-    auto roleOf = [&](unsigned d) {
-      if (iters.size() == 2)
-        return d == 0 ? Shape::Row : Shape::Col;
-      return iters[0] == utils::IteratorType::reduction ? Shape::Col : Shape::Row;
-    };
-    if (iters.empty() || iters.size() > 2)
-      return std::nullopt;
-    if (t.getRank() == 0)
-      return Shape::Row; // the value of the single row
-    Shape shape = Shape::Scalar;
-    SmallVector<Shape> seen;
-    for (auto [i, e] : llvm::enumerate(m.getResults())) {
-      Shape role;
-      if (auto d = dyn_cast<AffineDimExpr>(e)) {
-        role = roleOf(d.getPosition());
-      } else if (auto c = dyn_cast<AffineConstantExpr>(e); c && c.getValue() == 0 && t.getDimSize(i) == 1) {
-        role = t.getRank() == 2 && i == 1 ? Shape::Col : Shape::Row;
+  // What a tensor read through `m` in a generic with `iters` varies along. The space is (rows..., column) for
+  // k + 1 loops, the rows for k parallel loops, and a row's columns for one reduction loop (a single row,
+  // rank-reduced). A constant 0 indexes a dimension of size 1. A read that misses some row dims is broadcast
+  // along them (`rows` records the ones it has); its shape is that of the rows it fills, Row or Full.
+  struct Read {
+    Shape shape;
+    unsigned rows = 0;
+    bool col = false;
+  };
+  unsigned nonUnit = 0;
+  for (unsigned i = 0; i < k; ++i)
+    if (dag.rowExtents[i] != 1)
+      nonUnit |= 1u << i;
+  // The role of each loop of a generic: a row dim, or the column (-1). A reduction loop is the column; the
+  // parallel loops are the row dims (all, or the ones of more than one row, when unit dims were dropped),
+  // then the column unless there is a reduction or they are only rows, whichever the loop extents fit.
+  SmallVector<unsigned> nonUnitDims;
+  for (unsigned i = 0; i < k; ++i)
+    if (dag.rowExtents[i] != 1)
+      nonUnitDims.push_back(i);
+  auto rolesOf = [&](ArrayRef<utils::IteratorType> iters, ArrayRef<int64_t> extents) -> std::optional<SmallVector<int>> {
+    SmallVector<unsigned> parallel;
+    int reduction = -1;
+    for (auto [d, it] : llvm::enumerate(iters)) {
+      if (it == utils::IteratorType::reduction) {
+        if (reduction >= 0)
+          return std::nullopt;
+        reduction = d;
       } else {
-        return std::nullopt;
+        parallel.push_back(d);
       }
-      if (llvm::is_contained(seen, role))
-        return std::nullopt;
-      seen.push_back(role);
-      shape = join(shape, role);
     }
-    // A [rows, columns] tensor reads row-major: the row first.
-    if (seen.size() == 2 && seen[0] != Shape::Row)
-      return std::nullopt;
-    return shape;
+    SmallVector<unsigned> allDims;
+    for (unsigned i = 0; i < k; ++i)
+      allDims.push_back(i);
+    for (ArrayRef<unsigned> rowDims : {ArrayRef<unsigned>(allDims), ArrayRef<unsigned>(nonUnitDims)})
+      for (bool withCol : {true, false}) {
+        if (withCol && reduction >= 0)
+          continue;
+        if (parallel.size() != rowDims.size() + (withCol ? 1 : 0))
+          continue;
+        SmallVector<int> roles(iters.size(), -1);
+        bool fits = reduction < 0 || extents[reduction] == dag.h;
+        for (auto [i, d] : llvm::enumerate(rowDims)) {
+          roles[parallel[i]] = d;
+          fits &= extents[parallel[i]] == dag.rowExtents[d];
+        }
+        if (withCol)
+          fits &= extents[parallel.back()] == dag.h;
+        if (fits)
+          return roles;
+      }
+    return std::nullopt;
+  };
+  auto shapeOfMap = [&](AffineMap m, ArrayRef<int> roles, RankedTensorType t) -> std::optional<Read> {
+    Read read;
+    int last = -1;
+    for (auto [i, e] : llvm::enumerate(m.getResults())) {
+      if (auto c = dyn_cast<AffineConstantExpr>(e); c && c.getValue() == 0 && t.getDimSize(i) == 1)
+        continue; // a unit dim
+      auto d = dyn_cast<AffineDimExpr>(e);
+      if (!d || int(d.getPosition()) <= last)
+        return std::nullopt; // not a row-major projection
+      last = d.getPosition();
+      if (roles[d.getPosition()] < 0)
+        read.col = true;
+      else
+        read.rows |= 1u << roles[d.getPosition()];
+    }
+    read.rows &= nonUnit;
+    read.shape = !read.col ? Shape::Row : read.rows || !nonUnit ? Shape::Full : Shape::Col;
+    return read;
   };
 
   // The node for a tensor read through `map` inside a generic.
-  std::function<FailureOr<int>(Value, AffineMap, ArrayRef<utils::IteratorType>)> readNode;
-  readNode = [&](Value t, AffineMap map, ArrayRef<utils::IteratorType> iters) -> FailureOr<int> {
-    std::optional<Shape> shape = shapeOfMap(map, iters, cast<RankedTensorType>(t.getType()));
-    if (!shape) {
-      why = "an operand map is not a projection of (row, column)";
+  std::function<FailureOr<int>(Value, AffineMap, ArrayRef<int>)> readNode;
+  readNode = [&](Value t, AffineMap map, ArrayRef<int> roles) -> FailureOr<int> {
+    std::optional<Read> read = shapeOfMap(map, roles, cast<RankedTensorType>(t.getType()));
+    if (!read) {
+      why = "an operand map is not a projection of (rows..., column)";
       return failure();
     }
+    std::optional<Shape> shape = read->shape;
     if (auto arg = dyn_cast<BlockArgument>(t); arg && arg.getOwner() == &func.getBody().front()) {
       Node n{Node::Input};
       n.shape = *shape;
       n.arg = arg.getArgNumber();
       n.type = cast<RankedTensorType>(t.getType()).getElementType();
+      n.rows = read->rows;
+      n.col = read->col;
       return dag.add(n);
     }
     auto producer = t.getDefiningOp<linalg::GenericOp>();
@@ -160,9 +219,9 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
       why = "an operand is neither a buffer nor a generic's result";
       return failure();
     }
-    // A producer over the row space read through (d0), or over the full space read through (d0, d1).
-    bool rowProducer = cast<RankedTensorType>(t.getType()).getRank() <= 1;
-    if (rowProducer != (*shape == Shape::Row)) {
+    // A producer over the rows read without the column, or over (rows, column) read with it, all rows.
+    bool rowProducer = cast<RankedTensorType>(t.getType()).getRank() <= int64_t(k) && !read->col;
+    if (rowProducer != (*shape == Shape::Row) || read->rows != nonUnit) {
       why = "a generic's result is read through a map that does not match its domain";
       return failure();
     }
@@ -178,17 +237,16 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
       why = "a generic with several results";
       return failure();
     }
-    bool rowReduction = iters.size() == 2 && iters[0] == utils::IteratorType::parallel &&
-                        iters[1] == utils::IteratorType::reduction;
-    bool singleRowReduction = iters.size() == 1 && dag.r == 1;
-    if (reduction && !rowReduction && !singleRowReduction) {
-      why = "only reductions over the columns of each row are mapped";
+    std::optional<SmallVector<int>> roles = rolesOf(iters, g.getStaticLoopRanges());
+    if (!roles) {
+      why = reduction ? "only reductions over the columns of each row are mapped"
+                      : "a generic whose loops are not the rows and columns of the outputs";
       return failure();
     }
     Block &body = g.getRegion().front();
     llvm::DenseMap<Value, int> scalar; // body values -> nodes
     for (OpOperand *in : g.getDpsInputOperands()) {
-      auto n = readNode(in->get(), g.getMatchingIndexingMap(in), iters);
+      auto n = readNode(in->get(), g.getMatchingIndexingMap(in), *roles);
       if (failed(n))
         return failure();
       scalar[body.getArgument(in->getOperandNumber())] = *n;
@@ -304,8 +362,9 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
     auto root = genericValue(producer);
     if (failed(root))
       return failure();
-    if (dag.nodes[*root].shape != Shape::Full) {
-      why = "a stored value does not vary along both rows and columns";
+    bool rowResult = cast<RankedTensorType>(result.getType()).getRank() == int64_t(k);
+    if (dag.nodes[*root].shape != (rowResult ? Shape::Row : Shape::Full)) {
+      why = "a stored value does not vary along what its buffer spans";
       return failure();
     }
     dag.roots.push_back(*root);
@@ -378,15 +437,22 @@ private:
   KernelBuilder &kb;
   Dag &dag;
   MLIRContext *ctx;
-  MapAttr R, H, slice;
-  MapAttr rows; // the rows of the current tile: R, or R resized to the tile
+  SmallVector<std::pair<int, MapAttr>> rowAxes; // (row dim, axis), outermost first; dim -1: the single row
+  int64_t inner = 1;                             // rows inside the outermost row axis
+  MapAttr H, slice;
   std::map<int, Value> materialized; // node -> DmTensor (Full: [slice, H], Row: [slice, 1 # 8])
   std::map<int, Value> vrfs;         // node -> VrfTensor
-  std::map<int, unsigned> params;    // pointer argument -> kernel parameter
-  std::map<int, Type> inputTypes;    // pointer argument -> element type
-  std::map<int, Value> inputDm;      // pointer argument -> DmTensor
-  std::map<int, bool> fullInput;     // pointer argument -> [rows, columns] (else [columns])
+  std::map<int, unsigned> params;    // input node -> kernel parameter
+  std::map<int, Value> inputDm;      // input node -> DmTensor
   SmallVector<unsigned> outParams;   // tiled: the in-place output parameters
+
+  /// The slice mapping of `len` rows of the outermost row axis (all of the inner ones), padded to 256.
+  MapAttr rowsMap(int64_t len);
+  /// The HBM mapping of an input: the row axes it varies along, then the column axis.
+  MapAttr inputMap(const Node &n);
+  /// The HBM mapping of an output: every row axis, then the column axis (not for a row value, one f32 a row).
+  MapAttr outMap(bool row = false);
+  bool rootRow(size_t k) { return dag.nodes[dag.roots[k]].shape == Shape::Row; }
   int64_t vrfBytes = 0;              // VRF taken per slice
 
   Type f32() { return Float32Type::get(ctx); }
@@ -429,7 +495,7 @@ FailureOr<Value> Planner::vrfOf(int node, func::FuncOp func) {
     if (vrfBytes + dag.h * 4 > kVrfBytes)
       return fail(func, "VRF operands of ") << dag.h << " f32 per slice exceed the 8 KB VRF", failure();
     vrfBytes += dag.h * 4;
-    FailureOr<Value> dm = n.kind == Node::Input ? FailureOr<Value>(inputDm.at(n.arg)) : materialize(node, func);
+    FailureOr<Value> dm = n.kind == Node::Input ? FailureOr<Value>(inputDm.at(node)) : materialize(node, func);
     if (failed(dm))
       return failure();
     Type et = cast<DmTensorType>(dm->getType()).getElementType();
@@ -468,7 +534,7 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
   OpBuilder &b = kb.builder();
   Location loc = kb.loc();
   if (dag.nodes[node].kind == Node::Input && !output)
-    return inputDm.at(dag.nodes[node].arg);
+    return inputDm.at(node);
   Node &top = dag.nodes[node];
   if (top.shape != Shape::Full && top.shape != Shape::Row)
     return fail(func, "only row or full values are materialized"), failure();
@@ -553,7 +619,7 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
   if (leafNode.kind == Node::Input) {
     if (leafNode.shape != Shape::Full)
       return fail(func, "a streamed input must vary along rows and columns"), failure();
-    source = inputDm.at(leafNode.arg);
+    source = inputDm.at(leaf);
     sourceType = leafNode.type;
   } else {
     source = materialized.at(leaf);
@@ -649,7 +715,7 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
   if (zipFirst) {
     // begin_interleaved over the two inputs in the op's operand order, then unzip into the pair phase.
     Node &zipNode = dag.nodes[path[0].node];
-    Value lhs = inputDm.at(dag.nodes[zipNode.args[0]].arg), rhs = inputDm.at(dag.nodes[zipNode.args[1]].arg);
+    Value lhs = inputDm.at(zipNode.args[0]), rhs = inputDm.at(zipNode.args[1]);
     MapAttr I = kb.axis("I", 2);
     int64_t p = 8; // 8-element packets (16 bytes of bf16) keep the collected time (H / 8, I) after a cast
     s = BeginInterleavedOp::create(b, loc, stream(sourceType, I, H), lhs, rhs, ContextKind::Main, I);
@@ -687,8 +753,12 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
         return fail(func, "no Vector Engine zip for '" + op + "'"), failure();
     } else if (n.kind == Node::Reduce) {
       need = Reduce, alu = "ReduceAccTree", form = ReduceOp, veOp = n.op;
+    } else if (op == "sin" || op == "cos") {
+      // The Vector Engine's sin and cos are exact only within [-2 pi, 2 pi] (harness/characterize) and nothing
+      // bounds a computed angle here; tables of index-only angles are hoisted and never reach this point.
+      return fail(func, op + " of a value not known to lie within [-2 pi, 2 pi] (no range reduction yet)"), failure();
     } else if (op == "exp" || op == "negexp" || op == "sigmoid" || op == "sqrt" || op == "tanh" || op == "log" ||
-               op == "erf" || op == "sin" || op == "cos") {
+               op == "erf") {
       need = Fp, form = FpUnary, alu = op == "exp" || op == "negexp" ? "FpExp" : "FpFpu";
       veOp = op == "exp" ? "Exp" : op == "negexp" ? "NegExp" : op == "sigmoid" ? "Sigmoid" : op == "sqrt" ? "Sqrt"
              : op == "tanh" ? "Tanh" : op == "log" ? "Log" : op == "erf" ? "Erf" : op == "sin" ? "Sin" : "Cos";
@@ -700,7 +770,10 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
       veOp = alu == "FpMul0" ? "MulF(FpMulAlu::Mul0)" : alu == "FpMul1" ? "MulF(FpMulAlu::Mul1)"
                                                                         : "MulF(FpMulAlu::Fma)";
     } else if ((op == "add" || op == "sub") && !st.reversed) {
-      if (stage <= Fp && !alus.count("FpFma"))
+      // The clip stage adds; it subtracts only an immediate (negated). A VRF subtraction needs FpFma, in a
+      // new pass if this one has used it.
+      bool immediate = st.operand >= 0 && dag.nodes[st.operand].kind == Node::Const;
+      if ((stage <= Fp && !alus.count("FpFma")) || (op == "sub" && !immediate && !st.stash))
         need = Fp, form = FpBinary, alu = "FpFma", veOp = op == "add" ? "AddF" : "SubF";
       else
         need = Clip, form = ClipBin, needWay4 = false, alu = "ClipAdd", veOp = "Add";
@@ -724,7 +797,8 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
     // Pass break: a stage behind us, a used ALU, or a stash where the stage cannot stash.
     bool sameStageAllowed = need == Fp || need == Clip;
     bool breakHere = need < stage || (need == stage && !sameStageAllowed) || alus.count(alu) ||
-                     (needWay4 && stage > Narrow && !way4) || (form == ReduceOp && (row || pair));
+                     (needWay4 && stage > Narrow && !way4) || (form == ReduceOp && (row || pair)) ||
+                     (pair && st.stash); // pair mode has neither the stash nor the intra-slice reducer
     if (breakHere) {
       if (current == leaf && i == 0)
         return fail(func, "an op cannot start a pass"), failure();
@@ -789,71 +863,115 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
 LogicalResult Planner::declare(func::FuncOp func, ArrayRef<int64_t> written) {
   if (dag.h % 16)
     return fail(func, "a row length that is not a multiple of 16");
-  R = kb.axis("R", dag.r);
+  // A row axis per row dim of more than one row (a single row keeps one axis of one), and the column axis.
+  for (auto [i, extent] : llvm::enumerate(dag.rowExtents))
+    if (extent != 1)
+      rowAxes.push_back({int(i), kb.axis(rowAxes.empty() ? "R" : "R" + std::to_string(rowAxes.size()), extent)});
+  if (rowAxes.empty())
+    rowAxes.push_back({-1, kb.axis("R", 1)});
   H = kb.axis("H", dag.h);
-  rows = R;
-  slice = dag.r < kSlices ? R.padTo(kSlices) : R;
-  for (const Node &n : dag.nodes)
-    if (n.kind == Node::Input) {
-      if (!n.type.isBF16() && !n.type.isF32())
-        return fail(func, "inputs must be bf16 or f32");
-      inputTypes[n.arg] = n.type;
-    }
-  for (auto [a, et] : inputTypes) {
-    auto t = cast<RankedTensorType>(func.getArgumentTypes()[a]);
-    bool full = t.getRank() == 2 && t.getNumElements() == dag.r * dag.h; // row-major: rows may be regrouped
-    bool col = t.getRank() == 1 && t.getDimSize(0) == dag.h;
-    if (!full && !col)
-      return fail(func, "an input whose shape is neither [rows, columns] nor [columns]");
-    params[a] = kb.input(a, et, full ? MapAttr::pair(ctx, {R, H}) : H);
-    fullInput[a] = full;
+  inner = dag.r / rowAxes.front().second.size();
+  if (kSlices % inner && inner * rowAxes.front().second.size() != kSlices)
+    return fail(func, "rows inside the outermost row dim (") << inner << ") do not divide the 256 slices";
+  slice = rowsMap(rowAxes.front().second.size());
+  for (auto [i, n] : llvm::enumerate(dag.nodes)) {
+    if (n.kind != Node::Input)
+      continue;
+    if (!n.type.isBF16() && !n.type.isF32())
+      return fail(func, "inputs must be bf16 or f32");
+    if (!n.col)
+      return fail(func, "an input that does not vary along the columns (row values come from reductions)");
+    MapAttr m = inputMap(n);
+    if (cast<RankedTensorType>(func.getArgumentTypes()[n.arg]).getNumElements() != m.size())
+      return fail(func, "an input whose shape is not the rows and columns its map reads");
+    params[i] = kb.input(n.arg, n.type, m);
   }
   for (auto [k, outType] : llvm::enumerate(dag.outTypes)) {
     if (!outType.isBF16() && !outType.isF32())
       return fail(func, "the outputs must be bf16 or f32");
+    if (rootRow(k) && !outType.isF32())
+      return fail(func, "a row value is stored as f32");
     if (tiled())
-      outParams.push_back(kb.inout(written[k], outType, MapAttr::pair(ctx, {R, H})));
+      outParams.push_back(kb.inout(written[k], outType, outMap(rootRow(k))));
     else
-      kb.output(written[k], outType, MapAttr::pair(ctx, {R, H}));
+      kb.output(written[k], outType, outMap(rootRow(k)));
   }
   return success();
+}
+
+MapAttr Planner::rowsMap(int64_t len) {
+  MapAttr outer = rowAxes.front().second;
+  if (len != outer.size())
+    outer = outer.resize(len);
+  if (len * inner < kSlices)
+    outer = outer.padTo(kSlices / inner);
+  SmallVector<MapAttr> parts{outer};
+  for (auto &[d, axis] : llvm::drop_begin(rowAxes))
+    parts.push_back(axis);
+  return MapAttr::pair(ctx, parts);
+}
+
+MapAttr Planner::inputMap(const Node &n) {
+  SmallVector<MapAttr> parts;
+  for (auto &[d, axis] : rowAxes)
+    if (d >= 0 && (n.rows >> d) & 1)
+      parts.push_back(axis);
+  if (n.col)
+    parts.push_back(H);
+  return MapAttr::pair(ctx, parts);
+}
+
+MapAttr Planner::outMap(bool row) {
+  SmallVector<MapAttr> parts;
+  for (auto &[d, axis] : rowAxes)
+    parts.push_back(axis);
+  if (!row)
+    parts.push_back(H);
+  return MapAttr::pair(ctx, parts);
 }
 
 FailureOr<SmallVector<Value>> Planner::emitBody(func::FuncOp func) {
   OpBuilder &b = kb.builder();
   Location loc = kb.loc();
   if (!tiled()) {
-    for (auto [a, p] : params)
-      inputDm[a] = ToDmOp::create(b, loc, kb.dmType(inputTypes[a], slice, H), kb.param(p));
+    for (auto [i, p] : params)
+      inputDm[i] = ToDmOp::create(b, loc, kb.dmType(dag.nodes[i].type, slice, H), kb.param(p));
     return emitTile(func);
   }
-  // Row tiles: each reads its rows of the [rows, columns] inputs through a tile view, and writes its rows
-  // of the outputs through a mutable one.
-  for (int64_t start = 0; start < dag.r; start += kSlices) {
-    int64_t len = std::min(kSlices, dag.r - start);
-    rows = R.resize(len);
-    slice = len < kSlices ? rows.padTo(kSlices) : rows;
+  // Row tiles along the outermost row axis: each reads its rows of the inputs that have that axis through a
+  // tile view (the others broadcast as they are), and writes its rows of the outputs through a mutable one.
+  MapAttr outer = rowAxes.front().second;
+  int64_t extent = outer.size(), step = kSlices / inner;
+  for (int64_t start = 0; start < extent; start += step) {
+    int64_t len = std::min(step, extent - start);
+    slice = rowsMap(len);
     materialized.clear();
     vrfs.clear();
     inputDm.clear();
     vrfBytes = 0;
-    auto tileOf = [&](Value hbm, Type et, bool mut) -> Value {
-      MapAttr whole = MapAttr::pair(ctx, {R, H});
+    // The tile of a view whose mapping has the outer axis.
+    auto tileOf = [&](Value hbm, Type et, MapAttr whole, bool mut) -> Value {
       Value v = ViewOp::create(b, loc, HbmViewType::get(ctx, et, kb.chip(), whole, mut), hbm);
-      MapAttr part = MapAttr::pair(ctx, {rows.padTo(dag.r, mut ? PadKind::Bottom : PadKind::Top), H});
-      return TileOp::create(b, loc, HbmViewType::get(ctx, et, kb.chip(), part, mut), v, R, b.getI64IntegerAttr(len),
-                            b.getI64IntegerAttr(start));
+      SmallVector<MapAttr> parts;
+      for (Attribute a : whole.getKind() == MapKind::Pair ? whole.getOperands() : ArrayRef<Attribute>(whole))
+        parts.push_back(cast<MapAttr>(a) == outer
+                            ? outer.resize(len).padTo(extent, mut ? PadKind::Bottom : PadKind::Top)
+                            : cast<MapAttr>(a));
+      return TileOp::create(b, loc, HbmViewType::get(ctx, et, kb.chip(), MapAttr::pair(ctx, parts), mut), v, outer,
+                            b.getI64IntegerAttr(len), b.getI64IntegerAttr(start));
     };
-    for (auto [a, p] : params) {
-      DmTensorType dm = kb.dmType(inputTypes[a], slice, H);
-      inputDm[a] = fullInput[a] ? ViewToDmOp::create(b, loc, dm, tileOf(kb.param(p), inputTypes[a], false)).getResult()
-                                : ToDmOp::create(b, loc, dm, kb.param(p)).getResult();
+    for (auto [i, p] : params) {
+      Node &n = dag.nodes[i];
+      DmTensorType dm = kb.dmType(n.type, slice, H);
+      bool hasOuter = rowAxes.front().first >= 0 && (n.rows >> rowAxes.front().first) & 1;
+      inputDm[i] = hasOuter ? ViewToDmOp::create(b, loc, dm, tileOf(kb.param(p), n.type, inputMap(n), false)).getResult()
+                            : ToDmOp::create(b, loc, dm, kb.param(p)).getResult();
     }
     FailureOr<SmallVector<Value>> dms = emitTile(func);
     if (failed(dms))
       return failure();
     for (auto [k, dm] : llvm::enumerate(*dms))
-      DmToHbmViewOp::create(b, loc, dm, tileOf(kb.param(outParams[k]), dag.outTypes[k], true));
+      DmToHbmViewOp::create(b, loc, dm, tileOf(kb.param(outParams[k]), dag.outTypes[k], outMap(rootRow(k)), true));
   }
   return SmallVector<Value>();
 }
@@ -886,7 +1004,7 @@ FailureOr<SmallVector<Value>> Planner::emitTile(func::FuncOp func) {
     if (failed(out))
       return failure();
     outs[k] = tiled() ? *out
-                      : ToHbmOp::create(b, loc, kb.hbmType(dag.outTypes[k], MapAttr::pair(ctx, {R, H})), *out).getResult();
+                      : ToHbmOp::create(b, loc, kb.hbmType(dag.outTypes[k], outMap(rootRow(k))), *out).getResult();
   }
   return outs;
 }
@@ -907,12 +1025,17 @@ LogicalResult map(RaisedKernel &kernel) {
   rewriteSigmoid(dag);
   // Without reductions, row or column values, the DAG is elementwise and its rows are free to regroup:
   // shorter rows keep a second streamed tensor within the VRF.
-  if (llvm::all_of(dag.nodes, [](const Node &n) { return n.shape == Shape::Full || n.kind == Node::Const; })) {
+  if (dag.rowExtents.size() == 1 &&
+      llvm::all_of(dag.nodes, [](const Node &n) { return n.shape == Shape::Full || n.kind == Node::Const; })) {
     constexpr int64_t kRow = 1024;
     for (int64_t q = 1; q <= dag.h && dag.h > kRow; ++q)
       if (dag.h % q == 0 && dag.h / q <= kRow && (dag.h / q) % 16 == 0) {
         dag.r *= q;
         dag.h /= q;
+        dag.rowExtents = {dag.r};
+        for (Node &n : dag.nodes)
+          if (n.kind == Node::Input)
+            n.rows = dag.r > 1 ? 1 : 0;
         break;
       }
   }

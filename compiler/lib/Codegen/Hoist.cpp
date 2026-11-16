@@ -11,6 +11,7 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Matchers.h"
 
 #include "llvm/ADT/TypeSwitch.h"
 
@@ -255,9 +256,50 @@ SmallVector<unsigned> dimsOf(Value v, Block &body) {
   return sorted;
 }
 
+/// A select of data by an index-only condition against a constant becomes arithmetic with a table the
+/// hoisting below evaluates: `select(p, x, -inf)` is x + (p ? 0 : -inf), a mask; `select(p, x, 0)` is
+/// x * (p ? 1 : 0). Exact for finite x (the Vector Engine streams arithmetic; it has no per-element
+/// condition from a table).
+void selectsToArithmetic(Block &body) {
+  llvm::DenseMap<Value, bool> memo;
+  SmallVector<arith::SelectOp> selects(body.getOps<arith::SelectOp>());
+  for (arith::SelectOp sel : selects) {
+    if (!isa<FloatType>(sel.getType()) || !isIndexOnly(sel.getCondition(), body, memo))
+      continue;
+    for (int side = 0; side < 2; ++side) {
+      Value x = side ? sel.getFalseValue() : sel.getTrueValue(), other = side ? sel.getTrueValue() : sel.getFalseValue();
+      llvm::APFloat c(0.0);
+      if (isIndexOnly(x, body, memo) || !matchPattern(other, m_ConstantFloat(&c)))
+        continue;
+      OpBuilder b(sel);
+      Location loc = sel.getLoc();
+      Type t = sel.getType();
+      auto constant = [&](double v) { return arith::ConstantOp::create(b, loc, b.getFloatAttr(t, v)); };
+      Value result;
+      if (c.isInfinity()) {
+        Value zero = constant(0.0), inf = arith::ConstantOp::create(b, loc, b.getFloatAttr(t, c));
+        Value bias = side ? arith::SelectOp::create(b, loc, sel.getCondition(), inf, zero)
+                          : arith::SelectOp::create(b, loc, sel.getCondition(), zero, inf);
+        result = arith::AddFOp::create(b, loc, x, bias);
+      } else if (c.isZero()) {
+        Value one = constant(1.0), zero = constant(0.0);
+        Value mask = side ? arith::SelectOp::create(b, loc, sel.getCondition(), zero, one)
+                          : arith::SelectOp::create(b, loc, sel.getCondition(), one, zero);
+        result = arith::MulFOp::create(b, loc, x, mask);
+      } else {
+        continue;
+      }
+      sel.replaceAllUsesWith(result);
+      sel.erase();
+      break;
+    }
+  }
+}
+
 /// Hoists the index-only values of one generic; returns the generic that replaces it (or the same one).
 linalg::GenericOp hoist(linalg::GenericOp generic) {
   Block &body = generic.getRegion().front();
+  selectsToArithmetic(body);
   llvm::DenseMap<Value, bool> memo;
   // Frontier values: index-only, of a scalar element type, read by something that is not, and computed
   // (not a constant, not an index, which is addressing).
@@ -371,6 +413,27 @@ linalg::GenericOp hoist(linalg::GenericOp generic) {
 }
 
 } // namespace
+
+std::optional<std::pair<unsigned, SmallVector<bool>>> mlir::furiosa::truthOverOneDim(Value cond, Block &body,
+                                                                                    ArrayRef<int64_t> ranges) {
+  llvm::DenseMap<Value, bool> memo;
+  if (!cond.getType().isInteger(1) || !isIndexOnly(cond, body, memo))
+    return std::nullopt;
+  SmallVector<unsigned> dims = dimsOf(cond, body);
+  if (dims.size() != 1)
+    return std::nullopt;
+  Interpreter interp(body);
+  SmallVector<int64_t> point(ranges.size(), 0);
+  SmallVector<bool> truth;
+  for (int64_t i = 0; i < ranges[dims[0]]; ++i) {
+    point[dims[0]] = i;
+    FailureOr<Scalar> x = interp.eval(cond, point);
+    if (failed(x))
+      return std::nullopt;
+    truth.push_back(x->i != 0);
+  }
+  return std::make_pair(dims[0], truth);
+}
 
 void mlir::furiosa::hoistIndexOnly(ModuleOp module) {
   SmallVector<linalg::GenericOp> generics;

@@ -23,9 +23,18 @@ LogicalResult translateFoptToRust(ModuleOp module, llvm::raw_ostream &os);
 /// [pointer-arg index per result]}.
 FailureOr<std::string> foptSignature(ModuleOp module);
 
+/// Rewrites reads through mixed-radix map results (d1 * 128 + d2) into projected reads of the buffer reshaped by
+/// the radices and cut to a box, and drops inputs that only carried loop extents (lib/Codegen/Normalize.cpp).
+void normalizeKernels(ModuleOp module);
+
 /// Evaluates every value of a linalg.generic body that depends only on the iteration indices at compile time,
 /// over the dims it reads, and replaces it with a constant tensor input (lib/Codegen/Hoist.cpp).
 void hoistIndexOnly(ModuleOp module);
+
+/// For an index-only i1 value of a generic body that depends on one loop dim: that dim, and the value at each of
+/// its iterations (`ranges` are the loop extents).
+std::optional<std::pair<unsigned, SmallVector<bool>>> truthOverOneDim(Value cond, Block &body,
+                                                                    ArrayRef<int64_t> ranges);
 
 /// Splits each kernel that no op class maps whole into steps (lib/Codegen/Steps.cpp): sub-kernel functions,
 /// each one an op class maps, called in order from the kernel on its buffers and HBM temporaries.

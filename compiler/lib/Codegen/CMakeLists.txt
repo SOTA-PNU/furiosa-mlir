@@ -8,6 +8,7 @@ add_triton_library(FuriosaCodegen
   Mapping/Elementwise.cpp
   Mapping/Gather.cpp
   Mapping/Rowwise.cpp
+  Normalize.cpp
   Tile/Analysis.cpp
   Tile/Lower.cpp
   Tile/Ops.cpp
@@ -28,4 +29,5 @@ add_triton_library(FuriosaCodegen
     MLIRSCFDialect
     MLIRSupport
     MLIRTensorDialect
+    MLIRTransforms
 )

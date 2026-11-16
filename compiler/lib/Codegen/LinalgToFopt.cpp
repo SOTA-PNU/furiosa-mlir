@@ -125,6 +125,41 @@ const OpClass *mapping::matchClass(RaisedKernel &kernel) {
 
 RaisedKernel mapping::raisedKernel(func::FuncOp func) { return {func, argNames(func), writtenArgs(func)}; }
 
+bool mapping::mapsOnCopy(func::FuncOp func, const OpClass &c) {
+  OpBuilder b(func.getContext());
+  OwningOpRef<ModuleOp> scratch = ModuleOp::create(b, func.getLoc());
+  if (ModuleOp parent = func->getParentOfType<ModuleOp>())
+    for (NamedAttribute attr : parent->getAttrs())
+      (*scratch)->setAttr(attr.getName(), attr.getValue());
+  auto copy = cast<func::FuncOp>(func->clone());
+  scratch->push_back(copy);
+  ScopedDiagnosticHandler quiet(func.getContext(), [](Diagnostic &) { return success(); });
+  RaisedKernel raised = raisedKernel(copy);
+  return c.match(raised) && succeeded(c.map(raised));
+}
+
+LogicalResult mapping::mapKernel(func::FuncOp func) {
+  RaisedKernel kernel = raisedKernel(func);
+  SmallVector<const OpClass *> matching;
+  for (const OpClass &c : opClasses())
+    if (c.match(kernel))
+      matching.push_back(&c);
+  if (matching.empty()) {
+    bool gather = false;
+    func.walk([&](tensor::ExtractOp) { gather = true; });
+    if (gather)
+      return func.emitError("the kernel reads buffers with tensor.extract (gather form); mapping needs structured "
+                            "linalg (affine reads promoted to indexing-map inputs by furiosa-structure)");
+    return func.emitError("no op class maps this kernel (classes: elementwise, contraction, row-wise)");
+  }
+  // A class's match is a quick filter: the first of several matching classes that maps the kernel (tried on a
+  // copy) maps it; the last one tried explains a failure.
+  for (const OpClass *c : ArrayRef(matching).drop_back())
+    if (mapsOnCopy(func, *c))
+      return c->map(kernel);
+  return matching.back()->map(kernel);
+}
+
 namespace {
 
 struct LinalgToFoptPass : PassWrapper<LinalgToFoptPass, OperationPass<ModuleOp>> {
@@ -139,19 +174,7 @@ struct LinalgToFoptPass : PassWrapper<LinalgToFoptPass, OperationPass<ModuleOp>>
     for (func::FuncOp func : funcs) {
       if (func->hasAttr(fopt::kChipAttr))
         continue;
-      RaisedKernel kernel = raisedKernel(func);
-      const OpClass *chosen = matchClass(kernel);
-      if (!chosen) {
-        bool gather = false;
-        func.walk([&](tensor::ExtractOp) { gather = true; });
-        if (gather)
-          func.emitError("the kernel reads buffers with tensor.extract (gather form); mapping needs structured "
-                         "linalg (affine reads promoted to indexing-map inputs by furiosa-structure)");
-        else
-          func.emitError("no op class maps this kernel (classes: elementwise, contraction, row-wise)");
-        return signalPassFailure();
-      }
-      if (failed(chosen->map(kernel)))
+      if (failed(mapKernel(func)))
         return signalPassFailure();
     }
   }

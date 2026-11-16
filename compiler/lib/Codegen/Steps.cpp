@@ -15,6 +15,8 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/Pass/PassManager.h"
+#include "mlir/Transforms/Passes.h"
 
 #include "llvm/ADT/SetVector.h"
 #include "llvm/Support/Base64.h"
@@ -35,7 +37,34 @@ bool isCheap(Operation *op) {
 }
 
 bool isUnit(Operation *op) {
-  return (isa<linalg::LinalgOp>(op) && !isa<linalg::FillOp>(op)) || isa<tensor::InsertSliceOp>(op);
+  return (isa<linalg::LinalgOp>(op) && !isa<linalg::FillOp>(op)) ||
+         isa<tensor::InsertSliceOp, tensor::ExtractSliceOp>(op);
+}
+
+/// `v` as a tensor of type `t` with the same elements in row-major order (collapse to 1-D, expand back).
+Value reshapeTo(OpBuilder &b, Location loc, Value v, RankedTensorType t) {
+  auto from = cast<RankedTensorType>(v.getType());
+  if (from == t)
+    return v;
+  auto all = [](int64_t rank) {
+    ReassociationIndices r;
+    for (int64_t d = 0; d < rank; ++d)
+      r.push_back(d);
+    return SmallVector<ReassociationIndices>{r};
+  };
+  if (from.getRank() != 1)
+    v = tensor::CollapseShapeOp::create(b, loc, RankedTensorType::get({from.getNumElements()}, from.getElementType()), v,
+                                        all(from.getRank()));
+  if (t.getRank() != 1)
+    v = tensor::ExpandShapeOp::create(b, loc, t, v, all(t.getRank()));
+  return v;
+}
+
+/// The value a reshape chain starts from.
+Value throughReshapes(Value v) {
+  while (v.getDefiningOp() && isReshape(v.getDefiningOp()))
+    v = v.getDefiningOp()->getOperand(0);
+  return v;
 }
 
 /// Whether some op class maps `func` (mapped on a copy, its diagnostics dropped): an op class's match is a
@@ -74,14 +103,26 @@ bool mapsWhole(func::FuncOp func) {
   auto copy = cast<func::FuncOp>(func->clone());
   scratch->push_back(copy);
   externalize(copy);
-  ScopedDiagnosticHandler quiet(func.getContext(), [](Diagnostic &) { return success(); });
-  RaisedKernel raised = raisedKernel(copy);
-  const OpClass *c = matchClass(raised);
-  return c && succeeded(c->map(raised));
+  for (const OpClass &c : opClasses())
+    if (mapsOnCopy(copy, c))
+      return true;
+  // FURIOSA_DEBUG=1 prints why a candidate step does not map.
+  if (getenv("FURIOSA_DEBUG")) {
+    ScopedDiagnosticHandler print(func.getContext(), [&](Diagnostic &d) {
+      llvm::errs() << "candidate " << func.getName() << ": " << d << "\n";
+      return success();
+    });
+    (void)mapKernel(copy);
+  }
+  return false;
 }
 
-/// A candidate step: unit ops of the kernel's block, in program order.
-using Group = SmallVector<Operation *>;
+/// A step: the unit ops it owns (it produces their values for the other steps), and those of other steps it
+/// recomputes rather than reading their results.
+struct Group {
+  SmallVector<Operation *> ops, dups;
+  bool contains(Operation *op) const { return llvm::is_contained(ops, op) || llvm::is_contained(dups, op); }
+};
 
 class Splitter {
 public:
@@ -97,55 +138,169 @@ private:
   func::FuncOp kernel;
   Block &block;
   llvm::DenseMap<Operation *, size_t> position;
-  llvm::DenseMap<Operation *, int> groupOf; // unit op -> group index
+  llvm::DenseMap<Operation *, int> groupOf; // unit op -> the group that owns it
   std::vector<Group> groups;
+  std::vector<llvm::SmallSetVector<unsigned, 2>> reads; // per group: the kernel buffers it reads
+  llvm::DenseMap<Value, Value> resultOf;               // a step output -> its value after the call
 
-  /// The groups (or -1 for the kernel's return) that read `v`, looking through cheap ops.
+  /// A group's ops and dups, in program order.
+  SmallVector<Operation *> members(const Group &g) {
+    SmallVector<Operation *> all(g.ops);
+    llvm::append_range(all, g.dups);
+    llvm::sort(all, [&](Operation *x, Operation *y) { return position.lookup(x) < position.lookup(y); });
+    return all;
+  }
+  /// The unit ops whose values `g`'s members read (through cheap ops), outside `g`.
+  llvm::SetVector<Operation *> producedFor(const Group &g);
+  /// The groups (or -1 for the kernel's return) whose owned ops read `v`, looking through cheap ops.
   void consumers(Value v, llvm::SmallSetVector<int, 4> &out);
-  /// A step function for `ops` (unit ops), not inserted anywhere; fills `inputs` with the kernel values it
-  /// reads and `outputs` with the values of `ops` read outside them.
-  func::FuncOp outline(ArrayRef<Operation *> ops, StringRef name, SmallVectorImpl<Value> &inputs,
-                       SmallVectorImpl<Value> &outputs);
-  bool mappable(ArrayRef<Operation *> ops);
+  /// The values of `g`'s own ops that something outside it reads: the return, or a group that reads it
+  /// without recomputing it (`all`: any op outside `g`, for a candidate).
+  SmallVector<Value> outputsOf(int g, bool all);
+  /// A step function for `g` that writes `outputs`, not inserted anywhere; fills `inputs` with the values
+  /// it reads (kernel buffers, or outputs of earlier steps, by their original value).
+  func::FuncOp outline(const Group &g, StringRef name, ArrayRef<Value> outputs, SmallVectorImpl<Value> &inputs);
+  bool mappable(const Group &g);
+  /// Drops groups whose values no live group needs: every reader recomputes them.
+  void prune();
   /// Orders the steps: after the steps whose results they read, and a step that leaves its result in a
   /// buffer after every step that reads the buffer's original value, so the buffer can take it in place.
   void order();
 };
 
+llvm::SetVector<Operation *> Splitter::producedFor(const Group &g) {
+  llvm::SetVector<Operation *> producers;
+  for (Operation *op : members(g))
+    op->walk([&](Operation *nested) {
+      for (Value operand : nested->getOperands()) {
+        std::function<void(Value)> trace = [&](Value v) {
+          Operation *def = v.getDefiningOp();
+          if (!def || def->getBlock() != &block || g.contains(def))
+            return;
+          if (groupOf.count(def))
+            producers.insert(def);
+          else if (isCheap(def))
+            for (Value o : def->getOperands())
+              trace(o);
+        };
+        trace(operand);
+      }
+    });
+  return producers;
+}
+
+void Splitter::consumers(Value v, llvm::SmallSetVector<int, 4> &out) {
+  for (OpOperand &use : v.getUses()) {
+    Operation *user = use.getOwner();
+    while (user->getBlock() != &block)
+      user = user->getParentOp();
+    if (isa<func::ReturnOp>(user))
+      out.insert(-1);
+    else if (auto it = groupOf.find(user); it != groupOf.end())
+      out.insert(it->second);
+    else if (isCheap(user))
+      for (Value r : user->getResults())
+        consumers(r, out);
+  }
+}
+
+SmallVector<Value> Splitter::outputsOf(int g, bool all) {
+  SmallVector<Value> outputs;
+  const Group &group = groups[g];
+  for (Operation *op : members(group)) {
+    if (!llvm::is_contained(group.ops, op))
+      continue;
+    for (Value r : op->getResults()) {
+      bool read = false;
+      std::function<void(Value)> visit = [&](Value v) {
+        for (OpOperand &use : v.getUses()) {
+          Operation *user = use.getOwner();
+          while (user->getBlock() != &block)
+            user = user->getParentOp();
+          if (group.contains(user))
+            continue;
+          if (isa<func::ReturnOp>(user) || all) {
+            read = true;
+          } else if (isCheap(user)) {
+            for (Value x : user->getResults())
+              visit(x);
+          } else {
+            // A live group that reads the value without recomputing its producer.
+            for (const Group &other : groups)
+              if (&other != &group && other.contains(user) && !other.contains(op))
+                read = true;
+          }
+        }
+      };
+      visit(r);
+      if (read)
+        outputs.push_back(r);
+    }
+  }
+  return outputs;
+}
+
+void Splitter::prune() {
+  int n = groups.size();
+  std::vector<bool> live(n);
+  SmallVector<int> work;
+  for (int g = 0; g < n; ++g) {
+    bool needed = llvm::any_of(groups[g].ops, [](Operation *op) { return isa<tensor::InsertSliceOp>(op); });
+    for (Operation *op : groups[g].ops)
+      for (Value r : op->getResults()) {
+        llvm::SmallSetVector<int, 4> readers;
+        consumers(r, readers);
+        needed |= readers.contains(-1);
+      }
+    if (needed && !live[g]) {
+      live[g] = true;
+      work.push_back(g);
+    }
+  }
+  while (!work.empty()) {
+    int g = work.pop_back_val();
+    for (Operation *def : producedFor(groups[g])) {
+      int p = groupOf.lookup(def);
+      if (!live[p]) {
+        live[p] = true;
+        work.push_back(p);
+      }
+    }
+  }
+  for (int g = 0; g < n; ++g)
+    if (!live[g])
+      groups[g].ops.clear(), groups[g].dups.clear();
+}
+
 void Splitter::order() {
-  llvm::sort(groups, [&](const Group &x, const Group &y) {
-    return position.lookup(x.back()) < position.lookup(y.back());
-  });
+  llvm::erase_if(groups, [](const Group &g) { return g.ops.empty(); });
+  auto last = [&](const Group &g) {
+    size_t at = 0;
+    for (Operation *op : g.ops)
+      at = std::max(at, position.lookup(op));
+    return at;
+  };
+  llvm::sort(groups, [&](const Group &x, const Group &y) { return last(x) < last(y); });
   int n = groups.size();
   groupOf.clear();
   for (int g = 0; g < n; ++g)
-    for (Operation *op : groups[g])
+    for (Operation *op : groups[g].ops)
       groupOf[op] = g;
   std::vector<llvm::SmallSetVector<int, 4>> after(n); // after[g]: steps that must run before g
-  std::vector<llvm::SmallSetVector<unsigned, 2>> reads(n), writes(n);
-  for (int g = 0; g < n; ++g)
-    for (Operation *op : groups[g])
+  std::vector<llvm::SmallSetVector<unsigned, 2>> writes(n);
+  reads.assign(n, {});
+  for (int g = 0; g < n; ++g) {
+    for (Operation *def : producedFor(groups[g]))
+      after[g].insert(groupOf.lookup(def));
+    for (Operation *op : members(groups[g]))
       op->walk([&](Operation *nested) {
         for (Value operand : nested->getOperands()) {
-          std::function<void(Value)> trace = [&](Value v) {
-            if (auto arg = dyn_cast<BlockArgument>(v); arg && arg.getOwner() == &block) {
-              reads[g].insert(arg.getArgNumber());
-              return;
-            }
-            Operation *def = v.getDefiningOp();
-            if (!def || def->getBlock() != &block)
-              return;
-            if (auto it = groupOf.find(def); it != groupOf.end()) {
-              if (it->second != g)
-                after[g].insert(it->second);
-            } else if (isCheap(def)) {
-              for (Value o : def->getOperands())
-                trace(o);
-            }
-          };
-          trace(operand);
+          Value v = throughReshapes(operand);
+          if (auto arg = dyn_cast<BlockArgument>(v); arg && arg.getOwner() == &block)
+            reads[g].insert(arg.getArgNumber());
         }
       });
+  }
   // The buffers a step's results are returned in.
   auto written = kernel->getAttrOfType<ArrayAttr>("furiosa.written");
   for (OpOperand &use : block.getTerminator()->getOpOperands()) {
@@ -155,6 +310,22 @@ void Splitter::order() {
     if (Operation *def = v.getDefiningOp(); def && groupOf.count(def) && written)
       writes[groupOf[def]].insert(cast<IntegerAttr>(written[use.getOperandNumber()]).getInt());
   }
+  // An insert_slice writes in place the buffer its destination is (through reshapes and earlier inserts).
+  for (int g = 0; g < n; ++g)
+    for (Operation *op : groups[g].ops)
+      if (auto insert = dyn_cast<tensor::InsertSliceOp>(op)) {
+        Value d = insert.getDest();
+        while (Operation *def = d.getDefiningOp()) {
+          if (isReshape(def))
+            d = def->getOperand(0);
+          else if (auto earlier = dyn_cast<tensor::InsertSliceOp>(def))
+            d = earlier.getDest();
+          else
+            break;
+        }
+        if (auto arg = dyn_cast<BlockArgument>(d); arg && arg.getOwner() == &block)
+          writes[g].insert(arg.getArgNumber());
+      }
   for (int g = 0; g < n; ++g)
     for (unsigned buffer : writes[g])
       for (int h = 0; h < n; ++h)
@@ -179,41 +350,33 @@ void Splitter::order() {
         --pending[g];
   }
   std::vector<Group> reordered;
-  for (int g : sorted)
+  std::vector<llvm::SmallSetVector<unsigned, 2>> reorderedReads;
+  for (int g : sorted) {
     reordered.push_back(groups[g]);
-  groups = std::move(reordered);
-}
-
-void Splitter::consumers(Value v, llvm::SmallSetVector<int, 4> &out) {
-  for (OpOperand &use : v.getUses()) {
-    Operation *user = use.getOwner();
-    while (user->getBlock() != &block)
-      user = user->getParentOp();
-    if (isa<func::ReturnOp>(user))
-      out.insert(-1);
-    else if (auto it = groupOf.find(user); it != groupOf.end())
-      out.insert(it->second);
-    else if (isCheap(user))
-      for (Value r : user->getResults())
-        consumers(r, out);
+    reorderedReads.push_back(reads[g]);
   }
+  groups = std::move(reordered);
+  reads = std::move(reorderedReads);
+  groupOf.clear();
+  for (int g = 0; g < n; ++g)
+    for (Operation *op : groups[g].ops)
+      groupOf[op] = g;
 }
 
-func::FuncOp Splitter::outline(ArrayRef<Operation *> ops, StringRef name, SmallVectorImpl<Value> &inputs,
-                               SmallVectorImpl<Value> &outputs) {
-  llvm::SmallPtrSet<Operation *, 16> inside(ops.begin(), ops.end());
-  // Cheap producers are cloned in; everything else the ops read is an input.
+func::FuncOp Splitter::outline(const Group &g, StringRef name, ArrayRef<Value> outputs,
+                               SmallVectorImpl<Value> &inputs) {
+  // Cheap producers are cloned in; everything else the members read is an input.
   llvm::SetVector<Operation *> cloned;
   llvm::SetVector<Value> external;
   std::function<void(Value)> need = [&](Value v) {
     if (auto arg = dyn_cast<BlockArgument>(v); arg && arg.getOwner() != &block)
       return; // an argument of one of the ops' own regions
     Operation *def = v.getDefiningOp();
-    if (def && (inside.contains(def) || cloned.contains(def)))
+    if (def && (g.contains(def) || cloned.contains(def)))
       return;
     if (def && def->getBlock() != &block)
       return; // defined inside one of the ops' own regions
-    if (def && isCheap(def)) {
+    if (def && isCheap(def) && !resultOf.count(v)) {
       for (Value operand : def->getOperands())
         need(operand);
       cloned.insert(def);
@@ -221,20 +384,12 @@ func::FuncOp Splitter::outline(ArrayRef<Operation *> ops, StringRef name, SmallV
     }
     external.insert(v);
   };
-  for (Operation *op : ops)
+  SmallVector<Operation *> all = members(g);
+  for (Operation *op : all)
     op->walk([&](Operation *nested) {
       for (Value operand : nested->getOperands())
         need(operand);
     });
-  // Outputs: values of the ops read by anything else (another step, the return, or a cheap op that is).
-  for (Operation *op : ops)
-    for (Value r : op->getResults())
-      if (llvm::any_of(r.getUsers(), [&](Operation *user) {
-            while (user->getBlock() != &block)
-              user = user->getParentOp();
-            return !inside.contains(user);
-          }))
-        outputs.push_back(r);
   inputs.assign(external.begin(), external.end());
 
   // Each output is written to an argument: the buffer an insert_slice updates, or a fresh destination.
@@ -244,9 +399,11 @@ func::FuncOp Splitter::outline(ArrayRef<Operation *> ops, StringRef name, SmallV
     argTypes.push_back(v.getType());
   SmallVector<int64_t> written;
   for (Value out : outputs) {
+    // An insert_slice updates the buffer it writes (through reshapes) in place; order() put the steps that
+    // read the buffer's earlier value first, and stepsPlan rejects a plan that would read it stale.
     auto insert = out.getDefiningOp<tensor::InsertSliceOp>();
-    auto dest = insert ? llvm::find(inputs, insert.getDest()) : inputs.end();
-    if (dest != inputs.end() && insert.getDest().hasOneUse()) {
+    auto dest = insert ? llvm::find(inputs, throughReshapes(insert.getDest())) : inputs.end();
+    if (dest != inputs.end()) {
       written.push_back(dest - inputs.begin());
     } else {
       written.push_back(argTypes.size());
@@ -254,8 +411,8 @@ func::FuncOp Splitter::outline(ArrayRef<Operation *> ops, StringRef name, SmallV
     }
   }
   SmallVector<Type> resultTypes;
-  for (Value out : outputs)
-    resultTypes.push_back(out.getType());
+  for (int64_t w : written)
+    resultTypes.push_back(argTypes[w]);
   auto func = func::FuncOp::create(b, kernel.getLoc(), name, b.getFunctionType(argTypes, resultTypes));
   func->setAttr("furiosa.written", b.getI64ArrayAttr(written));
   Block *body = func.addEntryBlock();
@@ -270,21 +427,23 @@ func::FuncOp Splitter::outline(ArrayRef<Operation *> ops, StringRef name, SmallV
     if (w >= int64_t(inputs.size()))
       body->getArgument(w).setLoc(NameLoc::get(b.getStringAttr("t" + std::to_string(k))));
   b.setInsertionPointToStart(body);
-  SmallVector<Operation *> all(cloned.begin(), cloned.end());
-  llvm::append_range(all, ops);
-  llvm::sort(all, [&](Operation *x, Operation *y) { return position.lookup(x) < position.lookup(y); });
-  for (Operation *op : all)
+  SmallVector<Operation *> clones(cloned.begin(), cloned.end());
+  llvm::append_range(clones, all);
+  llvm::sort(clones, [&](Operation *x, Operation *y) { return position.lookup(x) < position.lookup(y); });
+  for (Operation *op : clones)
     b.clone(*op, map);
   SmallVector<Value> results;
-  for (Value out : outputs)
-    results.push_back(map.lookup(out));
+  for (auto [out, w] : llvm::zip(outputs, written))
+    results.push_back(reshapeTo(b, kernel.getLoc(), map.lookup(out), cast<RankedTensorType>(argTypes[w])));
   func::ReturnOp::create(b, kernel.getLoc(), results);
   return func;
 }
 
-bool Splitter::mappable(ArrayRef<Operation *> ops) {
-  SmallVector<Value> inputs, outputs;
-  func::FuncOp func = outline(ops, "candidate", inputs, outputs);
+bool Splitter::mappable(const Group &g) {
+  groups.push_back(g);
+  SmallVector<Value> inputs, outputs = outputsOf(groups.size() - 1, /*all=*/true);
+  func::FuncOp func = outline(g, "candidate", outputs, inputs);
+  groups.pop_back();
   bool ok = mapsWhole(func);
   func.erase();
   return ok;
@@ -295,83 +454,117 @@ void Splitter::run(bool single) {
     if (isUnit(&op)) {
       if (single && !groups.empty()) {
         groupOf[&op] = 0;
-        groups[0].push_back(&op);
+        groups[0].ops.push_back(&op);
         continue;
       }
       groupOf[&op] = groups.size();
-      groups.push_back({&op});
+      groups.push_back({{&op}, {}});
     }
   if (groups.size() < (single ? 1u : 2u))
     return;
 
-  // Merge a producer into its only consumer while an op class maps the merged step.
-  for (bool changed = true; changed;) {
+  // A producer merges into its only consumer, or is recomputed by one of several, while an op class maps
+  // the merged step.
+  for (bool changed = !single; changed;) {
     changed = false;
     for (int g = groups.size() - 1; g >= 0 && !changed; --g) {
-      if (groups[g].empty())
+      if (groups[g].ops.empty())
         continue;
       llvm::SmallSetVector<int, 4> producers;
-      for (Operation *op : groups[g])
-        op->walk([&](Operation *nested) {
-          for (Value operand : nested->getOperands()) {
-            std::function<void(Value)> trace = [&](Value v) {
-              Operation *def = v.getDefiningOp();
-              if (!def || def->getBlock() != &block)
-                return;
-              if (auto it = groupOf.find(def); it != groupOf.end()) {
-                if (it->second != g)
-                  producers.insert(it->second);
-              } else if (isCheap(def)) {
-                for (Value o : def->getOperands())
-                  trace(o);
-              }
-            };
-            trace(operand);
-          }
-        });
+      for (Operation *def : producedFor(groups[g]))
+        producers.insert(groupOf.lookup(def));
       for (int p : producers) {
         llvm::SmallSetVector<int, 4> readers;
-        for (Operation *op : groups[p])
+        for (Operation *op : groups[p].ops)
           for (Value r : op->getResults())
             consumers(r, readers);
-        if (readers.size() != 1 || readers.front() != g)
-          continue;
-        Group merged = groups[p];
-        llvm::append_range(merged, groups[g]);
-        llvm::sort(merged, [&](Operation *x, Operation *y) { return position.lookup(x) < position.lookup(y); });
+        Group merged = groups[g];
+        bool move = readers.size() == 1 && readers.front() == g;
+        if (move) {
+          llvm::append_range(merged.ops, groups[p].ops);
+        } else {
+          if (llvm::all_of(groups[p].ops, [&](Operation *op) { return groups[g].contains(op); }))
+            continue;
+          llvm::append_range(merged.dups, groups[p].ops);
+        }
+        for (Operation *op : groups[p].dups)
+          if (!merged.contains(op))
+            merged.dups.push_back(op);
         if (!mappable(merged))
           continue;
-        for (Operation *op : groups[p])
-          groupOf[op] = g;
+        if (move) {
+          for (Operation *op : groups[p].ops)
+            groupOf[op] = g;
+          groups[p].ops.clear();
+          groups[p].dups.clear();
+        }
         groups[g] = merged;
-        groups[p].clear();
         changed = true;
         break;
       }
+      // No single producer merges: try every computing (non-copy) producer at once, since a step may map
+      // only once all of its row values, say, are computed inside it.
+      if (changed || producers.size() < 2)
+        continue;
+      Group merged = groups[g];
+      SmallVector<int> moved;
+      for (int p : producers) {
+        if (llvm::any_of(groups[p].ops, [](Operation *op) { return isa<tensor::ExtractSliceOp, tensor::InsertSliceOp>(op); }))
+          continue;
+        llvm::SmallSetVector<int, 4> readers;
+        for (Operation *op : groups[p].ops)
+          for (Value r : op->getResults())
+            consumers(r, readers);
+        if (readers.size() == 1 && readers.front() == g) {
+          llvm::append_range(merged.ops, groups[p].ops);
+          moved.push_back(p);
+        } else {
+          for (Operation *op : groups[p].ops)
+            if (!merged.contains(op))
+              merged.dups.push_back(op);
+        }
+        for (Operation *op : groups[p].dups)
+          if (!merged.contains(op))
+            merged.dups.push_back(op);
+      }
+      if (merged.ops.size() == groups[g].ops.size() && merged.dups.size() == groups[g].dups.size())
+        continue;
+      if (!mappable(merged))
+        continue;
+      for (int p : moved) {
+        for (Operation *op : groups[p].ops)
+          groupOf[op] = g;
+        groups[p].ops.clear();
+        groups[p].dups.clear();
+      }
+      groups[g] = merged;
+      changed = true;
     }
   }
-  llvm::erase_if(groups, [](const Group &group) { return group.empty(); });
+  prune();
+  order();
   if (groups.size() < (single ? 1u : 2u))
     return;
-  order();
 
   // Outline each step and call it from the kernel, in order.
   ModuleOp module = kernel->getParentOfType<ModuleOp>();
   auto returnOp = cast<func::ReturnOp>(block.getTerminator());
   auto written = kernel->getAttrOfType<ArrayAttr>("furiosa.written");
   OpBuilder b(kernel.getContext());
-  SmallVector<std::string> names;
+  SmallVector<Operation *> outlinedOps;
   for (auto [s, group] : llvm::enumerate(groups)) {
-    SmallVector<Value> inputs, outputs;
+    SmallVector<Value> inputs, outputs = outputsOf(s, /*all=*/false);
     std::string name = (kernel.getName() + "__s" + Twine(s)).str();
-    func::FuncOp step = outline(group, name, inputs, outputs);
+    func::FuncOp step = outline(group, name, outputs, inputs);
     step.setPrivate();
     module.push_back(step);
     auto stepWritten = step->getAttrOfType<ArrayAttr>("furiosa.written");
-    // Call operands: the inputs, then a destination per fresh output: the buffer the kernel returns it into
-    // (through reshapes, which move no data), or a new temporary.
+    // Call operands: the inputs (as earlier steps left them), then a destination per fresh output: the buffer
+    // the kernel returns it into (through reshapes, which move no data), or a new temporary.
     b.setInsertionPoint(returnOp); // calls run in step order
-    SmallVector<Value> operands(inputs.begin(), inputs.end());
+    SmallVector<Value> operands;
+    for (Value v : inputs)
+      operands.push_back(resultOf.count(v) ? resultOf[v] : v);
     for (auto [k, out] : llvm::enumerate(outputs)) {
       int64_t w = cast<IntegerAttr>(stepWritten[k]).getInt();
       if (w < int64_t(inputs.size()))
@@ -383,44 +576,15 @@ void Splitter::run(bool single) {
           v = v.getDefiningOp()->getOperand(0);
         if (v != out || !written)
           continue;
-        Value buffer = kernel.getArgument(cast<IntegerAttr>(written[use.getOperandNumber()]).getInt());
+        unsigned index = cast<IntegerAttr>(written[use.getOperandNumber()]).getInt();
+        Value buffer = kernel.getArgument(index);
         auto bt = cast<RankedTensorType>(buffer.getType()), ot = cast<RankedTensorType>(out.getType());
         // The buffer takes the result once every other step that reads it has run (order() put them first).
-        if (bt.getNumElements() != ot.getNumElements() || bt.getElementType() != ot.getElementType() ||
-            !llvm::all_of(buffer.getUsers(), [&](Operation *u) {
-              while (u->getBlock() != &block)
-                u = u->getParentOp();
-              return isa<func::ReturnOp, func::CallOp>(u) || llvm::is_contained(group, u) ||
-                     (isCheap(u) && llvm::all_of(u->getUsers(), [&](Operation *x) {
-                        while (x->getBlock() != &block)
-                          x = x->getParentOp();
-                        return isa<func::CallOp>(x) || llvm::is_contained(group, x);
-                      }));
-            }))
-          continue;
-        dest = buffer;
-        if (bt != ot) {
-          // A row-major reshape of the buffer to the output's shape.
-          SmallVector<ReassociationIndices> assoc;
-          if (bt.getRank() == 1 || ot.getRank() == 1) {
-            auto flat = RankedTensorType::get({bt.getNumElements()}, bt.getElementType());
-            if (bt.getRank() != 1) {
-              ReassociationIndices all;
-              for (int64_t d = 0; d < bt.getRank(); ++d)
-                all.push_back(d);
-              dest = tensor::CollapseShapeOp::create(b, kernel.getLoc(), flat, dest,
-                                                     ArrayRef<ReassociationIndices>{all});
-            }
-            if (ot.getRank() != 1) {
-              ReassociationIndices all;
-              for (int64_t d = 0; d < ot.getRank(); ++d)
-                all.push_back(d);
-              dest = tensor::ExpandShapeOp::create(b, kernel.getLoc(), ot, dest, ArrayRef<ReassociationIndices>{all});
-            }
-          } else {
-            dest = Value();
-          }
-        }
+        bool free = bt.getNumElements() == ot.getNumElements() && bt.getElementType() == ot.getElementType();
+        for (size_t h = s + 1; h < groups.size() && free; ++h)
+          free = !reads[h].contains(index);
+        if (free)
+          dest = reshapeTo(b, kernel.getLoc(), buffer, ot);
         break;
       }
       if (!dest)
@@ -430,17 +594,26 @@ void Splitter::run(bool single) {
     }
     auto call = func::CallOp::create(b, kernel.getLoc(), step, operands);
     for (auto [out, result] : llvm::zip(outputs, call.getResults()))
-      out.replaceUsesWithIf(result, [&](OpOperand &use) {
-        Operation *user = use.getOwner();
-        while (user->getBlock() != &block)
-          user = user->getParentOp();
-        return !llvm::is_contained(group, user);
-      });
+      resultOf[out] = reshapeTo(b, kernel.getLoc(), result, cast<RankedTensorType>(out.getType()));
+    llvm::append_range(outlinedOps, group.ops);
   }
-  // The kernel now only calls steps: drop the outlined ops and whatever only they read.
-  for (Group &group : llvm::reverse(groups))
-    for (Operation *op : llvm::reverse(group))
-      op->erase();
+  // The kernel now only calls steps: what remains reads the step results; the unit ops (outlined, or
+  // recomputed by every step that read them) go.
+  for (auto &[out, value] : resultOf)
+    out.replaceUsesWithIf(value, [&](OpOperand &use) {
+      Operation *user = use.getOwner();
+      while (user->getBlock() != &block)
+        user = user->getParentOp();
+      return !isUnit(user);
+    });
+  SmallVector<Operation *> units;
+  for (Operation &op : block)
+    if (isUnit(&op))
+      units.push_back(&op);
+  for (Operation *op : llvm::reverse(units)) {
+    op->dropAllUses();
+    op->erase();
+  }
   for (bool erased = true; erased;) {
     erased = false;
     SmallVector<Operation *> ops;
@@ -452,16 +625,28 @@ void Splitter::run(bool single) {
         erased = true;
       }
   }
-  // Reshapes of step results the kernel returns move after the calls.
+  // The kernel's own cheap ops on step results move after the calls, each after its operands (those made
+  // with the calls are in place already).
   llvm::SetVector<Operation *> late;
-  for (Operation &op : block)
-    if (isCheap(&op) && llvm::any_of(op.getOperands(), [&](Value v) {
-          Operation *def = v.getDefiningOp();
-          return def && (isa<func::CallOp>(def) || late.contains(def));
-        }))
-      late.insert(&op);
-  for (Operation *op : late)
-    op->moveBefore(returnOp);
+  for (bool grew = true; grew;) {
+    grew = false;
+    for (Operation &op : block)
+      if (isCheap(&op) && position.count(&op) && !late.contains(&op) && llvm::any_of(op.getOperands(), [&](Value v) {
+            Operation *def = v.getDefiningOp();
+            return def && (isa<func::CallOp>(def) || late.contains(def));
+          }))
+        grew = late.insert(&op);
+  }
+  llvm::SmallPtrSet<Operation *, 8> moved;
+  while (moved.size() < late.size())
+    for (Operation *op : late)
+      if (!moved.contains(op) && llvm::all_of(op->getOperands(), [&](Value v) {
+            Operation *def = v.getDefiningOp();
+            return !def || !late.contains(def) || moved.contains(def);
+          })) {
+        op->moveBefore(returnOp);
+        moved.insert(op);
+      }
   kernel->setAttr(kStepsAttr, b.getUnitAttr());
 }
 
@@ -473,6 +658,12 @@ LogicalResult mlir::furiosa::splitSteps(ModuleOp module) {
   for (auto func : module.getOps<func::FuncOp>())
     if (func.isPublic() && !func->hasAttr(kStepsAttr))
       kernels.push_back(func);
+  normalizeKernels(module);
+  // Reads the normalization rewrote alike (each operand gets its own reshape and box) become one again.
+  PassManager pm(module.getContext());
+  pm.addPass(createCSEPass());
+  if (failed(pm.run(module)))
+    return failure();
   hoistIndexOnly(module);
   for (func::FuncOp kernel : kernels) {
     if (!mapsWhole(kernel))
