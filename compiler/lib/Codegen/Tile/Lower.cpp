@@ -107,7 +107,7 @@ private:
 
   SmallVector<MapAttr> axisMap;
   std::map<unsigned, unsigned> paramOf;
-  std::map<double, Value> fillDm;
+  std::map<std::pair<double, bool>, Value> fillDm;
   MapAttr kf, interleave;
   unsigned fresh = 0;
 
@@ -205,7 +205,7 @@ private:
 
   // Emission helpers.
   Location loc() { return kb.loc(); }
-  Value zeros(double value);
+  Value zeros(double value, Type et);
   Value view(Value hbm, bool mut) {
     auto t = cast<HbmTensorType>(hbm.getType());
     return ViewOp::create(b, loc(), HbmViewType::get(ctx, t.getElementType(), t.getChip(), t.getElement(), mut), hbm);
@@ -221,14 +221,18 @@ private:
       return v;
     return ViewReshapeOp::create(b, loc(), HbmViewType::get(ctx, t.getElementType(), t.getChip(), element, false), v);
   }
-  Value allocHbm(MapAttr element) { return AllocHbmOp::create(b, loc(), kb.hbmType(f32, element)); }
+  Value allocHbm(MapAttr element, Type et) { return AllocHbmOp::create(b, loc(), kb.hbmType(et, element)); }
   Value reshapeHbm(Value t, MapAttr element) {
     if (cast<HbmTensorType>(t.getType()).getElement() == element)
       return t;
-    return ReshapeHbmOp::create(b, loc(), kb.hbmType(f32, element), t);
+    return ReshapeHbmOp::create(b, loc(), kb.hbmType(cast<HbmTensorType>(t.getType()).getElementType(), element), t);
   }
   void copy(Value src, Value dst) { HbmToHbmViewOp::create(b, loc(), src, dst); }
-  void fill(Value hbm, double value) { DmToHbmViewOp::create(b, loc(), zeros(value), view(hbm, true)); }
+  void fill(Value hbm, double value) {
+    DmToHbmViewOp::create(b, loc(), zeros(value, cast<HbmTensorType>(hbm.getType()).getElementType()), view(hbm, true));
+  }
+  /// A DM tile or vector converted between f32 and bf16 by one pass (fetch_cast up, the Cast Engine down).
+  Value convert(Value dm, Type to);
   /// Tiles view `v` (of mapping `parts`) to one position of each digit in `at`.
   Value tileDigits(Value v, SmallVector<MapAttr> parts, ArrayRef<std::pair<MapAttr, int64_t>> at, bool mut) {
     for (auto [d, index] : at) {
@@ -259,7 +263,8 @@ private:
         at.push_back({kf.stride(kTile), kIndex});
     }
     Value v = tileDigits(view(hbm, false), parts, at, false);
-    return ViewToDmOp::create(b, loc(), kb.dmType(f32, sliceMap(), element), v);
+    return ViewToDmOp::create(
+        b, loc(), kb.dmType(cast<HbmTensorType>(hbm.getType()).getElementType(), sliceMap(), element), v);
   }
 
   // Vector Engine.
@@ -548,6 +553,10 @@ LogicalResult Lowering::planLayout() {
         break;
       }
   colPad = roundUp(colLocalSize, kLanes);
+  // DMA rows to DM are whole 8-byte units: bf16 needs four live columns per unit.
+  bool bf16 = p.outType.isBF16() || llvm::any_of(p.reads, [](const Read &r) { return r.type.isBF16(); });
+  if (bf16 && colLocalSize % 4)
+    return fail(std::to_string(colLocalSize) + " bf16 columns per slice (DMA rows are 8-byte units)");
   int64_t blocks = (c + colLocalSize - 1) / colLocalSize;
   if (blocks > kSlices) {
     // Column tiles of 256 blocks; the column axis pads to whole tiles.
@@ -644,11 +653,12 @@ LogicalResult Lowering::planLayout() {
 LogicalResult Lowering::plan() {
   if (failed(findGemm()) || failed(planLayout()))
     return failure();
+  auto supported = [](Type t) { return t.isF32() || t.isBF16(); };
   for (const Read &r : p.reads)
-    if (!r.type.isF32())
-      return fail("a buffer that is not f32 (only f32 graphs are mapped yet)");
-  if (!p.outType.isF32())
-    return fail("the written buffer is not f32");
+    if (!supported(r.type))
+      return fail("a buffer that is neither f32 nor bf16");
+  if (!supported(p.outType))
+    return fail("the written buffer is neither f32 nor bf16");
   for (auto [j, l] : llvm::enumerate(p.outIndex)) {
     if (p.outShape[j] == 1)
       continue;
@@ -704,13 +714,36 @@ LogicalResult Lowering::declare() {
 // Operands
 //===----------------------------------------------------------------------===//
 
-Value Lowering::zeros(double value) {
-  auto it = fillDm.find(value);
+Value Lowering::zeros(double value, Type et) {
+  auto key = std::make_pair(value, et.isBF16());
+  auto it = fillDm.find(key);
   if (it != fillDm.end())
     return it->second;
-  Value dm = AllocDmOp::create(b, loc(), kb.dmType(f32, kb.one().padTo(kSlices), kb.one().padTo(2)));
+  // Eight bytes of the value, broadcast by the DMA over the destination.
+  Value dm = AllocDmOp::create(b, loc(), kb.dmType(et, kb.one().padTo(kSlices), kb.one().padTo(et.isBF16() ? 4 : 2)));
   MemsetOp::create(b, loc(), dm, b.getF32FloatAttr(value));
-  return fillDm[value] = dm;
+  return fillDm[key] = dm;
+}
+
+Value Lowering::convert(Value dm, Type to) {
+  auto t = cast<DmTensorType>(dm.getType());
+  if (t.getElementType() == to)
+    return dm;
+  auto [timeParts, packet] = timePacket(t.getElement());
+  MapAttr time = pairOf(timeParts);
+  auto st = [&](Type et, MapAttr tm, MapAttr pk) { return kb.streamType(et, t.getSlice(), tm, pk); };
+  Type from = t.getElementType();
+  Value s = BeginOp::create(b, loc(), st(from, kb.one(), t.getElement()), dm, ContextKind::Main);
+  s = FetchOp::create(b, loc(), st(from, time, packet), s);
+  if (from.isBF16()) {
+    s = FetchCastOp::create(b, loc(), st(to, time, packet), s);
+    s = CollectOp::create(b, loc(), st(to, time, packet), s);
+  } else {
+    s = CollectOp::create(b, loc(), st(from, time, packet), s);
+    s = CastOp::create(b, loc(), st(to, time, packet.size() < 16 ? packet.padTo(16) : packet), s);
+  }
+  s = CommitTrimOp::create(b, loc(), st(to, time, packet), s);
+  return CommitOp::create(b, loc(), kb.dmType(to, t.getSlice(), t.getElement()), s);
 }
 
 /// Read `r` as a dense HBM tensor in the canonical layout over `rowAxes`, then KF (a contraction operand, `k`)
@@ -763,7 +796,7 @@ FailureOr<Value> Lowering::materialize(const Read &r, ArrayRef<unsigned> rowAxes
       padded.push_back(axis);
       interior.push_back(r.shape[j] == extent[j] ? axis : axis.resize(r.shape[j]));
     }
-    Value xp = allocHbm(pairOf(padded));
+    Value xp = allocHbm(pairOf(padded), r.type);
     fill(xp, r.fill.value_or(0.0));
     Value d = view(xp, true);
     SmallVector<MapAttr> cur(padded);
@@ -845,7 +878,7 @@ FailureOr<Value> Lowering::materialize(const Read &r, ArrayRef<unsigned> rowAxes
     if (cq)
       dstParts.push_back(cq);
   }
-  Value dst = allocHbm(pairOf(dstParts));
+  Value dst = allocHbm(pairOf(dstParts), r.type);
   int64_t numTaps = 1;
   for (unsigned a : taps)
     numTaps *= p.axes[a].size;
@@ -1022,8 +1055,8 @@ FailureOr<Val> Lowering::leaf(unsigned read, ArrayRef<int64_t> tileIndex) {
     it = hbmOfRead.insert({key, *h}).first;
   }
   if (colOnly) // with no rows a column vector is the whole tile
-    return Val{rows.empty() ? Val::Tile : Val::Vec, toDm(it->second, layout, tileIndex, colLocal())};
-  return Val{Val::Tile, toDm(it->second, layout, tileIndex, tileElement())};
+    return Val{rows.empty() ? Val::Tile : Val::Vec, convert(toDm(it->second, layout, tileIndex, colLocal()), f32)};
+  return Val{Val::Tile, convert(toDm(it->second, layout, tileIndex, tileElement()), f32)};
 }
 
 FailureOr<Val> Lowering::binary(const std::string &op, Val l, Val r) {
@@ -1364,12 +1397,14 @@ FailureOr<Value> Lowering::contract(ArrayRef<int64_t> tileIndex) {
         return failure();
       AluSpec mul{"vector_fp_zip", "FpBinaryOp::MulF(FpMulAlu::Mul0)"};
       mul.fp = true;
-      bDm = zip(bDm, toDm(*h, g.n, tileIndex, pairOf({cl, k}), true, kt), mul);
+      bDm = zip(convert(bDm, f32), convert(toDm(*h, g.n, tileIndex, pairOf({cl, k}), true, kt), f32), mul);
     }
     MapAttr tt = pairOf({lane, group, k.stride(16)});
-    Value s = BeginOp::create(b, loc(), st(f32, kb.one(), pairOf({cl, k})), bDm, ContextKind::Sub);
-    s = FetchOp::create(b, loc(), st(f32, tt, k.modulo(16)), s);
-    s = FetchCastOp::create(b, loc(), st(bf16, tt, k.modulo(16)), s);
+    Type bt = cast<DmTensorType>(bDm.getType()).getElementType();
+    Value s = BeginOp::create(b, loc(), st(bt, kb.one(), pairOf({cl, k})), bDm, ContextKind::Sub);
+    s = FetchOp::create(b, loc(), st(bt, tt, k.modulo(16)), s);
+    if (!bt.isBF16())
+      s = FetchCastOp::create(b, loc(), st(bf16, tt, k.modulo(16)), s);
     s = CollectOp::create(b, loc(), st(bf16, tt, k.modulo(16)), s);
     Value trf = ToTrfOp::create(
         b, loc(), TrfTensorType::get(ctx, bf16, kb.chip(), kb.cluster(), slice, lane, pairOf({group, k})), s);
@@ -1381,11 +1416,13 @@ FailureOr<Value> Lowering::contract(ArrayRef<int64_t> tileIndex) {
         return failure();
       AluSpec mul{"vector_fp_zip", "FpBinaryOp::MulF(FpMulAlu::Mul0)"};
       mul.fp = true;
-      aDm = zip(aDm, toDm(*h, rows, tileIndex, pairOf(ae), true, kt), mul);
+      aDm = zip(convert(aDm, f32), convert(toDm(*h, rows, tileIndex, pairOf(ae), true, kt), f32), mul);
     }
-    s = BeginOp::create(b, loc(), st(f32, kb.one(), pairOf(ae)), aDm, ContextKind::Main);
-    s = FetchOp::create(b, loc(), st(f32, pairOf(t16), k.modulo(16)), s);
-    s = FetchCastOp::create(b, loc(), st(bf16, pairOf(t16), k.modulo(16)), s);
+    Type at = cast<DmTensorType>(aDm.getType()).getElementType();
+    s = BeginOp::create(b, loc(), st(at, kb.one(), pairOf(ae)), aDm, ContextKind::Main);
+    s = FetchOp::create(b, loc(), st(at, pairOf(t16), k.modulo(16)), s);
+    if (!at.isBF16())
+      s = FetchCastOp::create(b, loc(), st(bf16, pairOf(t16), k.modulo(16)), s);
     s = CollectOp::create(b, loc(), st(bf16, pairOf(t16), k.modulo(16)), s);
     s = ContractOuterOp::create(b, loc(), st(bf16, pairOf(t32), k.modulo(32)), s, trf);
     s = ContractPacketOp::create(b, loc(), st(f32, pairOf(t32), kb.one()), s);
@@ -1416,7 +1453,7 @@ LogicalResult Lowering::emit() {
   SmallVector<unsigned> layout(rows);
   layout.push_back(*col);
   SmallVector<MapAttr> outParts = canonical(layout, true);
-  Value outCanonical = allocHbm(pairOf(outParts));
+  Value outCanonical = allocHbm(pairOf(outParts), p.outType);
   int64_t numTiles = 1;
   for (const Digit &d : tileD)
     numTiles *= d.size;
@@ -1433,10 +1470,11 @@ LogicalResult Lowering::emit() {
       return failure();
     if (v->kind != Val::Tile)
       return fail("the stored value does not vary over the rows");
-    DmToHbmViewOp::create(b, loc(), v->dm, tileDigits(view(outCanonical, true), outParts, tileAt(layout, index), true));
+    DmToHbmViewOp::create(b, loc(), convert(v->dm, p.outType),
+                          tileDigits(view(outCanonical, true), outParts, tileAt(layout, index), true));
   }
   // The relayout into the written buffer's own layout.
-  Value out = allocHbm(pairOf(outDims));
+  Value out = allocHbm(pairOf(outDims), p.outType);
   copy(view(outCanonical, false), view(out, true));
   kb.finish({out});
   return success();

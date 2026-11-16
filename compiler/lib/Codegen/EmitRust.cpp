@@ -505,8 +505,11 @@ LogicalResult Emitter::emit(func::FuncOp kernel) {
               return success();
             })
             .Case([&](MemsetOp o) {
-              os << "    " << nameOf(o.getTarget()) << ".view_mut().memset(" << rustF32(o.getValue().convertToFloat())
-                 << ", &mut device.sub);\n";
+              // A bf16 fill value is computed, so it needs a const block to fold.
+              std::string v = rustF32(o.getValue().convertToFloat());
+              if (o.getTarget().getType().getElementType().isBF16())
+                v = "const { bf16::from_f32(" + v + ") }";
+              os << "    " << nameOf(o.getTarget()) << ".view_mut().memset(" << v << ", &mut device.sub);\n";
               return success();
             })
             .Case([&](ReshapeHbmOp o) {
