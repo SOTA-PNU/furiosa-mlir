@@ -155,6 +155,52 @@ std::pair<AffineExpr, int64_t> splitConstant(AffineExpr e) {
   return {e, 0};
 }
 
+/// Rewrites nested floordiv/mod into single ones ((x floordiv a) floordiv b = x floordiv ab, and
+/// (x mod a) mod b = x mod b when b divides a), which MLIR's simplifier does not, then simplifies, so
+/// equal digits of one index cancel.
+AffineExpr normalize(AffineExpr e) {
+  auto bin = dyn_cast<AffineBinaryOpExpr>(e);
+  if (!bin)
+    return e;
+  AffineExpr l = normalize(bin.getLHS()), r = normalize(bin.getRHS());
+  auto c = dyn_cast<AffineConstantExpr>(r);
+  switch (e.getKind()) {
+  case AffineExprKind::Add:
+    return l + r;
+  case AffineExprKind::Mul:
+    return l * r;
+  case AffineExprKind::FloorDiv:
+    if (c && l.getKind() == AffineExprKind::FloorDiv) {
+      auto inner = cast<AffineBinaryOpExpr>(l);
+      if (auto ic = dyn_cast<AffineConstantExpr>(inner.getRHS()))
+        return inner.getLHS().floorDiv(ic.getValue() * c.getValue());
+    }
+    return l.floorDiv(r);
+  case AffineExprKind::CeilDiv:
+    return l.ceilDiv(r);
+  case AffineExprKind::Mod:
+    if (c && l.getKind() == AffineExprKind::Mod) {
+      auto inner = cast<AffineBinaryOpExpr>(l);
+      if (auto ic = dyn_cast<AffineConstantExpr>(inner.getRHS()); ic && ic.getValue() % c.getValue() == 0)
+        return inner.getLHS() % c.getValue();
+    }
+    return l % r;
+  default:
+    return e;
+  }
+}
+
+AffineExpr simplify(AffineExpr e, unsigned numDims, unsigned numSyms = 0) {
+  return simplifyAffineExpr(normalize(simplifyAffineExpr(e, numDims, numSyms)), numDims, numSyms);
+}
+
+std::string show(AffineExpr e) {
+  std::string out;
+  llvm::raw_string_ostream os(out);
+  e.print(os);
+  return out;
+}
+
 SmallVector<int64_t> shapeOf(Type t) {
   if (auto r = dyn_cast<RankedTensorType>(t))
     return SmallVector<int64_t>(r.getShape());
@@ -206,6 +252,8 @@ public:
     auto it = syms.find(v);
     return it == syms.end() ? nullptr : &it->second;
   }
+
+  DenseMap<unsigned, int64_t> trips; // per loop id: its trip count in this instance
 
 private:
   MLIRContext *ctx;
@@ -367,11 +415,11 @@ private:
       } else if (isa<arith::DivSIOp, arith::DivUIOp>(op)) {
         if (!cb || cb.getValue() <= 0)
           return op->emitError("furiosa: index division by a non-constant or non-positive value");
-        res = a.floorDiv(cb.getValue());
+        res = normalize(a.floorDiv(cb.getValue()));
       } else if (isa<arith::RemSIOp, arith::RemUIOp>(op)) {
         if (!cb || cb.getValue() <= 0)
           return op->emitError("furiosa: index remainder by a non-constant or non-positive value");
-        res = a % cb.getValue();
+        res = normalize(a % cb.getValue());
       } else {
         if (!ca || !cb)
           return op->emitError("furiosa: min/max of non-constant indices");
@@ -458,12 +506,19 @@ private:
   }
 
   LogicalResult evalFor(scf::ForOp f) {
-    auto lb = getConstantIntValue(f.getLowerBound()), ub = getConstantIntValue(f.getUpperBound()),
-         step = getConstantIntValue(f.getStep());
+    // Bounds may depend on the program id; in one instance they must be constants.
+    auto bound = [&](Value v) -> std::optional<int64_t> {
+      if (const Sym *s = get(v); s && s->kind == Sym::Int && s->data.empty())
+        if (auto c = dyn_cast<AffineConstantExpr>(s->expr))
+          return c.getValue();
+      return getConstantIntValue(v);
+    };
+    auto lb = bound(f.getLowerBound()), ub = bound(f.getUpperBound()), step = bound(f.getStep());
     if (!lb || !ub || !step || *step <= 0)
-      return f.emitError("furiosa: loop bounds are not constant after launch specialization");
+      return f.emitError("furiosa: loop bounds vary inside a program instance");
     unsigned id = loopIds.lookup(f);
     int64_t trip = std::max<int64_t>(0, (*ub - *lb + *step - 1) / *step);
+    trips[id] = trip;
     AffineExpr t = getAffineSymbolExpr(id, ctx);
     setInt(f.getInductionVar(), cst(*lb) + t * *step);
 
@@ -518,21 +573,25 @@ struct BufferInfo {
   }
 };
 
-/// The coordinate space a store defines.
+/// The coordinate space a store defines. Each stored axis has a global index (the axis plus its tile
+/// origin in that instance) that is an expression of the view dims: one view dim for a linear axis, or
+/// the mixed-radix recombination of the view dims of its digits for an address built with div/mod.
 struct StoreSpace {
   int arg = -1;
   SmallVector<int64_t> viewShape, viewStrides; // row-major view of the buffer
   SmallVector<int64_t> boxLo, boxHi;           // written box (inclusive) per view dim
   bool full = false;
-  SmallVector<int> axisDim;                    // per stored axis: its view dim (-1: unit axis)
-  SmallVector<int64_t> axisExtent, phase;      // per view dim: extent of its axis (0: none), origin phase
-  std::vector<SmallVector<int64_t>> origin;    // per instance, per view dim
+  SmallVector<AffineExpr> global;              // per stored axis, over view dims (null: unit axis)
+  SmallVector<int64_t> extent, phase;          // per stored axis: tile extent and origin phase (-1: unaligned)
+  SmallVector<unsigned> freeDims;              // view dims no axis moves along
+  // Per instance: the origin of each stored axis, then the coordinate of each free dim.
+  std::vector<SmallVector<int64_t>> origin;
 };
 
 /// What an axis of a value means inside the generic being built.
 struct Axis {
-  enum Kind { Coord, Iter, Unit } kind = Unit;
-  int dim = 0; // Coord: store-view dim; Iter: generic dim
+  enum Kind { Store, Iter, Unit } kind = Unit;
+  int dim = 0; // Store: stored axis; Iter: generic dim
 };
 
 /// The generic being built: its dims are the store-view dims it keeps, then its own dims.
@@ -571,6 +630,7 @@ private:
   DenseMap<Value, int> argIndex;
   DenseMap<Operation *, unsigned> loopIds;
   SmallVector<int64_t> loopTrip;
+  SmallVector<bool> varTrip;
   std::vector<std::unique_ptr<Evaluator>> evals;
   std::map<int, Value> current;
   std::map<int, Value> flat;
@@ -584,6 +644,7 @@ private:
   AffineExpr originExpr(const Gen &g, unsigned viewDim);
   FailureOr<AffineExpr> rewrite(Operation *at, const Gen &g, ArrayRef<Axis> env,
                                 std::function<AffineExpr(const Sym &)> select, Value v);
+  FailureOr<AffineExpr> fitOrigins(Operation *at, const Gen &g, ArrayRef<int64_t> consts);
   Value index(Gen &g, unsigned dim);
   Value exprValue(Gen &g, AffineExpr e);
   Value flatOf(int arg);
@@ -637,9 +698,7 @@ LogicalResult Raiser::parseLaunch() {
 LogicalResult Raiser::evaluate() {
   kernel.walk([&](scf::ForOp f) {
     loopIds[f] = loopTrip.size();
-    auto lb = getConstantIntValue(f.getLowerBound()), ub = getConstantIntValue(f.getUpperBound()),
-         step = getConstantIntValue(f.getStep());
-    loopTrip.push_back((lb && ub && step && *step > 0) ? std::max<int64_t>(0, (*ub - *lb + *step - 1) / *step) : 0);
+    loopTrip.push_back(0);
   });
   for (int64_t z = 0; z < grid[2]; ++z)
     for (int64_t y = 0; y < grid[1]; ++y)
@@ -648,150 +707,372 @@ LogicalResult Raiser::evaluate() {
         if (failed(evals.back()->run(kernel)))
           return failure();
       }
+  // A loop's reduction extent is its longest trip; instances with shorter trips mask the rest.
+  varTrip.assign(loopTrip.size(), false);
+  for (unsigned id = 0; id < loopTrip.size(); ++id) {
+    int64_t lo = std::numeric_limits<int64_t>::max(), hi = 0;
+    for (auto &ev : evals) {
+      int64_t t = ev->trips.lookup(id);
+      lo = std::min(lo, t);
+      hi = std::max(hi, t);
+    }
+    loopTrip[id] = hi;
+    varTrip[id] = lo != hi;
+  }
   return success();
 }
+
+namespace {
+/// A term of a store address: `stride * u`, where u is a linear axis or a digit (G floordiv a) mod b of
+/// a global axis index (b = 0: unbounded).
+struct Component {
+  int64_t stride;
+  int axis;
+  bool digit;
+  int64_t a, b;
+};
+
+/// Collects the inner linear forms of every floordiv/mod node of `e`.
+void atoms(AffineExpr e, SmallVectorImpl<AffineExpr> &out) {
+  if (auto bin = dyn_cast<AffineBinaryOpExpr>(e)) {
+    if (e.getKind() == AffineExprKind::FloorDiv || e.getKind() == AffineExprKind::Mod) {
+      if (!isa<AffineBinaryOpExpr>(bin.getLHS()) || bin.getLHS().getKind() == AffineExprKind::Add ||
+          bin.getLHS().getKind() == AffineExprKind::Mul || isa<AffineDimExpr>(bin.getLHS()))
+        out.push_back(bin.getLHS());
+    }
+    atoms(bin.getLHS(), out);
+    atoms(bin.getRHS(), out);
+  }
+}
+
+/// Splits `e` (a sum of constant multiples of dims and of div/mod atoms of single dims) into components.
+bool components(AffineExpr e, int64_t scale, SmallVectorImpl<Component> &out) {
+  if (isa<AffineConstantExpr>(e))
+    return true; // constants are origins, handled separately
+  if (auto d = dyn_cast<AffineDimExpr>(e)) {
+    out.push_back({scale, (int)d.getPosition(), false, 1, 0});
+    return true;
+  }
+  auto bin = cast<AffineBinaryOpExpr>(e);
+  switch (e.getKind()) {
+  case AffineExprKind::Add:
+    return components(bin.getLHS(), scale, out) && components(bin.getRHS(), scale, out);
+  case AffineExprKind::Mul:
+    if (auto c = dyn_cast<AffineConstantExpr>(bin.getRHS()))
+      return components(bin.getLHS(), scale * c.getValue(), out);
+    if (auto c = dyn_cast<AffineConstantExpr>(bin.getLHS()))
+      return components(bin.getRHS(), scale * c.getValue(), out);
+    return false;
+  case AffineExprKind::FloorDiv:
+  case AffineExprKind::Mod: {
+    int64_t a = 1, b = 0;
+    AffineExpr x = e;
+    if (x.getKind() == AffineExprKind::Mod) {
+      b = cast<AffineConstantExpr>(cast<AffineBinaryOpExpr>(x).getRHS()).getValue();
+      x = cast<AffineBinaryOpExpr>(x).getLHS();
+    }
+    if (x.getKind() == AffineExprKind::FloorDiv) {
+      a = cast<AffineConstantExpr>(cast<AffineBinaryOpExpr>(x).getRHS()).getValue();
+      x = cast<AffineBinaryOpExpr>(x).getLHS();
+    }
+    auto d = dyn_cast<AffineDimExpr>(x);
+    if (!d)
+      return false;
+    out.push_back({scale, (int)d.getPosition(), true, a, b});
+    return true;
+  }
+  default:
+    return false;
+  }
+}
+} // namespace
 
 FailureOr<StoreSpace> Raiser::storeSpace(tt::StoreOp store) {
   if (store->getParentOp() != kernel.getOperation())
     return store.emitError("furiosa: stores inside loops or branches are not raised yet"), failure();
   SmallVector<int64_t> shape = shapeOf(store.getValue().getType());
   unsigned rank = shape.size();
-  StoreSpace sp;
   const Sym *p0 = evals[0]->get(store.getPtr());
   if (!p0 || p0->kind != Sym::Ptr || !p0->data.empty())
     return store.emitError("furiosa: store address is not an affine function of program ids and axes"), failure();
-  sp.arg = p0->base;
-  const BufferInfo &buf = buffers[sp.arg];
-  auto lin0 = linearize(p0->expr, rank);
-  if (!lin0)
-    return store.emitError("furiosa: store address is not linear in the stored axes"), failure();
-  for (auto &ev : evals) {
-    const Sym *p = ev->get(store.getPtr());
-    auto lin = linearize(p->expr, rank);
-    if (!lin || lin->first != lin0->first || p->base != sp.arg || !p->data.empty())
-      return store.emitError("furiosa: store strides differ between program instances"), failure();
-  }
-  const SmallVector<int64_t> &coef = lin0->first;
+  int arg = p0->base;
+  const BufferInfo &buf = buffers[arg];
+  int64_t numel = buf.numel();
 
-  // View strides: every axis stride, plus each buffer dim stride no axis spans across.
+  // Axes the address takes apart with div/mod get a per-instance origin read off the atoms
+  // (`origin + axis` inside each), so the address becomes one expression of their global indices.
+  std::vector<SmallVector<int64_t>> digitOrigin(evals.size(), SmallVector<int64_t>(rank, 0));
+  SmallVector<bool> isDigit(rank, false);
+  SmallVector<AffineExpr> rest(evals.size());
+  SmallVector<int64_t> constant(evals.size());
+  for (auto [n, ev] : llvm::enumerate(evals)) {
+    const Sym *p = ev->get(store.getPtr());
+    if (!p || p->kind != Sym::Ptr || p->base != arg || !p->data.empty())
+      return store.emitError("furiosa: store base differs between program instances"), failure();
+    SmallVector<AffineExpr> inner;
+    atoms(p->expr, inner);
+    SmallVector<bool> seen(rank, false);
+    for (AffineExpr form : inner) {
+      auto lin = linearize(form, rank);
+      if (!lin)
+        return store.emitError("furiosa: a store address digit is not linear in one axis"), failure();
+      int axis = -1;
+      for (unsigned i = 0; i < rank; ++i)
+        if (lin->first[i]) {
+          if (axis >= 0 || lin->first[i] != 1)
+            return store.emitError("furiosa: a store address digit mixes axes or scales one"), failure();
+          axis = i;
+        }
+      if (axis < 0)
+        continue;
+      if (seen[axis] && digitOrigin[n][axis] != lin->second)
+        return store.emitError("furiosa: a store axis has inconsistent digit origins"), failure();
+      seen[axis] = true;
+      digitOrigin[n][axis] = lin->second;
+    }
+    if (n == 0)
+      isDigit = seen;
+    else if (seen != isDigit)
+      return store.emitError("furiosa: store addresses differ between program instances"), failure();
+    SmallVector<AffineExpr> sub;
+    for (unsigned i = 0; i < rank; ++i)
+      sub.push_back(getAffineDimExpr(i, ctx) - (isDigit[i] ? digitOrigin[n][i] : 0));
+    auto [r, c] = splitConstant(simplify(p->expr.replaceDims(sub), rank, 0));
+    if (n && r != rest[0])
+      return store.emitError("furiosa: store addresses differ between program instances"), failure();
+    rest[n] = r;
+    constant[n] = c;
+  }
+  SmallVector<Component> terms;
+  if (!components(rest[0], 1, terms))
+    return store.emitError("furiosa: store address is not a sum of axis terms and digits: ") << show(rest[0]), failure();
+  // Rewrite the terms of each div/mod axis over its mixed-radix digits u_k = (G floordiv a_k) mod
+  // (a_k+1 / a_k), where 1 = a_0 | a_1 | ... are the divisors its terms use; a term (G floordiv a) mod b
+  // is sum_{a <= a_k < ab} u_k * a_k / a. The coefficient a digit collects is its address stride.
+  SmallVector<Component> comps;
+  for (const Component &t : terms)
+    if (!isDigit[t.axis])
+      comps.push_back(t);
+  for (unsigned i = 0; i < rank; ++i) {
+    if (!isDigit[i])
+      continue;
+    std::set<int64_t> chainSet{1};
+    for (const Component &t : terms)
+      if (t.axis == (int)i) {
+        chainSet.insert(t.a);
+        if (t.b)
+          chainSet.insert(t.a * t.b);
+      }
+    SmallVector<int64_t> chain(chainSet.begin(), chainSet.end());
+    for (unsigned k = 1; k < chain.size(); ++k)
+      if (chain[k] % chain[k - 1])
+        return store.emitError("furiosa: the digits of a store axis do not nest: ") << show(rest[0]), failure();
+    SmallVector<int64_t> coeff(chain.size(), 0);
+    for (const Component &t : terms)
+      if (t.axis == (int)i)
+        for (unsigned k = 0; k < chain.size(); ++k)
+          if (chain[k] >= t.a && (!t.b || chain[k] < t.a * t.b))
+            coeff[k] += t.stride * (chain[k] / t.a);
+    for (unsigned k = 0; k < chain.size(); ++k)
+      if (coeff[k])
+        comps.push_back({coeff[k], (int)i, true, chain[k], k + 1 < chain.size() ? chain[k + 1] / chain[k] : 0});
+  }
+  for (const Component &c : comps)
+    if (c.stride <= 0 || (shape[c.axis] == 1 && !c.digit))
+      return store.emitError("furiosa: a stored axis does not advance the address"), failure();
+
+  // View candidates: with the buffer's own dim strides (nicer views), then without.
   SmallVector<int64_t> bufStrides(buf.shape.size(), 1);
   for (int i = (int)buf.shape.size() - 2; i >= 0; --i)
     bufStrides[i] = bufStrides[i + 1] * buf.shape[i + 1];
-  std::set<int64_t, std::greater<int64_t>> strides{1};
-  for (unsigned i = 0; i < rank; ++i)
-    if (shape[i] > 1) {
-      if (coef[i] <= 0)
-        return store.emitError("furiosa: a stored axis does not advance the address"), failure();
-      strides.insert(coef[i]);
+  for (bool withBuffer : {true, false}) {
+    std::set<int64_t, std::greater<int64_t>> strides{1};
+    for (const Component &c : comps)
+      strides.insert(c.stride);
+    if (withBuffer)
+      strides.insert(bufStrides.begin(), bufStrides.end());
+    SmallVector<int64_t> st(strides.begin(), strides.end());
+    bool nests = numel % st[0] == 0;
+    for (unsigned j = 1; j < st.size(); ++j)
+      nests &= st[j - 1] % st[j] == 0;
+    if (!nests) {
+      if (withBuffer)
+        continue;
+      return store.emitError("furiosa: store strides do not nest: ") << show(rest[0]), failure();
     }
-  for (int64_t s : bufStrides) {
-    bool spanned = false;
-    for (unsigned i = 0; i < rank; ++i)
-      spanned |= shape[i] > 1 && coef[i] < s && s < coef[i] * shape[i];
-    if (!spanned)
-      strides.insert(s);
-  }
-  SmallVector<int64_t> st(strides.begin(), strides.end());
-  for (unsigned j = 1; j < st.size(); ++j)
-    if (st[j - 1] % st[j])
-      return store.emitError("furiosa: store strides do not nest"), failure();
-  if (buf.numel() % st[0])
-    return store.emitError("furiosa: store strides do not divide the buffer"), failure();
-  unsigned nd = st.size();
-  sp.viewStrides = st;
-  sp.viewShape.push_back(buf.numel() / st[0]);
-  for (unsigned j = 1; j < nd; ++j)
-    sp.viewShape.push_back(st[j - 1] / st[j]);
-  sp.axisDim.assign(rank, -1);
-  sp.axisExtent.assign(nd, 0);
-  for (unsigned i = 0; i < rank; ++i)
-    if (shape[i] > 1) {
-      int j = llvm::find(st, coef[i]) - st.begin();
-      if (sp.axisExtent[j])
-        return store.emitError("furiosa: two stored axes share a stride"), failure();
-      sp.axisDim[i] = j;
-      sp.axisExtent[j] = shape[i];
+    unsigned nd = st.size();
+    StoreSpace sp;
+    sp.arg = arg;
+    sp.viewStrides = st;
+    sp.viewShape.push_back(numel / st[0]);
+    for (unsigned j = 1; j < nd; ++j)
+      sp.viewShape.push_back(st[j - 1] / st[j]);
+    SmallVector<int> dimOf(comps.size());
+    SmallVector<bool> used(nd, false);
+    bool clash = false;
+    for (auto [k, c] : llvm::enumerate(comps)) {
+      dimOf[k] = llvm::find(st, c.stride) - st.begin();
+      clash |= used[dimOf[k]];
+      used[dimOf[k]] = true;
+    }
+    if (clash)
+      return store.emitError("furiosa: two store address terms share a stride"), failure();
+    sp.global.assign(rank, AffineExpr());
+    for (auto [k, c] : llvm::enumerate(comps)) {
+      AffineExpr term = getAffineDimExpr(dimOf[k], ctx) * c.a;
+      sp.global[c.axis] = sp.global[c.axis] ? sp.global[c.axis] + term : term;
+    }
+    for (unsigned j = 0; j < nd; ++j)
+      if (!used[j])
+        sp.freeDims.push_back(j);
+    // Linear axes and free dims take their origins from the constant; digits carry their own.
+    bool ok = true;
+    for (auto [n, ev] : llvm::enumerate(evals)) {
+      SmallVector<int64_t> viewOrigin(nd, 0);
+      int64_t c = constant[n];
+      for (unsigned j = 0; j < nd; ++j) {
+        bool digitDim = llvm::any_of(llvm::enumerate(comps), [&](auto kc) { return dimOf[kc.index()] == (int)j && kc.value().digit; });
+        if (digitDim)
+          continue;
+        viewOrigin[j] = floorDiv(c, st[j]);
+        c -= viewOrigin[j] * st[j];
+      }
+      ok &= (c == 0);
+      SmallVector<int64_t> origin(rank, 0);
+      for (unsigned i = 0; i < rank; ++i) {
+        if (isDigit[i])
+          origin[i] = digitOrigin[n][i];
+        else
+          for (auto [k, cmp] : llvm::enumerate(comps))
+            if (cmp.axis == (int)i && !cmp.digit)
+              origin[i] = viewOrigin[dimOf[k]];
+      }
+      for (unsigned f : sp.freeDims)
+        origin.push_back(viewOrigin[f]);
+      sp.origin.push_back(origin);
+    }
+    if (!ok) {
+      if (withBuffer)
+        continue;
+      return store.emitError("furiosa: store origins do not fit the view"), failure();
     }
 
-  // Origins and the written box, by enumerating every instance and point.
-  std::vector<uint8_t> covered(buf.numel(), 0);
-  sp.boxLo.assign(nd, std::numeric_limits<int64_t>::max());
-  sp.boxHi.assign(nd, std::numeric_limits<int64_t>::min());
-  int64_t count = 0, total = 1;
-  for (int64_t d : shape)
-    total *= d;
-  SmallVector<int64_t> idx(rank);
-  for (auto &ev : evals) {
-    const Sym *p = ev->get(store.getPtr());
-    const Sym *m = store.getMask() ? ev->get(store.getMask()) : nullptr;
-    if (store.getMask() && (!m || m->kind != Sym::Mask))
-      return store.emitError("furiosa: store mask is not an index predicate"), failure();
-    int64_t base = linearize(p->expr, rank)->second;
-    SmallVector<int64_t> origin(nd);
-    int64_t rest = base;
-    for (unsigned j = 0; j < nd; ++j) {
-      origin[j] = floorDiv(rest, st[j]);
-      rest -= origin[j] * st[j];
-    }
-    sp.origin.push_back(origin);
-    if (m && m->never)
-      continue;
-    for (int64_t f = 0; f < total; ++f) {
-      int64_t r = f;
-      for (int i = rank - 1; i >= 0; --i) {
-        idx[i] = r % shape[i];
-        r /= shape[i];
-      }
-      if (m && llvm::any_of(m->conds, [&](AffineExpr c) { return evalAt(c, idx) < 0; }))
+    // Enumerate every point: it must land where the view says, once.
+    std::vector<uint8_t> covered(numel, 0);
+    sp.boxLo.assign(nd, std::numeric_limits<int64_t>::max());
+    sp.boxHi.assign(nd, std::numeric_limits<int64_t>::min());
+    int64_t count = 0, total = 1;
+    for (int64_t d : shape)
+      total *= d;
+    SmallVector<int64_t> idx(rank), coord(nd);
+    std::string why;
+    for (auto [n, ev] : llvm::enumerate(evals)) {
+      const Sym *p = ev->get(store.getPtr());
+      const Sym *m = store.getMask() ? ev->get(store.getMask()) : nullptr;
+      if (store.getMask() && (!m || m->kind != Sym::Mask))
+        return store.emitError("furiosa: store mask is not an index predicate"), failure();
+      if (m && m->never)
         continue;
-      int64_t addr = evalAt(p->expr, idx);
-      if (addr < 0 || addr >= buf.numel())
-        return store.emitError("furiosa: a store lands outside its buffer"), failure();
-      if (covered[addr]++)
-        return store.emitError("furiosa: two stores of the grid write the same element"), failure();
-      ++count;
-      for (unsigned j = 0; j < nd; ++j) {
-        int64_t c = addr / st[j];
-        addr %= st[j];
-        sp.boxLo[j] = std::min(sp.boxLo[j], c);
-        sp.boxHi[j] = std::max(sp.boxHi[j], c);
+      for (int64_t f = 0; f < total && why.empty(); ++f) {
+        int64_t r = f;
+        for (int i = rank - 1; i >= 0; --i) {
+          idx[i] = r % shape[i];
+          r /= shape[i];
+        }
+        if (m && llvm::any_of(m->conds, [&](AffineExpr c) { return evalAt(c, idx) < 0; }))
+          continue;
+        int64_t addr = evalAt(p->expr, idx);
+        if (addr < 0 || addr >= numel) {
+          why = "a store lands outside its buffer";
+          break;
+        }
+        int64_t a = addr;
+        for (unsigned j = 0; j < nd; ++j) {
+          coord[j] = a / st[j];
+          a %= st[j];
+        }
+        for (unsigned i = 0; i < rank && why.empty(); ++i)
+          if (sp.global[i] && evalAt(sp.global[i], coord) - sp.origin[n][i] != idx[i])
+            why = "a store tile crosses a view boundary";
+        for (auto [k, fdim] : llvm::enumerate(sp.freeDims))
+          if (coord[fdim] != sp.origin[n][rank + k])
+            why = "a store tile crosses a view boundary";
+        if (!why.empty())
+          break;
+        if (covered[addr]++) {
+          why = "two stores of the grid write the same element";
+          break;
+        }
+        ++count;
+        for (unsigned j = 0; j < nd; ++j) {
+          sp.boxLo[j] = std::min(sp.boxLo[j], coord[j]);
+          sp.boxHi[j] = std::max(sp.boxHi[j], coord[j]);
+        }
       }
+      if (!why.empty())
+        break;
     }
+    if (!why.empty()) {
+      if (withBuffer && why == "a store tile crosses a view boundary")
+        continue;
+      return store.emitError("furiosa: ") << why, failure();
+    }
+    if (!count)
+      return store.emitError("furiosa: the store never writes"), failure();
+    int64_t volume = 1;
+    for (unsigned j = 0; j < nd; ++j)
+      volume *= sp.boxHi[j] - sp.boxLo[j] + 1;
+    if (volume != count)
+      return store.emitError("furiosa: the grid writes a non-rectangular region"), failure();
+    sp.full = (count == numel);
+    // Tile phase per axis, for recovering origins from global indices.
+    sp.extent.assign(rank, 0);
+    sp.phase.assign(rank, -1);
+    for (unsigned i = 0; i < rank; ++i) {
+      if (!sp.global[i])
+        continue;
+      int64_t e = shape[i], ph = ((sp.origin[0][i] % e) + e) % e;
+      bool aligned = llvm::all_of(sp.origin, [&](auto &o) { return ((o[i] % e) + e) % e == ph; });
+      sp.extent[i] = e;
+      sp.phase[i] = aligned ? ph : -1;
+    }
+    return sp;
   }
-  if (!count)
-    return store.emitError("furiosa: the store never writes"), failure();
-  int64_t volume = 1;
-  for (unsigned j = 0; j < nd; ++j)
-    volume *= sp.boxHi[j] - sp.boxLo[j] + 1;
-  if (volume != count)
-    return store.emitError("furiosa: the grid writes a non-rectangular region"), failure();
-  sp.full = (count == buf.numel());
-  sp.phase.assign(nd, 0);
-  for (unsigned j = 0; j < nd; ++j) {
-    if (!sp.axisExtent[j])
-      continue;
-    int64_t e = sp.axisExtent[j], ph = ((sp.origin[0][j] % e) + e) % e;
-    for (auto &o : sp.origin)
-      if (((o[j] % e) + e) % e != ph)
-        return store.emitError("furiosa: store tiles are not aligned along view dim ") << j, failure();
-    sp.phase[j] = ph;
-  }
-  return sp;
+  llvm_unreachable("the second view candidate always returns");
 }
 
-AffineExpr Raiser::originExpr(const Gen &g, unsigned j) {
-  AffineExpr c = getAffineDimExpr(g.coordPos[j], ctx);
-  if (!space->axisExtent[j])
-    return c;
-  return c - (c - space->phase[j]) % space->axisExtent[j];
+/// The basis element k (a stored axis origin, or a free dim coordinate) as an expression of the
+/// generic's dims; null when coordinates do not determine it.
+AffineExpr Raiser::originExpr(const Gen &g, unsigned k) {
+  unsigned rank = space->global.size();
+  SmallVector<AffineExpr> viewToGen;
+  for (int pos : g.coordPos)
+    viewToGen.push_back(pos >= 0 ? getAffineDimExpr(pos, ctx) : AffineExpr());
+  if (k >= rank) {
+    unsigned f = space->freeDims[k - rank];
+    return viewToGen[f];
+  }
+  if (!space->global[k] || space->phase[k] < 0)
+    return AffineExpr();
+  for (unsigned j = 0; j < viewToGen.size(); ++j)
+    if (!viewToGen[j] && space->global[k].isFunctionOfDim(j))
+      return AffineExpr();
+  SmallVector<AffineExpr> sub;
+  for (AffineExpr e : viewToGen)
+    sub.push_back(e ? e : getAffineConstantExpr(0, ctx));
+  AffineExpr gl = space->global[k].replaceDims(sub);
+  return gl - (gl - space->phase[k]) % space->extent[k];
 }
 
 /// One expression of the generic's dims for a per-instance symbolic value: substitute each axis of `v`
-/// (coordinate minus that instance's origin, or a generic dim) and each loop counter; the instances
-/// must then agree up to a constant that is an affine function of the store origins.
+/// (its global index minus that instance's origin, or a generic dim) and each loop counter; the
+/// instances must then agree up to a constant that is an affine function of the store origins.
 FailureOr<AffineExpr> Raiser::rewrite(Operation *at, const Gen &g, ArrayRef<Axis> env,
                                       std::function<AffineExpr(const Sym &)> select, Value v) {
   unsigned nd = g.extent.size();
+  SmallVector<AffineExpr> viewToGen;
+  for (int pos : g.coordPos)
+    viewToGen.push_back(pos >= 0 ? getAffineDimExpr(pos, ctx) : getAffineConstantExpr(0, ctx));
   SmallVector<AffineExpr> per;
   for (auto [n, ev] : llvm::enumerate(evals)) {
     const Sym *s = ev->get(v);
@@ -799,10 +1080,12 @@ FailureOr<AffineExpr> Raiser::rewrite(Operation *at, const Gen &g, ArrayRef<Axis
       return at->emitError("furiosa: value is not symbolic in every instance"), failure();
     SmallVector<AffineExpr> dims;
     for (const Axis &a : env) {
-      if (a.kind == Axis::Coord) {
-        if (g.coordPos[a.dim] < 0)
-          return at->emitError("furiosa: internal: coordinate dim not in this generic"), failure();
-        dims.push_back(getAffineDimExpr(g.coordPos[a.dim], ctx) - space->origin[n][a.dim]);
+      if (a.kind == Axis::Store) {
+        AffineExpr gl = space->global[a.dim];
+        for (unsigned j = 0; j < g.coordPos.size(); ++j)
+          if (g.coordPos[j] < 0 && gl.isFunctionOfDim(j))
+            return at->emitError("furiosa: internal: coordinate dim not in this generic"), failure();
+        dims.push_back(gl.replaceDims(viewToGen) - space->origin[n][a.dim]);
       } else if (a.kind == Axis::Iter) {
         dims.push_back(getAffineDimExpr(a.dim, ctx));
       } else {
@@ -818,7 +1101,7 @@ FailureOr<AffineExpr> Raiser::rewrite(Operation *at, const Gen &g, ArrayRef<Axis
     for (unsigned l = 0; l < loopTrip.size(); ++l)
       if (e.isFunctionOfSymbol(l) && !g.loopPos.count(l))
         return at->emitError("furiosa: a loop counter is used outside its loop"), failure();
-    per.push_back(simplifyAffineExpr(e.replaceDimsAndSymbols(dims, syms), nd, 0));
+    per.push_back(simplify(e.replaceDimsAndSymbols(dims, syms), nd, 0));
   }
   auto [rest0, c0] = splitConstant(per[0]);
   SmallVector<int64_t> consts;
@@ -833,8 +1116,17 @@ FailureOr<AffineExpr> Raiser::rewrite(Operation *at, const Gen &g, ArrayRef<Axis
   if (same)
     return per[0];
 
-  // Fit consts[n] = beta + sum_j alpha_j * origin[n][j] (least squares, then checked exactly).
-  unsigned nv = space->viewShape.size() + 1;
+  auto fitted = fitOrigins(at, g, consts);
+  if (failed(fitted))
+    return failure();
+  return simplify(rest0 + *fitted, nd, 0);
+}
+
+/// consts[n] (one integer per instance) as beta + sum_k alpha_k * origin_k, with each origin rewritten
+/// in the generic's coordinates (least squares, then checked exactly).
+FailureOr<AffineExpr> Raiser::fitOrigins(Operation *at, const Gen &g, ArrayRef<int64_t> consts) {
+  unsigned nd = g.extent.size();
+  unsigned nb = space->origin[0].size(), nv = nb + 1;
   std::vector<std::vector<double>> a(nv, std::vector<double>(nv, 0.0));
   std::vector<double> rhs(nv, 0.0);
   for (unsigned n = 0; n < evals.size(); ++n) {
@@ -872,26 +1164,29 @@ FailureOr<AffineExpr> Raiser::rewrite(Operation *at, const Gen &g, ArrayRef<Axis
     if (pivot[col] >= 0)
       x[col] = rhs[pivot[col]] / a[pivot[col]][col];
   SmallVector<int64_t> alpha;
-  for (unsigned j = 0; j + 1 < nv; ++j)
-    alpha.push_back(std::llround(x[j]));
-  int64_t beta = std::llround(x[nv - 1]);
+  for (unsigned k = 0; k < nb; ++k)
+    alpha.push_back(std::llround(x[k]));
+  int64_t beta = std::llround(x[nb]);
   for (unsigned n = 0; n < evals.size(); ++n) {
-    int64_t v = beta;
-    for (unsigned j = 0; j + 1 < nv; ++j)
-      v += alpha[j] * space->origin[n][j];
-    if (v != consts[n])
+    int64_t val = beta;
+    for (unsigned k = 0; k < nb; ++k)
+      val += alpha[k] * space->origin[n][k];
+    if (val != consts[n])
       return at->emitError("furiosa: an address varies between program instances in a way the store "
                            "tiles do not explain"),
              failure();
   }
-  AffineExpr out = rest0 + beta;
-  for (unsigned j = 0; j + 1 < nv; ++j)
-    if (alpha[j]) {
-      if (g.coordPos[j] < 0)
-        return at->emitError("furiosa: internal: origin of a coordinate dim not in this generic"), failure();
-      out = out + originExpr(g, j) * alpha[j];
+  AffineExpr out = getAffineConstantExpr(beta, ctx);
+  for (unsigned k = 0; k < nb; ++k)
+    if (alpha[k]) {
+      AffineExpr o = originExpr(g, k);
+      if (!o)
+        return at->emitError("furiosa: an address depends on a tile origin the coordinates do not "
+                             "determine"),
+               failure();
+      out = out + o * alpha[k];
     }
-  return simplifyAffineExpr(out, nd, 0);
+  return simplify(out, nd, 0);
 }
 
 Value Raiser::index(Gen &g, unsigned dim) {
@@ -1065,10 +1360,12 @@ FailureOr<Value> Raiser::emitLoad(Gen &g, tt::LoadOp load, ArrayRef<Axis> env) {
     return failure();
   Interval range = bounds(*addr, ranges);
   bool mayLeave = *data || range.lo < 0 || range.hi >= numel;
+  // A load in an iteration that a shorter trip masks off may be clamped: its value is discarded.
+  bool guarded = llvm::any_of(g.loopPos, [&](auto kv) { return varTrip[kv.first]; });
   if (*data)
     i = arith::AddIOp::create(ob, loc, i, *data);
   if (mayLeave) {
-    if (!on && !*data)
+    if (!on && !*data && !guarded)
       return load.emitError("furiosa: an unmasked load may read outside its buffer"), failure();
     i = arith::MaxSIOp::create(ob, loc, i, arith::ConstantIndexOp::create(ob, loc, 0));
     i = arith::MinSIOp::create(ob, loc, i, arith::ConstantIndexOp::create(ob, loc, numel - 1));
@@ -1415,19 +1712,62 @@ FailureOr<Value> Raiser::materialize(Gen &g, Value v, ArrayRef<Axis> env) {
           return arith::AddIOp::create(*gg.ob, loc, acc, arith::MulIOp::create(*gg.ob, loc, x, y)).getResult();
         });
   } else if (auto loop = dyn_cast<scf::ForOp>(def)) {
+    // Follow the accumulator from this loop inward: through each nested loop it initializes, down to
+    // the op that updates it. Every loop on the way contributes one reduction dim.
     unsigned i = cast<OpResult>(v).getResultNumber();
-    unsigned id = loopIds.lookup(loop);
-    Value iter = loop.getRegionIterArgs()[i];
-    Value next = cast<scf::YieldOp>(loop.getBody()->getTerminator()).getOperand(i);
-    Operation *upd = next.getDefiningOp();
-    if (!upd || !iter.hasOneUse() || iter.getUses().begin()->getOwner() != upd)
-      return loop.emitError("furiosa: the loop carries state other than an accumulation"), failure();
-    int64_t trip = loopTrip[id];
+    Value init = loop.getInitArgs()[i];
+    SmallVector<int64_t> extents;
+    SmallVector<std::pair<unsigned, unsigned>> loopDims;
+    scf::ForOp cur = loop;
+    unsigned idx = i;
+    Value iter;
+    Operation *upd = nullptr;
+    while (true) {
+      iter = cur.getRegionIterArgs()[idx];
+      unsigned id = loopIds.lookup(cur);
+      loopDims.push_back({id, (unsigned)extents.size()});
+      extents.push_back(loopTrip[id]);
+      Value next = cast<scf::YieldOp>(cur.getBody()->getTerminator()).getOperand(idx);
+      auto inner = next.getDefiningOp<scf::ForOp>();
+      if (inner && inner->getParentOp() == cur.getOperation()) {
+        unsigned r = cast<OpResult>(next).getResultNumber();
+        if (inner.getInitArgs()[r] != iter || !iter.hasOneUse())
+          return cur.emitError("furiosa: the loop carries state other than an accumulation"), failure();
+        cur = inner;
+        idx = r;
+        continue;
+      }
+      upd = next.getDefiningOp();
+      if (!upd || upd->getParentOp() != cur.getOperation() || !iter.hasOneUse() ||
+          iter.getUses().begin()->getOwner() != upd)
+        return cur.emitError("furiosa: the loop carries state other than an accumulation"), failure();
+      break;
+    }
+    auto initFn = [&](Gen &gi, ArrayRef<int> remap) { return emit(gi, init, remapEnv(env, remap)); };
+    // Iterations past an instance's own trip count leave the accumulator unchanged.
+    auto guard = [&](Gen &gg, Value acc, Value next) -> FailureOr<Value> {
+      Value active;
+      for (auto [id, own] : loopDims) {
+        if (!varTrip[id])
+          continue;
+        SmallVector<int64_t> trips;
+        for (auto &ev : evals)
+          trips.push_back(ev->trips.lookup(id));
+        auto trip = fitOrigins(loop, gg, trips);
+        if (failed(trip))
+          return failure();
+        Value lt = arith::CmpIOp::create(*gg.ob, loc, arith::CmpIPredicate::slt, index(gg, gg.loopPos[id]),
+                                         exprValue(gg, *trip));
+        active = active ? arith::AndIOp::create(*gg.ob, loc, active, lt).getResult() : lt;
+      }
+      if (!active)
+        return next;
+      return arith::SelectOp::create(*gg.ob, loc, active, next, acc).getResult();
+    };
     if (auto d = dyn_cast<tt::DotOp>(upd); d && d.getC() == iter) {
-      int64_t k = shapeOf(d.getA().getType())[1];
+      extents.push_back(shapeOf(d.getA().getType())[1]);
       built = buildGeneric(
-          g, parentDims, {trip, k}, {{id, 0}}, elem,
-          [&](Gen &gi, ArrayRef<int> remap) { return emit(gi, loop.getInitArgs()[i], remapEnv(env, remap)); },
+          g, parentDims, extents, loopDims, elem, initFn,
           [&](Gen &gg, Value acc, ArrayRef<int> remap) -> FailureOr<Value> {
             SmallVector<Axis> e = remapEnv(env, remap);
             Axis kk;
@@ -1442,15 +1782,14 @@ FailureOr<Value> Raiser::materialize(Gen &g, Value v, ArrayRef<Axis> env) {
               x = arith::ExtFOp::create(*gg.ob, loc, elem, x);
             if (y.getType() != elem)
               y = arith::ExtFOp::create(*gg.ob, loc, elem, y);
-            return arith::AddFOp::create(*gg.ob, loc, acc, arith::MulFOp::create(*gg.ob, loc, x, y)).getResult();
+            return guard(gg, acc, arith::AddFOp::create(*gg.ob, loc, acc, arith::MulFOp::create(*gg.ob, loc, x, y)));
           });
     } else if (upd->getNumOperands() == 2 &&
                isa<arith::AddFOp, arith::MulFOp, arith::MaxNumFOp, arith::MinNumFOp, arith::MaximumFOp,
                    arith::MinimumFOp, arith::AddIOp, arith::MaxSIOp, arith::MinSIOp>(upd)) {
       Value term = upd->getOperand(0) == iter ? upd->getOperand(1) : upd->getOperand(0);
       built = buildGeneric(
-          g, parentDims, {trip}, {{id, 0}}, elem,
-          [&](Gen &gi, ArrayRef<int> remap) { return emit(gi, loop.getInitArgs()[i], remapEnv(env, remap)); },
+          g, parentDims, extents, loopDims, elem, initFn,
           [&](Gen &gg, Value acc, ArrayRef<int> remap) -> FailureOr<Value> {
             auto x = emit(gg, term, remapEnv(env, remap));
             if (failed(x))
@@ -1459,10 +1798,10 @@ FailureOr<Value> Raiser::materialize(Gen &g, Value v, ArrayRef<Axis> env) {
             state.addOperands({acc, *x});
             state.addTypes(elem);
             state.addAttributes(upd->getAttrs());
-            return gg.ob->create(state)->getResult(0);
+            return guard(gg, acc, gg.ob->create(state)->getResult(0));
           });
     } else {
-      return loop.emitError("furiosa: the loop carries state other than an accumulation"), failure();
+      return upd->emitError("furiosa: the loop carries state other than an accumulation"), failure();
     }
   }
   if (failed(built))
@@ -1484,11 +1823,11 @@ LogicalResult Raiser::raiseStore(tt::StoreOp store) {
   int arg = sp->arg;
   unsigned nd = sp->viewShape.size();
   SmallVector<Axis> env;
-  for (int j : sp->axisDim) {
+  for (auto [i, gl] : llvm::enumerate(sp->global)) {
     Axis a;
-    if (j >= 0) {
-      a.kind = Axis::Coord;
-      a.dim = j;
+    if (gl) {
+      a.kind = Axis::Store;
+      a.dim = i;
     }
     env.push_back(a);
   }

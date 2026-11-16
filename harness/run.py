@@ -91,6 +91,14 @@ def compiler_env() -> dict:
     return dict(os.environ, PYTHONPATH=str(ROOT / "compiler"))
 
 
+def compiler_cmd(*args) -> list:
+    """A compiler-venv command that holds compiler/build.sh's lock shared, so it never loads a
+    libtriton that a rebuild is still linking."""
+    lock = ROOT / "build" / ".build.lock"
+    lock.parent.mkdir(exist_ok=True)
+    return ["flock", "-s", str(lock), str(COMPILER_PY), *args]
+
+
 _compiled = {}
 
 
@@ -100,8 +108,8 @@ def compile_case(name: str) -> Result:
         if not COMPILER_PY.exists():
             _compiled[name] = Result("SKIP", "compiler/.venv missing (see compiler/README.md)")
         else:
-            cmd = [str(COMPILER_PY), "-m", "furiosa_compiler", CASES[name].path, "-o", str(OUT / name / "compiler"),
-                   "--crate", str(OUT / name / "crate")]
+            cmd = compiler_cmd("-m", "furiosa_compiler", CASES[name].path, "-o", str(OUT / name / "compiler"),
+                               "--crate", str(OUT / name / "crate"))
             code, log = sh(cmd, ROOT, compiler_env())
             _compiled[name] = Result("PASS") if code == 0 else Result("FAIL", f"compile: {tail(log)}")
     return _compiled[name]
@@ -148,8 +156,8 @@ def judge(name: str, level: str, impl: str) -> Result:
         if not (GOLDEN / name / "meta.json").exists():
             return Result("SKIP", f"no golden (run: python -m harness.golden {name})")
         tol = case.exact
-        cmd = [str(COMPILER_PY), "-m", "furiosa_compiler.l1", str(OUT / name / "compiler"), str(GOLDEN / name),
-               "--rtol", str(tol.rtol), "--atol", str(tol.atol)]
+        cmd = compiler_cmd("-m", "furiosa_compiler.l1", str(OUT / name / "compiler"), str(GOLDEN / name),
+                           "--rtol", str(tol.rtol), "--atol", str(tol.atol))
         code, log = sh(cmd, ROOT, compiler_env())
         try:
             verdict = json.loads(log.strip().splitlines()[-1])
