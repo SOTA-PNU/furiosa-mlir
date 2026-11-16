@@ -207,8 +207,11 @@ def judge(name: str, level: str, impl: str) -> Result:
     if level == "L2":
         failed = crate / "CODEGEN_FAILED"
         if failed.exists():  # the compiler wrote a crate that only carries its codegen diagnostic
-            reason = failed.read_text().strip().replace(str(ROOT) + "/", "")
-            return Result("FAIL", f"codegen: {reason[:300]}")
+            lines = failed.read_text().strip().replace(str(ROOT) + "/", "").splitlines()
+            # One line per failing kernel (or step of one): "<symbol>[ step k (...)]: reason".
+            unmapped = {line.split(":")[0].split(" ")[0] for line in lines if line.strip()}
+            total = len(json.loads((OUT / name / "compiler" / "graph.json").read_text())["kernels"])
+            return Result("FAIL", f"codegen: {len(unmapped)}/{total} kernels unmapped; {lines[0][:300]}")
         exe, log = build_run_graph(crate, npu=True)
         code = 0 if exe else 1
         return Result("PASS") if code == 0 else Result("FAIL", tail(log))
