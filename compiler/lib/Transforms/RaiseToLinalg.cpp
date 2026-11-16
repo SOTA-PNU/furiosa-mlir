@@ -262,8 +262,15 @@ std::optional<SmallVector<int64_t>> fitAffine(ArrayRef<SmallVector<int64_t>> x, 
   unsigned nf = x.empty() ? 0 : x[0].size(), nv = nf + 1;
   std::vector<std::vector<double>> a(nv, std::vector<double>(nv, 0.0));
   std::vector<double> rhs(nv, 0.0);
+  // Features that are the same in every row stay out of the fit (the constant absorbs them).
+  SmallVector<bool> varies(nf, false);
+  for (unsigned f = 0; f < nf; ++f)
+    for (auto &r : x)
+      varies[f] = varies[f] || r[f] != x[0][f];
   for (unsigned n = 0; n < x.size(); ++n) {
-    SmallVector<double> row(x[n].begin(), x[n].end());
+    SmallVector<double> row;
+    for (unsigned f = 0; f < nf; ++f)
+      row.push_back(varies[f] ? (double)x[n][f] : 0.0);
     row.push_back(1.0);
     for (unsigned i = 0; i < nv; ++i) {
       rhs[i] += row[i] * y[n];
@@ -1594,10 +1601,16 @@ FailureOr<AffineExpr> Raiser::fitOrigins(Operation *at, const Gen &g, ArrayRef<i
   unsigned nb = space->origin[0].size(), nv = nb + 1;
   std::vector<std::vector<double>> a(nv, std::vector<double>(nv, 0.0));
   std::vector<double> rhs(nv, 0.0);
+  // A basis element that is the same in every instance cannot be told from the constant; it stays out
+  // of the fit, so the constant absorbs it instead of a coefficient that only fits that one value.
+  SmallVector<bool> varies(nb, false);
+  for (unsigned k = 0; k < nb; ++k)
+    for (auto &o : space->origin)
+      varies[k] = varies[k] || o[k] != space->origin[0][k];
   for (unsigned n = 0; n < act.size(); ++n) {
     SmallVector<double> row;
-    for (int64_t o : space->origin[n])
-      row.push_back((double)o);
+    for (auto [k, o] : llvm::enumerate(space->origin[n]))
+      row.push_back(varies[k] ? (double)o : 0.0);
     row.push_back(1.0);
     for (unsigned i = 0; i < nv; ++i) {
       rhs[i] += row[i] * consts[n];
