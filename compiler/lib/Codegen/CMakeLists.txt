@@ -8,6 +8,9 @@ add_triton_library(FuriosaCodegen
   Mapping/Elementwise.cpp
   Mapping/Gather.cpp
   Mapping/Rowwise.cpp
+  Tile/Analysis.cpp
+  Tile/Lower.cpp
+  Tile/Ops.cpp
   Steps.cpp
 
   DEPENDS

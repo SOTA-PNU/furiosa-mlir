@@ -118,6 +118,49 @@ private:
     return rustF32(o.getImm()->convertToFloat());
   }
 
+  /// A tiled kernel's Vector Engine ALU call: .<method>[_with_mode](<op>, [<mode>,] <operand>).
+  FailureOr<std::string> aluCall(VectorAluOp o) {
+    std::string args;
+    if (!o.getOp().empty())
+      args = o.getOp().str();
+    auto add = [&](const std::string &a) { args += (args.empty() ? "" : ", ") + a; };
+    if (auto mode = o.getMode())
+      add("BinaryArgMode::" + mode->str());
+    if (auto imm = o.getImm())
+      add(rustF32(imm->convertToFloat()));
+    else if (Value v = o.getVrf(); v && !o.getBranches())
+      add("&" + nameOf(v));
+    else if (o.getStash() && !o.getBranches())
+      add("Stash");
+    else if (auto branches = o.getBranches()) {
+      std::string b = "Branched";
+      for (Attribute a : *branches) {
+        auto pair = cast<ArrayAttr>(a);
+        StringRef bits = cast<StringAttr>(pair[0]).getValue();
+        std::string guard = "TagGuard::all()";
+        if (bits != "all") {
+          guard = "TagGuard::matches([";
+          for (auto [i, c] : llvm::enumerate(bits))
+            guard += std::string(i ? ", " : "") + (c == '1' ? "BitReq::One" : c == '0' ? "BitReq::Zero" : "BitReq::Ignore");
+          guard += "])";
+        }
+        if (auto f = dyn_cast<FloatAttr>(pair[1]))
+          b += "::imm(" + guard + ", " + rustF32(f.getValueAsDouble()) + ")";
+        else if (Value v = o.getVrf())
+          b += "::rf(" + guard + ", &" + nameOf(v) + ")";
+        else
+          b += "::rf(" + guard + ", Stash)";
+      }
+      // Branched::imm(..)::imm(..) -> Branched::imm(..).imm(..): only the first call is the constructor.
+      size_t first = b.find("::", std::string("Branched").size());
+      for (size_t at = b.find(")::", first); at != std::string::npos; at = b.find(")::", at))
+        b.replace(at, 3, ").");
+      add(b);
+    }
+    std::string method = o.getMethod().str() + (o.getMode() ? "_with_mode" : "");
+    return "." + method + "(" + args + ")";
+  }
+
   /// The builder chain that ends in `stream`: device.<ctx>.begin(..).<stage>()...
   FailureOr<std::string> chain(Value stream);
 
@@ -141,6 +184,13 @@ FailureOr<std::string> Emitter::view(Value v) {
     if (failed(base))
       return failure();
     return *base + ".pad::<" + m(o.getType().getElement()) + ">()";
+  }
+  if (auto o = dyn_cast_or_null<ViewReshapeOp>(op)) {
+    FailureOr<std::string> base = view(o.getSource());
+    if (failed(base))
+      return failure();
+    return "unsafe { " + *base + ".reshape::<" + m(o.getType().getChip()) + ", " + m(o.getType().getElement()) +
+           ">() }";
   }
   if (op)
     op->emitOpError("is not a view expression");
@@ -283,6 +333,20 @@ FailureOr<std::string> Emitter::chain(Value stream) {
             .Case([&](ContractLaneOp o) {
               out << "\n.contract_lane::<" << tp() << ">(LaneMode::"
                   << (o.getMode() == LaneMode::Interleaved ? "Interleaved" : "Sequential") << ")";
+              return success();
+            })
+            .Case([&](VectorAluOp o) -> LogicalResult {
+              FailureOr<std::string> call = aluCall(o);
+              if (failed(call))
+                return failure();
+              out << "\n" << *call;
+              return success();
+            })
+            .Case([&](VectorTagCmpOp o) {
+              out << "\n.vector_intra_slice_tag(TagMode::Comparison([";
+              llvm::interleave(o.getCmps().getAsValueRange<StringAttr>(), out,
+                               [&](StringRef c) { out << "Cmp::" << c; }, ", ");
+              out << "]))";
               return success();
             })
             .Default([&](Operation *op) -> LogicalResult {
@@ -428,6 +492,27 @@ LogicalResult Emitter::emit(func::FuncOp kernel) {
               if (failed(src) || failed(dst))
                 return failure();
               os << "    " << *src << ".to_hbm_view(&mut device.tdma, " << *dst << ");\n";
+              return success();
+            })
+            .Case([&](AllocHbmOp o) {
+              names[o] = fresh("h" + std::to_string(names.size()));
+              os << "    let mut " << names[o] << ": " << rustType(o.getType()) << " = HbmTensor::new();\n";
+              return success();
+            })
+            .Case([&](AllocDmOp o) {
+              names[o] = fresh("d" + std::to_string(names.size()));
+              os << "    let mut " << names[o] << ": " << rustType(o.getType()) << " = DmTensor::new();\n";
+              return success();
+            })
+            .Case([&](MemsetOp o) {
+              os << "    " << nameOf(o.getTarget()) << ".view_mut().memset(" << rustF32(o.getValue().convertToFloat())
+                 << ", &mut device.sub);\n";
+              return success();
+            })
+            .Case([&](ReshapeHbmOp o) {
+              names[o] = fresh(nameOf(o.getSource()) + "_r");
+              os << "    let " << names[o] << " = unsafe { " << nameOf(o.getSource()) << ".reshape::<"
+                 << m(o.getType().getChip()) << ", " << m(o.getType().getElement()) << ">() };\n";
               return success();
             })
             .Default([&](Operation *op) -> LogicalResult {

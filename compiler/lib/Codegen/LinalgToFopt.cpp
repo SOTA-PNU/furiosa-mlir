@@ -112,7 +112,7 @@ SmallVector<int64_t> writtenArgs(func::FuncOp func) {
 
 ArrayRef<OpClass> mapping::opClasses() {
   static const OpClass classes[] = {gatherClass(), copyClass(), elementwiseClass(), contractionClass(),
-                                    rowwiseClass()};
+                                    rowwiseClass(), tiledClass()};
   return classes;
 }
 

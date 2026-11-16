@@ -401,8 +401,10 @@ LogicalResult FetchOp::verify() {
 
 LogicalResult FetchCastOp::verify() {
   auto out = getResult().getType();
-  if (!out.getElementType().isF32() && !out.getElementType().isInteger(32))
-    return emitOpError("fetch_cast widens to f32 or i32");
+  // Every widening lands in f32 / i32; f32 -> bf16 is the one narrowing (the contraction operand cast).
+  bool narrowing = getInput().getType().getElementType().isF32() && out.getElementType().isBF16();
+  if (!out.getElementType().isF32() && !out.getElementType().isInteger(32) && !narrowing)
+    return emitOpError("fetch_cast widens to f32 or i32, or narrows f32 to bf16");
   if (failed(verifySamePlacement(*this, getInput().getType(), out)))
     return failure();
   return verifyStreamUse(*this);

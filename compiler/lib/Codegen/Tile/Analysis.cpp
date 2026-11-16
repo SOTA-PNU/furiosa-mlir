@@ -1,0 +1,824 @@
+// Structured linalg -> Program (Program.h): folds a kernel's generics, fills, pads, slices and reshapes into one
+// expression over its output space, then splits divided dims into digits so every index is linear.
+
+#include "Program.h"
+
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/IR/AffineExpr.h"
+#include "mlir/IR/Matchers.h"
+
+#include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/TypeSwitch.h"
+
+#include <functional>
+#include <map>
+#include <set>
+
+using namespace mlir;
+using namespace mlir::furiosa;
+using namespace mlir::furiosa::tile;
+
+//===----------------------------------------------------------------------===//
+// Program helpers
+//===----------------------------------------------------------------------===//
+
+int64_t Lin::coeff(unsigned axis) const {
+  for (auto [a, c] : terms)
+    if (a == axis)
+      return c;
+  return 0;
+}
+
+void Lin::add(unsigned axis, int64_t c) {
+  for (auto it = terms.begin(); it != terms.end(); ++it)
+    if (it->first == axis) {
+      it->second += c;
+      if (!it->second)
+        terms.erase(it);
+      return;
+    }
+  if (c)
+    terms.push_back({axis, c});
+}
+
+bool Lin::operator==(const Lin &o) const {
+  if (offset != o.offset || terms.size() != o.terms.size())
+    return false;
+  for (auto [a, c] : terms)
+    if (o.coeff(a) != c)
+      return false;
+  return true;
+}
+
+SmallVector<unsigned> Read::axes() const {
+  std::set<unsigned> s;
+  for (const Lin &l : index)
+    for (auto [a, c] : l.terms)
+      s.insert(a);
+  return SmallVector<unsigned>(s.begin(), s.end());
+}
+
+SmallVector<unsigned> Program::axesOf(unsigned node) const {
+  std::set<unsigned> s;
+  std::function<void(unsigned)> walk = [&](unsigned n) {
+    const Node &x = nodes[n];
+    if (x.kind == Node::Leaf)
+      for (unsigned a : reads[x.read].axes())
+        s.insert(a);
+    for (unsigned a : x.args)
+      walk(a);
+  };
+  walk(node);
+  // A reduction's own axes are not free in its result.
+  std::function<void(unsigned)> strip = [&](unsigned n) {
+    const Node &x = nodes[n];
+    if (x.kind == Node::Reduce)
+      for (unsigned a : x.axes)
+        s.erase(a);
+    for (unsigned a : x.args)
+      strip(a);
+  };
+  strip(node);
+  return SmallVector<unsigned>(s.begin(), s.end());
+}
+
+static void printLin(llvm::raw_ostream &os, const Lin &l) {
+  bool first = true;
+  for (auto [a, c] : l.terms) {
+    os << (first ? "" : " + ") << (c == 1 ? "" : std::to_string(c) + "*") << "a" << a;
+    first = false;
+  }
+  if (l.offset || first)
+    os << (first ? "" : " + ") << l.offset;
+}
+
+void Program::print(llvm::raw_ostream &os) const {
+  os << "axes:";
+  for (auto [i, a] : llvm::enumerate(axes))
+    os << " a" << i << "=" << a.size << (a.reduction ? "r" : "");
+  os << "\nout:";
+  for (unsigned a : out)
+    os << " a" << a;
+  os << "\nstore arg" << outArg << "[";
+  llvm::interleave(outIndex, os, [&](const Lin &l) { printLin(os, l); }, ", ");
+  os << "]\n";
+  for (auto [i, n] : llvm::enumerate(nodes)) {
+    os << "  %" << i << " = ";
+    switch (n.kind) {
+    case Node::Leaf: {
+      const Read &r = reads[n.read];
+      os << "arg" << r.arg << "[";
+      llvm::interleave(r.index, os, [&](const Lin &l) { printLin(os, l); }, ", ");
+      os << "]";
+      if (r.fill)
+        os << " fill " << *r.fill;
+      break;
+    }
+    case Node::Const:
+      os << n.value;
+      break;
+    case Node::Op:
+      os << n.op;
+      for (unsigned a : n.args)
+        os << " %" << a;
+      break;
+    case Node::Reduce:
+      os << "reduce." << n.op << " %" << n.args[0] << " over";
+      for (unsigned a : n.axes)
+        os << " a" << a;
+      break;
+    }
+    os << "\n";
+  }
+  os << "root %" << root << "\n";
+}
+
+//===----------------------------------------------------------------------===//
+// Digits
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// An affine expression as coefficients of atoms (digits or opaque sub-expressions) plus a constant.
+struct Form {
+  llvm::MapVector<AffineExpr, int64_t> terms;
+  int64_t constant = 0;
+  void add(const Form &o, int64_t scale) {
+    for (auto [atom, c] : o.terms)
+      terms[atom] += c * scale;
+    constant += o.constant * scale;
+  }
+};
+
+std::set<unsigned> dimsOf(AffineExpr e) {
+  std::set<unsigned> out;
+  e.walk([&](AffineExpr x) {
+    if (auto d = dyn_cast<AffineDimExpr>(x))
+      out.insert(d.getPosition());
+  });
+  return out;
+}
+
+/// The constants each dim is divided or reduced by (x floordiv c, x mod c with x mentioning that dim alone).
+std::map<unsigned, std::set<int64_t>> divisors(ArrayRef<AffineExpr> exprs) {
+  std::map<unsigned, std::set<int64_t>> found;
+  for (AffineExpr e : exprs)
+    e.walk([&](AffineExpr x) {
+      if (x.getKind() != AffineExprKind::FloorDiv && x.getKind() != AffineExprKind::Mod)
+        return;
+      auto bin = cast<AffineBinaryOpExpr>(x);
+      auto c = dyn_cast<AffineConstantExpr>(bin.getRHS());
+      std::set<unsigned> dims = dimsOf(bin.getLHS());
+      if (c && c.getValue() > 1 && dims.size() == 1)
+        found[*dims.begin()].insert(c.getValue());
+    });
+  return found;
+}
+
+/// Splits dims into mixed-radix digits and linearizes expressions over them.
+class Digits {
+public:
+  /// `chains[d]`: the divisors of dim d, increasing, each dividing the next and the extent.
+  Digits(MLIRContext *ctx, ArrayRef<int64_t> extents, const std::map<unsigned, SmallVector<int64_t>> &chains)
+      : ctx(ctx) {
+    for (auto [d, extent] : llvm::enumerate(extents)) {
+      AffineExpr dim = getAffineDimExpr(d, ctx);
+      auto it = chains.find(d);
+      SmallVector<int64_t> cs = it == chains.end() ? SmallVector<int64_t>{} : it->second;
+      // Digits most significant first: d floordiv cK, ..., (d floordiv c1) mod (c2 / c1), d mod c1.
+      SmallVector<Digit> ds;
+      for (int k = cs.size(); k >= 0; --k) {
+        int64_t place = k == 0 ? 1 : cs[k - 1];
+        int64_t size = k == (int)cs.size() ? extent / place : cs[k] / place;
+        AffineExpr e = k == 0 ? (cs.empty() ? dim : dim % cs[0])
+                       : k == (int)cs.size() ? dim.floorDiv(cs[k - 1])
+                                             : dim.floorDiv(cs[k - 1]) % (cs[k] / cs[k - 1]);
+        ds.push_back({e, place, size});
+        place_[e] = {unsigned(d), place};
+      }
+      table[d] = ds;
+    }
+  }
+
+  struct Digit {
+    AffineExpr expr;
+    int64_t place, size;
+  };
+  std::map<unsigned, SmallVector<Digit>> table;
+
+  /// `e` over digits; atoms that are not digits stay opaque.
+  Form linear(AffineExpr e) {
+    Form f;
+    if (auto c = dyn_cast<AffineConstantExpr>(e)) {
+      f.constant = c.getValue();
+      return f;
+    }
+    if (auto d = dyn_cast<AffineDimExpr>(e)) {
+      for (const Digit &g : table[d.getPosition()])
+        f.terms[g.expr] += g.place;
+      return f;
+    }
+    auto bin = cast<AffineBinaryOpExpr>(e);
+    if (e.getKind() == AffineExprKind::Add) {
+      f = linear(bin.getLHS());
+      f.add(linear(bin.getRHS()), 1);
+      return f;
+    }
+    if (e.getKind() == AffineExprKind::Mul) {
+      if (auto c = dyn_cast<AffineConstantExpr>(bin.getRHS())) {
+        f.add(linear(bin.getLHS()), c.getValue());
+        return f;
+      }
+      if (auto c = dyn_cast<AffineConstantExpr>(bin.getLHS())) {
+        f.add(linear(bin.getRHS()), c.getValue());
+        return f;
+      }
+    }
+    if (e.getKind() == AffineExprKind::FloorDiv || e.getKind() == AffineExprKind::Mod) {
+      auto c = dyn_cast<AffineConstantExpr>(bin.getRHS());
+      Form inner = linear(bin.getLHS());
+      // Digits of one dim at exactly their place values (plus a constant below the divisor for floordiv), and
+      // a divisor of that dim's chain: the digits above (floordiv) or below (mod) the divisor survive.
+      std::optional<unsigned> dim;
+      bool ok = c && inner.constant >= 0;
+      for (auto [atom, coeff] : inner.terms) {
+        if (!coeff)
+          continue;
+        auto it = place_.find(atom);
+        if (it == place_.end() || it->second.second != coeff || (dim && *dim != it->second.first)) {
+          ok = false;
+          break;
+        }
+        dim = it->second.first;
+      }
+      if (ok && dim) {
+        int64_t cv = c.getValue();
+        bool isDivisor = llvm::any_of(table[*dim], [&](const Digit &g) { return g.place == cv; });
+        // The constant must not carry across the divisor: below every digit at or above it.
+        if (isDivisor && inner.constant < cv) {
+          bool carries = false;
+          int64_t below = inner.constant;
+          for (auto [atom, coeff] : inner.terms)
+            if (coeff && place_[atom].second < cv)
+              below += (llvm::find_if(table[*dim], [&](const Digit &g) { return g.expr == atom; })->size - 1) *
+                       coeff;
+          carries = below >= cv;
+          if (!carries) {
+            for (auto [atom, coeff] : inner.terms) {
+              if (!coeff)
+                continue;
+              int64_t value = place_[atom].second;
+              bool above = value >= cv;
+              if (e.getKind() == AffineExprKind::FloorDiv && above)
+                f.terms[atom] += value / cv;
+              if (e.getKind() == AffineExprKind::Mod && !above)
+                f.terms[atom] += value;
+            }
+            if (e.getKind() == AffineExprKind::Mod)
+              f.constant += inner.constant;
+            return f;
+          }
+        }
+      }
+    }
+    f.terms[e] = 1;
+    return f;
+  }
+
+  MLIRContext *ctx;
+  llvm::DenseMap<AffineExpr, std::pair<unsigned, int64_t>> place_; // digit -> (dim, place value)
+};
+
+//===----------------------------------------------------------------------===//
+// Folding
+//===----------------------------------------------------------------------===//
+
+/// A read before linearization: indices are AffineExprs over the global dims.
+struct RawRead {
+  unsigned arg;
+  Type type;
+  SmallVector<int64_t> shape;
+  SmallVector<AffineExpr> index;
+  std::optional<double> fill;
+};
+
+struct RawNode {
+  Node::Kind kind;
+  unsigned read = 0;
+  double value = 0;
+  std::string op;
+  SmallVector<unsigned> args;
+  SmallVector<unsigned> axes; // Reduce: global dims
+};
+
+class Folder {
+public:
+  Folder(func::FuncOp func, std::string &why) : func(func), why(why), ctx(func.getContext()) {}
+
+  func::FuncOp func;
+  std::string &why;
+  MLIRContext *ctx;
+  SmallVector<int64_t> extents;
+  SmallVector<bool> isReduction;
+  std::vector<RawRead> reads;
+  std::vector<RawNode> nodes;
+  std::map<std::string, unsigned> memo;
+
+  unsigned dim(int64_t extent, bool reduction) {
+    extents.push_back(extent);
+    isReduction.push_back(reduction);
+    return extents.size() - 1;
+  }
+
+  std::string key(const RawNode &n) {
+    std::string s;
+    llvm::raw_string_ostream os(s);
+    os << int(n.kind) << "|" << n.op << "|" << llvm::bit_cast<uint64_t>(n.value) << "|";
+    if (n.kind == Node::Leaf) {
+      const RawRead &r = reads[n.read];
+      os << r.arg << "|";
+      for (AffineExpr e : r.index)
+        os << e << ",";
+      os << "|" << (r.fill ? std::to_string(llvm::bit_cast<uint64_t>(*r.fill)) : "none");
+    }
+    for (unsigned a : n.args)
+      os << "%" << a;
+    for (unsigned a : n.axes)
+      os << "d" << a;
+    return s;
+  }
+
+  unsigned add(RawNode n) {
+    // Reductions are never shared: their axes are fresh per occurrence.
+    if (n.kind != Node::Reduce) {
+      std::string k = key(n);
+      if (auto it = memo.find(k); it != memo.end())
+        return it->second;
+      nodes.push_back(n);
+      return memo[k] = nodes.size() - 1;
+    }
+    nodes.push_back(n);
+    return nodes.size() - 1;
+  }
+
+  unsigned constant(double v) {
+    RawNode n{Node::Const};
+    n.value = v;
+    return add(n);
+  }
+
+  /// The node for `tensor` at `idx` (one AffineExpr per tensor dim). `fill`: the value of positions an
+  /// enclosing tensor.pad added.
+  FailureOr<unsigned> valueAt(Value tensor, SmallVector<AffineExpr> idx, std::optional<double> fill) {
+    if (auto arg = dyn_cast<BlockArgument>(tensor); arg && arg.getOwner() == &func.getBody().front()) {
+      auto type = cast<RankedTensorType>(tensor.getType());
+      reads.push_back({arg.getArgNumber(), type.getElementType(), SmallVector<int64_t>(type.getShape()), idx, fill});
+      RawNode n{Node::Leaf};
+      n.read = reads.size() - 1;
+      return add(n);
+    }
+    Operation *op = tensor.getDefiningOp();
+    if (!op) {
+      why = "a tensor that is neither an argument nor an op result";
+      return failure();
+    }
+    if (auto pad = dyn_cast<tensor::PadOp>(op)) {
+      llvm::APFloat value(0.0f);
+      Value pv = pad.getConstantPaddingValue();
+      if (!pv || !matchPattern(pv, m_ConstantFloat(&value))) {
+        why = "a tensor.pad with a non-constant padding value";
+        return failure();
+      }
+      double v = value.convertToDouble();
+      if (fill && *fill != v) {
+        why = "nested pads with different values";
+        return failure();
+      }
+      SmallVector<int64_t> low(pad.getStaticLow());
+      if (llvm::is_contained(low, ShapedType::kDynamic)) {
+        why = "a dynamic tensor.pad";
+        return failure();
+      }
+      for (unsigned j = 0; j < idx.size(); ++j)
+        idx[j] = idx[j] - low[j];
+      return valueAt(pad.getSource(), idx, v);
+    }
+    if (auto slice = dyn_cast<tensor::ExtractSliceOp>(op)) {
+      SmallVector<int64_t> offsets(slice.getStaticOffsets()), strides(slice.getStaticStrides());
+      if (llvm::is_contained(offsets, ShapedType::kDynamic) || llvm::is_contained(strides, ShapedType::kDynamic)) {
+        why = "a dynamic tensor.extract_slice";
+        return failure();
+      }
+      auto srcType = slice.getSourceType();
+      llvm::SmallBitVector dropped = slice.getDroppedDims();
+      SmallVector<AffineExpr> src;
+      unsigned k = 0;
+      for (unsigned j = 0; j < srcType.getRank(); ++j) {
+        AffineExpr inner = dropped.test(j) ? getAffineConstantExpr(0, ctx) : idx[k++];
+        src.push_back(inner * strides[j] + offsets[j]);
+      }
+      return valueAt(slice.getSource(), src, fill);
+    }
+    if (auto expand = dyn_cast<tensor::ExpandShapeOp>(op)) {
+      // Source dim = the expanded group's indices at their row-major strides.
+      auto outShape = expand.getResultType().getShape();
+      SmallVector<AffineExpr> src;
+      for (ReassociationIndices group : expand.getReassociationIndices()) {
+        AffineExpr e = getAffineConstantExpr(0, ctx);
+        int64_t stride = 1;
+        for (int i = group.size() - 1; i >= 0; --i) {
+          e = e + idx[group[i]] * stride;
+          stride *= outShape[group[i]];
+        }
+        src.push_back(e);
+      }
+      return valueAt(expand.getSrc(), src, fill);
+    }
+    if (auto collapse = dyn_cast<tensor::CollapseShapeOp>(op)) {
+      // Source dims = the digits of the collapsed index.
+      auto srcShape = collapse.getSrcType().getShape();
+      SmallVector<AffineExpr> src(srcShape.size());
+      for (auto [g, group] : llvm::enumerate(collapse.getReassociationIndices())) {
+        int64_t stride = 1;
+        for (int i = group.size() - 1; i >= 0; --i) {
+          AffineExpr e = idx[g];
+          if (stride > 1)
+            e = e.floorDiv(stride);
+          if (i > 0)
+            e = e % srcShape[group[i]];
+          src[group[i]] = e;
+          stride *= srcShape[group[i]];
+        }
+      }
+      return valueAt(collapse.getSrc(), src, fill);
+    }
+    if (auto f = dyn_cast<linalg::FillOp>(op)) {
+      llvm::APFloat value(0.0f);
+      if (!matchPattern(f.getInputs()[0], m_ConstantFloat(&value))) {
+        why = "a linalg.fill with a non-constant value";
+        return failure();
+      }
+      return constant(value.convertToDouble());
+    }
+    if (auto g = dyn_cast<linalg::GenericOp>(op))
+      return generic(g, cast<OpResult>(tensor).getResultNumber(), idx, fill);
+    why = "no folding for '" + op->getName().getStringRef().str() + "'";
+    return failure();
+  }
+
+  /// The generic's result `r` at `idx`: its parallel dims bind to the indices, its reduction dims are fresh.
+  FailureOr<unsigned> generic(linalg::GenericOp g, unsigned r, ArrayRef<AffineExpr> idx, std::optional<double> fill) {
+    if (fill) {
+      why = "a padded generic result";
+      return failure();
+    }
+    auto iters = g.getIteratorTypesArray();
+    SmallVector<int64_t> ranges = g.getStaticLoopRanges();
+    AffineMap outMap = g.getMatchingIndexingMap(g.getDpsInitOperand(r));
+    SmallVector<AffineExpr> dims(iters.size());
+    SmallVector<unsigned> fresh;
+    for (auto [k, e] : llvm::enumerate(outMap.getResults())) {
+      if (auto d = dyn_cast<AffineDimExpr>(e))
+        dims[d.getPosition()] = idx[k];
+      else if (!isa<AffineConstantExpr>(e)) {
+        why = "a generic output map that is not a projection";
+        return failure();
+      }
+    }
+    for (unsigned d = 0; d < iters.size(); ++d) {
+      if (dims[d])
+        continue;
+      if (iters[d] != utils::IteratorType::reduction) {
+        if (ranges[d] != 1) {
+          why = "a parallel dim the output does not index";
+          return failure();
+        }
+        dims[d] = getAffineConstantExpr(0, ctx);
+        continue;
+      }
+      unsigned fd = dim(ranges[d], true);
+      fresh.push_back(fd);
+      dims[d] = getAffineDimExpr(fd, ctx);
+    }
+    Block &body = g.getRegion().front();
+    llvm::DenseMap<Value, unsigned> values;
+    for (OpOperand *in : g.getDpsInputOperands()) {
+      BlockArgument a = body.getArgument(in->getOperandNumber());
+      if (a.use_empty())
+        continue;
+      AffineMap m = g.getMatchingIndexingMap(in);
+      SmallVector<AffineExpr> sub;
+      for (AffineExpr e : m.getResults())
+        sub.push_back(e.replaceDims(dims));
+      auto n = valueAt(in->get(), sub, std::nullopt);
+      if (failed(n))
+        return failure();
+      values[a] = *n;
+    }
+    Value acc = body.getArgument(g.getNumDpsInputs() + r);
+    auto yield = cast<linalg::YieldOp>(body.getTerminator());
+    Value yielded = yield.getOperand(r);
+    if (!fresh.empty()) {
+      Operation *comb = yielded.getDefiningOp();
+      if (!comb || comb->getNumOperands() != 2 || (comb->getOperand(0) != acc && comb->getOperand(1) != acc)) {
+        why = "a reduction body that does not combine the accumulator with one term";
+        return failure();
+      }
+      std::string op = isa<arith::AddFOp>(comb)                            ? "add"
+                       : isa<arith::MaximumFOp, arith::MaxNumFOp>(comb)    ? "max"
+                       : isa<arith::MinimumFOp, arith::MinNumFOp>(comb)    ? "min"
+                                                                           : "";
+      if (op.empty()) {
+        why = "a reduction combiner other than add/max/min";
+        return failure();
+      }
+      Value term = comb->getOperand(0) == acc ? comb->getOperand(1) : comb->getOperand(0);
+      auto t = scalar(term, body, values, acc);
+      if (failed(t))
+        return failure();
+      RawNode red{Node::Reduce};
+      red.op = op;
+      red.args = {*t};
+      red.axes = fresh;
+      unsigned rn = add(red);
+      // The initial value: the combiner's identity drops out.
+      auto init = valueAt(g.getDpsInits()[r], SmallVector<AffineExpr>(idx), std::nullopt);
+      if (failed(init))
+        return failure();
+      const RawNode &in = nodes[*init];
+      bool identity = in.kind == Node::Const &&
+                      ((op == "add" && in.value == 0) || (op == "max" && std::isinf(in.value) && in.value < 0) ||
+                       (op == "min" && std::isinf(in.value) && in.value > 0));
+      if (identity)
+        return rn;
+      RawNode c{Node::Op};
+      c.op = op;
+      c.args = {*init, rn};
+      return add(c);
+    }
+    if (!acc.use_empty()) {
+      auto init = valueAt(g.getDpsInits()[r], SmallVector<AffineExpr>(idx), std::nullopt);
+      if (failed(init))
+        return failure();
+      values[acc] = *init;
+    }
+    return scalar(yielded, body, values, Value());
+  }
+
+  /// A body value as a node.
+  FailureOr<unsigned> scalar(Value v, Block &body, llvm::DenseMap<Value, unsigned> &values, Value acc) {
+    if (auto it = values.find(v); it != values.end())
+      return it->second;
+    if (v == acc && acc) {
+      why = "the accumulator read outside the combiner";
+      return failure();
+    }
+    llvm::APFloat f(0.0f);
+    if (matchPattern(v, m_ConstantFloat(&f)))
+      return values[v] = constant(f.convertToDouble());
+    Operation *op = v.getDefiningOp();
+    if (!op || op->getBlock() != &body) {
+      // A value from outside the body (a function-level constant is matched above).
+      why = "a body value defined outside the body";
+      return failure();
+    }
+    if (isa<arith::ExtFOp, arith::TruncFOp>(op)) {
+      auto in = scalar(op->getOperand(0), body, values, acc);
+      if (failed(in))
+        return failure();
+      return values[v] = *in;
+    }
+    std::string name = llvm::TypeSwitch<Operation *, std::string>(op)
+                           .Case<arith::AddFOp>([](auto) { return "add"; })
+                           .Case<arith::SubFOp>([](auto) { return "sub"; })
+                           .Case<arith::MulFOp>([](auto) { return "mul"; })
+                           .Case<arith::DivFOp>([](auto) { return "div"; })
+                           .Case<arith::MaximumFOp, arith::MaxNumFOp>([](auto) { return "max"; })
+                           .Case<arith::MinimumFOp, arith::MinNumFOp>([](auto) { return "min"; })
+                           .Case<arith::NegFOp>([](auto) { return "neg"; })
+                           .Case<math::AbsFOp>([](auto) { return "abs"; })
+                           .Case<math::ExpOp>([](auto) { return "exp"; })
+                           .Case<math::SqrtOp>([](auto) { return "sqrt"; })
+                           .Case<math::RsqrtOp>([](auto) { return "rsqrt"; })
+                           .Case<math::TanhOp>([](auto) { return "tanh"; })
+                           .Case<math::LogOp>([](auto) { return "log"; })
+                           .Case<math::ErfOp>([](auto) { return "erf"; })
+                           .Case<math::SinOp>([](auto) { return "sin"; })
+                           .Case<math::CosOp>([](auto) { return "cos"; })
+                           .Case<arith::SelectOp>([](auto) { return "select"; })
+                           .Case<arith::CmpFOp>([](arith::CmpFOp c) {
+                             return "cmp." + arith::stringifyCmpFPredicate(c.getPredicate()).str();
+                           })
+                           .Default([](auto) { return ""; });
+    if (name.empty()) {
+      why = "no folding for body op '" + op->getName().getStringRef().str() + "'";
+      return failure();
+    }
+    RawNode n{Node::Op};
+    n.op = name;
+    for (Value o : op->getOperands()) {
+      auto a = scalar(o, body, values, acc);
+      if (failed(a))
+        return failure();
+      n.args.push_back(*a);
+    }
+    return values[v] = add(n);
+  }
+};
+
+/// Ranges of a linear index over the axes.
+std::pair<int64_t, int64_t> range(const Lin &l, ArrayRef<Axis> axes) {
+  int64_t lo = l.offset, hi = l.offset;
+  for (auto [a, c] : l.terms) {
+    int64_t span = c * (axes[a].size - 1);
+    (span < 0 ? lo : hi) += span;
+  }
+  return {lo, hi};
+}
+
+} // namespace
+
+FailureOr<Program> mlir::furiosa::tile::analyze(func::FuncOp func, ArrayRef<int64_t> written, std::string &why) {
+  MLIRContext *ctx = func.getContext();
+  auto ret = cast<func::ReturnOp>(func.getBody().front().getTerminator());
+  if (ret.getNumOperands() != 1 || written.size() != 1) {
+    why = "expected one written buffer";
+    return failure();
+  }
+  Folder folder(func, why);
+
+  // The stored value: reshapes down to the generic that computes it.
+  Value v = ret.getOperand(0);
+  SmallVector<Operation *> reshapes;
+  while (isa_and_nonnull<tensor::ExpandShapeOp, tensor::CollapseShapeOp>(v.getDefiningOp())) {
+    reshapes.push_back(v.getDefiningOp());
+    v = v.getDefiningOp()->getOperand(0);
+  }
+  auto last = v.getDefiningOp<linalg::GenericOp>();
+  if (!last) {
+    why = "the stored value is not a generic's result";
+    return failure();
+  }
+  if (llvm::any_of(last.getIteratorTypesArray(), [](auto t) { return t != utils::IteratorType::parallel; })) {
+    why = "the last generic reduces";
+    return failure();
+  }
+  for (int64_t e : last.getStaticLoopRanges())
+    folder.dim(e, false);
+  unsigned numOut = folder.extents.size();
+  SmallVector<AffineExpr> outIdx;
+  AffineMap lastOut = last.getMatchingIndexingMap(last.getDpsInitOperand(cast<OpResult>(v).getResultNumber()));
+  outIdx = SmallVector<AffineExpr>(lastOut.getResults());
+  // Through the reshapes, outermost last: the written buffer's indices over the output dims.
+  for (Operation *op : llvm::reverse(reshapes)) {
+    SmallVector<AffineExpr> next;
+    if (auto collapse = dyn_cast<tensor::CollapseShapeOp>(op)) {
+      auto shape = collapse.getSrcType().getShape();
+      for (ReassociationIndices group : collapse.getReassociationIndices()) {
+        AffineExpr e = getAffineConstantExpr(0, ctx);
+        int64_t stride = 1;
+        for (int i = group.size() - 1; i >= 0; --i) {
+          e = e + outIdx[group[i]] * stride;
+          stride *= shape[group[i]];
+        }
+        next.push_back(e);
+      }
+    } else {
+      auto expand = cast<tensor::ExpandShapeOp>(op);
+      auto shape = expand.getResultType().getShape();
+      next.resize(shape.size());
+      for (auto [g, group] : llvm::enumerate(expand.getReassociationIndices())) {
+        int64_t stride = 1;
+        for (int i = group.size() - 1; i >= 0; --i) {
+          AffineExpr e = outIdx[g];
+          if (stride > 1)
+            e = e.floorDiv(stride);
+          if (i > 0)
+            e = e % shape[group[i]];
+          next[group[i]] = e;
+          stride *= shape[group[i]];
+        }
+      }
+    }
+    outIdx = next;
+  }
+  SmallVector<AffineExpr> dims;
+  for (unsigned d = 0; d < numOut; ++d)
+    dims.push_back(getAffineDimExpr(d, ctx));
+  auto root = folder.generic(last, cast<OpResult>(v).getResultNumber(), SmallVector<AffineExpr>(lastOut.getResults()),
+                             std::nullopt);
+  if (failed(root))
+    return failure();
+  // generic() bound the last generic's dims to its own output map's results; re-express the root at the dims.
+  // (The map is a projection, so the root is already over dims 0..numOut-1.)
+
+  // Digits: every divisor a map applies to a dim, if the chain nests and divides the extent.
+  SmallVector<AffineExpr> all(outIdx);
+  for (const RawRead &r : folder.reads)
+    llvm::append_range(all, r.index);
+  std::map<unsigned, SmallVector<int64_t>> chains;
+  for (auto &[d, cs] : divisors(all)) {
+    SmallVector<int64_t> chain(cs.begin(), cs.end());
+    bool ok = true;
+    for (unsigned i = 0; i < chain.size(); ++i)
+      ok &= (i == 0 || chain[i] % chain[i - 1] == 0) && folder.extents[d] % chain[i] == 0;
+    if (!ok) {
+      why = "dim " + std::to_string(d) + " is divided by constants that do not nest in its extent";
+      return failure();
+    }
+    chains[d] = chain;
+  }
+  Digits digits(ctx, folder.extents, chains);
+
+  Program p;
+  llvm::DenseMap<AffineExpr, unsigned> axisOf; // digit -> axis
+  for (unsigned d = 0; d < folder.extents.size(); ++d)
+    for (const Digits::Digit &g : digits.table[d]) {
+      if (g.size == 1)
+        continue;
+      axisOf[g.expr] = p.axes.size();
+      p.axes.push_back({g.size, (bool)folder.isReduction[d]});
+      if (d < numOut)
+        p.out.push_back(p.axes.size() - 1);
+    }
+  auto toLin = [&](AffineExpr e) -> FailureOr<Lin> {
+    Form f = digits.linear(e);
+    Lin l;
+    l.offset = f.constant;
+    for (auto [atom, c] : f.terms) {
+      if (!c)
+        continue;
+      auto it = axisOf.find(atom);
+      if (it == axisOf.end()) {
+        // A unit digit is zero; anything else is not linear in the digits.
+        bool unit = false;
+        for (auto &[d, ds] : digits.table)
+          for (const Digits::Digit &g : ds)
+            unit |= g.expr == atom && g.size == 1;
+        if (unit)
+          continue;
+        std::string s;
+        llvm::raw_string_ostream os(s);
+        os << "an index that is not linear in the loop digits: " << e;
+        why = s;
+        return failure();
+      }
+      l.add(it->second, c);
+    }
+    return l;
+  };
+  for (const RawRead &r : folder.reads) {
+    Read read{r.arg, r.type, r.shape, {}, r.fill};
+    for (AffineExpr e : r.index) {
+      auto l = toLin(e);
+      if (failed(l))
+        return failure();
+      read.index.push_back(*l);
+    }
+    // Drop the fill when no index can leave the buffer.
+    bool inside = true;
+    for (auto [j, l] : llvm::enumerate(read.index)) {
+      auto [lo, hi] = range(l, p.axes);
+      inside &= lo >= 0 && hi < read.shape[j];
+    }
+    if (inside)
+      read.fill.reset();
+    else if (!read.fill) {
+      why = "a read that can leave its buffer without padding";
+      return failure();
+    }
+    p.reads.push_back(read);
+  }
+  // Global dims -> axes for reductions.
+  for (const RawNode &n : folder.nodes) {
+    Node m{n.kind};
+    m.read = n.read;
+    m.value = n.value;
+    m.op = n.op;
+    m.args = n.args;
+    for (unsigned d : n.axes)
+      for (const Digits::Digit &g : digits.table[d])
+        if (auto it = axisOf.find(g.expr); it != axisOf.end())
+          m.axes.push_back(it->second);
+    p.nodes.push_back(m);
+  }
+  p.root = *root;
+  p.outArg = written[0];
+  auto outType = cast<RankedTensorType>(func.getArgumentTypes()[p.outArg]);
+  p.outType = outType.getElementType();
+  p.outShape = SmallVector<int64_t>(outType.getShape());
+  if (outIdx.size() != p.outShape.size()) {
+    why = "the stored value's rank differs from the written buffer's";
+    return failure();
+  }
+  for (AffineExpr e : outIdx) {
+    auto l = toLin(e);
+    if (failed(l))
+      return failure();
+    p.outIndex.push_back(*l);
+  }
+  return p;
+}

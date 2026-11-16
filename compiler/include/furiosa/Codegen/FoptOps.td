@@ -392,4 +392,6 @@ def Fopt_VectorFxpOp : Fopt_StageOp<"vector_fxp"> {
   let assemblyFormat = "$op $input `,` $imm attr-dict `:` qualified(type($input)) `->` qualified(type($result))";
 }
 
+include "FoptTileOps.td"
+
 #endif // FURIOSA_CODEGEN_FOPT_OPS

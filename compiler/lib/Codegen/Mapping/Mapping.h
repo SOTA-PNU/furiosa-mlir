@@ -89,6 +89,8 @@ OpClass elementwiseClass();
 OpClass contractionClass();
 /// Row-wise elementwise generics and row reductions over [rows, columns] (Mapping/Rowwise.cpp).
 OpClass rowwiseClass();
+/// Any kernel the tiled lowering folds: contractions and elementwise tails over row tiles (Tile/Lower.cpp).
+OpClass tiledClass();
 /// Rows of a table read at data-dependent indices, as an indirect DMA (Mapping/Gather.cpp).
 OpClass gatherClass();
 /// A buffer copied into a box of another, in place, as an HBM-to-HBM DMA (Mapping/Copy.cpp).
