@@ -674,6 +674,150 @@ bool mergeReductionDims(linalg::GenericOp &generic, OpBuilder &b) {
   return false;
 }
 
+/// The block argument behind a body value, through an extension.
+BlockArgument bodyArg(Value v, Block &body) {
+  if (auto ext = v.getDefiningOp<arith::ExtFOp>())
+    v = ext.getIn();
+  auto arg = dyn_cast<BlockArgument>(v);
+  return arg && arg.getOwner() == &body ? arg : BlockArgument();
+}
+
+/// Shrinks reduction dims to the extent that can change the result. A reduction whose every contributing
+/// operand is padded along the dim with the combiner's absorbing input (zero for out + x * y, where one zero
+/// factor makes the term vanish; -inf for max) gains nothing past the padding: the dim's extent becomes the
+/// largest live extent among those operands, and each operand reading the dim drops the padding (or the rows)
+/// beyond it.
+bool trimReductionDims(linalg::GenericOp &generic, OpBuilder &b) {
+  MLIRContext *ctx = generic.getContext();
+  Block &body = generic.getRegion().front();
+  auto yield = cast<linalg::YieldOp>(body.getTerminator());
+  if (generic.getNumDpsInits() != 1 || yield.getNumOperands() != 1)
+    return false;
+  Value acc = body.getArgument(generic.getNumDpsInputs());
+  // The operands whose padding must be absorbing, and that value.
+  SmallVector<BlockArgument> factors;
+  bool isMax = false;
+  Operation *comb = yield.getOperand(0).getDefiningOp();
+  if (!comb || comb->getNumOperands() != 2 || (comb->getOperand(0) != acc && comb->getOperand(1) != acc))
+    return false;
+  Value term = comb->getOperand(0) == acc ? comb->getOperand(1) : comb->getOperand(0);
+  if (isa<arith::AddFOp>(comb)) {
+    // The term is a product of operand reads: every factor is a leaf of its mulf tree.
+    std::function<void(Value)> collect = [&](Value v) {
+      if (auto mul = v.getDefiningOp<arith::MulFOp>(); mul && mul->getBlock() == &body) {
+        collect(mul.getLhs());
+        collect(mul.getRhs());
+        return;
+      }
+      factors.push_back(bodyArg(v, body));
+    };
+    if (!term.getDefiningOp<arith::MulFOp>())
+      return false;
+    collect(term);
+  } else if (isa<arith::MaximumFOp, arith::MaxNumFOp>(comb)) {
+    isMax = true;
+    factors.push_back(bodyArg(term, body));
+  } else {
+    return false;
+  }
+  if (llvm::any_of(factors, [&](BlockArgument a) { return !a || a.getArgNumber() >= generic.getNumDpsInputs(); }))
+    return false;
+
+  auto iters = generic.getIteratorTypesArray();
+  SmallVector<int64_t> extents = generic.getStaticLoopRanges();
+  for (unsigned r = 0; r < iters.size(); ++r) {
+    if (iters[r] != utils::IteratorType::reduction)
+      continue;
+    bool readsIndex = false;
+    generic.getRegion().walk([&](linalg::IndexOp ix) { readsIndex |= ix.getDim() == r; });
+    if (readsIndex)
+      continue;
+    // Each input reading r: the result position and offset of its `d_r + c` index.
+    struct Use {
+      unsigned operand, result;
+      int64_t offset;
+    };
+    SmallVector<Use> uses;
+    bool simple = true;
+    for (OpOperand *in : generic.getDpsInputOperands()) {
+      AffineMap map = generic.getMatchingIndexingMap(in);
+      for (auto [j, e] : llvm::enumerate(map.getResults())) {
+        if (!e.isFunctionOfDim(r))
+          continue;
+        AffineExpr rest = simplifyAffineExpr(e - getAffineDimExpr(r, ctx), map.getNumDims(), 0);
+        auto c = dyn_cast<AffineConstantExpr>(rest);
+        if (!c || c.getValue() < 0 || llvm::any_of(uses, [&](const Use &u) { return u.operand == in->getOperandNumber(); }))
+          simple = false;
+        else
+          uses.push_back({in->getOperandNumber(), unsigned(j), c.getValue()});
+      }
+    }
+    if (!simple || uses.empty())
+      continue;
+    // The live extent of each factor along r: past it the factor reads the absorbing padding.
+    int64_t live = 0;
+    bool absorbed = true;
+    for (BlockArgument f : factors) {
+      auto it = llvm::find_if(uses, [&](const Use &u) { return u.operand == f.getArgNumber(); });
+      auto pad = it == uses.end() ? tensor::PadOp() : generic.getDpsInputs()[f.getArgNumber()].getDefiningOp<tensor::PadOp>();
+      llvm::APFloat value(0.0f);
+      if (!pad || !pad.getConstantPaddingValue() || !matchPattern(pad.getConstantPaddingValue(), m_ConstantFloat(&value)) ||
+          (isMax ? !(value.isInfinity() && value.isNegative()) : !value.isZero())) {
+        absorbed = false;
+        break;
+      }
+      SmallVector<int64_t> low(pad.getStaticLow()), high(pad.getStaticHigh());
+      int64_t source = pad.getSourceType().getDimSize(it->result);
+      if (llvm::is_contained(low, ShapedType::kDynamic) || llvm::is_contained(high, ShapedType::kDynamic)) {
+        absorbed = false;
+        break;
+      }
+      live = std::max(live, low[it->result] + source - it->offset);
+    }
+    if (!absorbed || live >= extents[r])
+      continue;
+    live = std::max<int64_t>(live, 1);
+    // Every operand reading r shrinks to the new extent along that dim.
+    b.setInsertionPoint(generic);
+    SmallVector<Value> inputs(generic.getDpsInputs());
+    for (const Use &u : uses) {
+      Value v = inputs[u.operand];
+      auto type = cast<RankedTensorType>(v.getType());
+      int64_t size = live + u.offset;
+      if (size >= type.getDimSize(u.result))
+        continue;
+      if (auto pad = v.getDefiningOp<tensor::PadOp>()) {
+        SmallVector<int64_t> low(pad.getStaticLow()), high(pad.getStaticHigh());
+        int64_t cut = type.getDimSize(u.result) - size;
+        if (!llvm::is_contained(low, ShapedType::kDynamic) && !llvm::is_contained(high, ShapedType::kDynamic) &&
+            high[u.result] >= cut) {
+          high[u.result] -= cut;
+          SmallVector<int64_t> shape(type.getShape());
+          shape[u.result] = size;
+          auto repad = tensor::PadOp::create(b, generic.getLoc(), RankedTensorType::get(shape, type.getElementType()),
+                                             pad.getSource(), getAsIndexOpFoldResult(ctx, low),
+                                             getAsIndexOpFoldResult(ctx, high), pad.getConstantPaddingValue());
+          inputs[u.operand] = repad;
+          continue;
+        }
+      }
+      SmallVector<int64_t> offsets(type.getRank(), 0), sizes(type.getShape()), ones(type.getRank(), 1);
+      sizes[u.result] = size;
+      inputs[u.operand] = tensor::ExtractSliceOp::create(
+          b, generic.getLoc(), RankedTensorType::get(sizes, type.getElementType()), v,
+          getAsIndexOpFoldResult(ctx, offsets), getAsIndexOpFoldResult(ctx, sizes), getAsIndexOpFoldResult(ctx, ones));
+    }
+    auto trimmed = linalg::GenericOp::create(b, generic.getLoc(), generic.getResultTypes(), inputs,
+                                             generic.getDpsInits(), generic.getIndexingMapsArray(), iters);
+    trimmed.getRegion().takeBody(generic.getRegion());
+    generic.replaceAllUsesWith(trimmed.getResults());
+    generic.erase();
+    generic = trimmed;
+    return true;
+  }
+  return false;
+}
+
 struct StructurePass : PassWrapper<StructurePass, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(StructurePass)
 
@@ -730,6 +874,8 @@ struct StructurePass : PassWrapper<StructurePass, OperationPass<ModuleOp>> {
         continue;
       }
       while (mergeReductionDims(generic, b)) {
+      }
+      while (trimReductionDims(generic, b)) {
       }
     }
 
