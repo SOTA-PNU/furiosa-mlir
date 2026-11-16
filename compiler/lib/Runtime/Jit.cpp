@@ -63,7 +63,8 @@ namespace {
 // non-writable first, so bufferization copies instead of writing them.
 // The pipeline text is relative to the module-anchored pass manager it is parsed into.
 constexpr const char *kPipeline =
-    "one-shot-bufferize{bufferize-function-boundaries function-boundary-type-conversion=identity-layout-map},"
+    "one-shot-bufferize{bufferize-function-boundaries function-boundary-type-conversion=identity-layout-map "
+    "allow-return-allocs-from-loops},"
     "buffer-results-to-out-params{hoist-static-allocs modify-public-functions},"
     "ownership-based-buffer-deallocation,"
     "canonicalize,"

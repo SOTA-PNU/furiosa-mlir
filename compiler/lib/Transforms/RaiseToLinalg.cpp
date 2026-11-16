@@ -33,6 +33,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Verifier.h"
 
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -45,6 +46,7 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <numeric>
 #include <optional>
 #include <set>
 
@@ -63,13 +65,15 @@ struct Interval {
 
 int64_t floorDiv(int64_t a, int64_t b) { return a >= 0 ? a / b : -((-a + b - 1) / b); }
 
-Interval bounds(AffineExpr e, ArrayRef<Interval> dims) {
+Interval bounds(AffineExpr e, ArrayRef<Interval> dims, ArrayRef<Interval> syms = {}) {
   if (auto c = dyn_cast<AffineConstantExpr>(e))
     return {c.getValue(), c.getValue()};
   if (auto d = dyn_cast<AffineDimExpr>(e))
     return dims[d.getPosition()];
+  if (auto sy = dyn_cast<AffineSymbolExpr>(e))
+    return syms[sy.getPosition()];
   auto bin = cast<AffineBinaryOpExpr>(e);
-  Interval l = bounds(bin.getLHS(), dims), r = bounds(bin.getRHS(), dims);
+  Interval l = bounds(bin.getLHS(), dims, syms), r = bounds(bin.getRHS(), dims, syms);
   switch (e.getKind()) {
   case AffineExprKind::Add:
     return {l.lo + r.lo, l.hi + r.hi};
@@ -194,6 +198,57 @@ AffineExpr simplify(AffineExpr e, unsigned numDims, unsigned numSyms = 0) {
   return simplifyAffineExpr(normalize(simplifyAffineExpr(e, numDims, numSyms)), numDims, numSyms);
 }
 
+/// Coefficients c (one per feature, then a constant) with sum_f c_f * x[n][f] + c_last == y[n] exactly
+/// for every row n, if they exist (least squares, rounded, then checked).
+std::optional<SmallVector<int64_t>> fitAffine(ArrayRef<SmallVector<int64_t>> x, ArrayRef<int64_t> y) {
+  unsigned nf = x.empty() ? 0 : x[0].size(), nv = nf + 1;
+  std::vector<std::vector<double>> a(nv, std::vector<double>(nv, 0.0));
+  std::vector<double> rhs(nv, 0.0);
+  for (unsigned n = 0; n < x.size(); ++n) {
+    SmallVector<double> row(x[n].begin(), x[n].end());
+    row.push_back(1.0);
+    for (unsigned i = 0; i < nv; ++i) {
+      rhs[i] += row[i] * y[n];
+      for (unsigned j = 0; j < nv; ++j)
+        a[i][j] += row[i] * row[j];
+    }
+  }
+  std::vector<double> sol(nv, 0.0);
+  std::vector<int> pivot(nv, -1);
+  for (unsigned col = 0, row = 0; col < nv && row < nv; ++col) {
+    unsigned best = row;
+    for (unsigned r = row; r < nv; ++r)
+      if (std::abs(a[r][col]) > std::abs(a[best][col]))
+        best = r;
+    if (std::abs(a[best][col]) < 1e-9)
+      continue;
+    std::swap(a[best], a[row]);
+    std::swap(rhs[best], rhs[row]);
+    for (unsigned r = 0; r < nv; ++r)
+      if (r != row) {
+        double f = a[r][col] / a[row][col];
+        for (unsigned c = 0; c < nv; ++c)
+          a[r][c] -= f * a[row][c];
+        rhs[r] -= f * rhs[row];
+      }
+    pivot[col] = row++;
+  }
+  for (unsigned col = 0; col < nv; ++col)
+    if (pivot[col] >= 0)
+      sol[col] = rhs[pivot[col]] / a[pivot[col]][col];
+  SmallVector<int64_t> c;
+  for (double v : sol)
+    c.push_back(std::llround(v));
+  for (unsigned n = 0; n < x.size(); ++n) {
+    int64_t v = c[nf];
+    for (unsigned f = 0; f < nf; ++f)
+      v += c[f] * x[n][f];
+    if (v != y[n])
+      return std::nullopt;
+  }
+  return c;
+}
+
 std::string show(AffineExpr e) {
   std::string out;
   llvm::raw_string_ostream os(out);
@@ -237,6 +292,15 @@ public:
             const DenseMap<Operation *, unsigned> &loopIds)
       : ctx(ctx), pid(pid.begin(), pid.end()), grid(grid.begin(), grid.end()), argIndex(argIndex), loopIds(loopIds) {}
 
+  /// The symbolic mode: program id d is the symbol `pidSymbol + d` instead of a constant; whatever is
+  /// not affine in it fails quietly (the mode is only a fallback).
+  Evaluator(MLIRContext *ctx, unsigned pidSymbol, ArrayRef<int64_t> grid, const DenseMap<Value, int> &argIndex,
+            const DenseMap<Operation *, unsigned> &loopIds)
+      : ctx(ctx), pid{0, 0, 0}, grid(grid.begin(), grid.end()), argIndex(argIndex), loopIds(loopIds),
+        symbolic(true), pidSymbol(pidSymbol) {}
+
+  ArrayRef<int64_t> programId() const { return pid; }
+
   LogicalResult run(tt::FuncOp fn) {
     for (auto [arg, index] : argIndex) {
       Sym s;
@@ -253,14 +317,26 @@ public:
     return it == syms.end() ? nullptr : &it->second;
   }
 
-  DenseMap<unsigned, int64_t> trips; // per loop id: its trip count in this instance
+  DenseMap<unsigned, int64_t> trips;    // per loop id: its trip count in this instance
+  DenseMap<Operation *, bool> taken;     // per scf.if: whether this instance took its then-branch
+  DenseSet<Operation *> executed;        // the stores this instance runs
 
 private:
   MLIRContext *ctx;
   SmallVector<int64_t, 3> pid, grid;
   const DenseMap<Value, int> &argIndex;
   const DenseMap<Operation *, unsigned> &loopIds;
+  bool symbolic = false;
+  unsigned pidSymbol = 0;
   DenseMap<Value, Sym> syms;
+
+  /// A value this mode cannot express: an error with constant program ids; in the symbolic mode the
+  /// value just stays unknown (rewriteSymbolic then declines anything that needs it).
+  LogicalResult fail(Operation *op, const Twine &msg) {
+    if (symbolic)
+      return success();
+    return op->emitError(msg);
+  }
 
   AffineExpr cst(int64_t c) { return getAffineConstantExpr(c, ctx); }
 
@@ -333,7 +409,8 @@ private:
       return success();
     }
     if (auto p = dyn_cast<tt::GetProgramIdOp>(op))
-      return setInt(p, cst(pid[p.getAxisAsInt()])), success();
+      return setInt(p, symbolic ? getAffineSymbolExpr(pidSymbol + p.getAxisAsInt(), ctx) : cst(pid[p.getAxisAsInt()])),
+             success();
     if (auto p = dyn_cast<tt::GetNumProgramsOp>(op))
       return setInt(p, cst(grid[p.getAxisAsInt()])), success();
     if (auto r = dyn_cast<tt::MakeRangeOp>(op))
@@ -362,7 +439,7 @@ private:
     if (auto a = dyn_cast<tt::AddPtrOp>(op)) {
       const Sym *ptr = get(a.getPtr());
       if (!ptr)
-        return op->emitError("furiosa: address of an unknown pointer");
+        return fail(op, "furiosa: address of an unknown pointer");
       Sym out = *ptr;
       out.shape = shapeOf(a.getType());
       if (const Sym *off = get(a.getOffset())) {
@@ -410,19 +487,19 @@ private:
       AffineExpr res;
       if (isa<arith::MulIOp>(op)) {
         if (!ca && !cb)
-          return op->emitError("furiosa: product of two non-constant indices");
+          return fail(op, "furiosa: product of two non-constant indices");
         res = a * b;
       } else if (isa<arith::DivSIOp, arith::DivUIOp>(op)) {
         if (!cb || cb.getValue() <= 0)
-          return op->emitError("furiosa: index division by a non-constant or non-positive value");
+          return fail(op, "furiosa: index division by a non-constant or non-positive value");
         res = normalize(a.floorDiv(cb.getValue()));
       } else if (isa<arith::RemSIOp, arith::RemUIOp>(op)) {
         if (!cb || cb.getValue() <= 0)
-          return op->emitError("furiosa: index remainder by a non-constant or non-positive value");
+          return fail(op, "furiosa: index remainder by a non-constant or non-positive value");
         res = normalize(a % cb.getValue());
       } else {
         if (!ca || !cb)
-          return op->emitError("furiosa: min/max of non-constant indices");
+          return fail(op, "furiosa: min/max of non-constant indices");
         bool isMin = isa<arith::MinSIOp, arith::MinUIOp>(op);
         res = cst(isMin ? std::min(ca.getValue(), cb.getValue()) : std::max(ca.getValue(), cb.getValue()));
       }
@@ -502,6 +579,29 @@ private:
     }
     if (auto f = dyn_cast<scf::ForOp>(op))
       return evalFor(f);
+    if (auto i = dyn_cast<scf::IfOp>(op))
+      return evalIf(i);
+    if (isa<tt::StoreOp>(op))
+      executed.insert(op);
+    return success();
+  }
+
+  /// A branch whose condition the program id decides: only the taken region runs in this instance.
+  LogicalResult evalIf(scf::IfOp i) {
+    const Sym *c = get(i.getCondition());
+    if (!c || c->kind != Sym::Mask || !c->conds.empty())
+      return fail(i.getOperation(), "furiosa: a branch whose condition varies inside a program instance");
+    bool then = !c->never;
+    taken[i] = then;
+    Region &region = then ? i.getThenRegion() : i.getElseRegion();
+    if (region.empty())
+      return success();
+    if (failed(evalBlock(region.front())))
+      return failure();
+    auto yield = cast<scf::YieldOp>(region.front().getTerminator());
+    for (auto [r, y] : llvm::zip(i.getResults(), yield.getOperands()))
+      if (const Sym *s = get(y))
+        syms[r] = *s;
     return success();
   }
 
@@ -514,14 +614,27 @@ private:
       return getConstantIntValue(v);
     };
     auto lb = bound(f.getLowerBound()), ub = bound(f.getUpperBound()), step = bound(f.getStep());
+    if (symbolic && step && *step > 0 && (!lb || !ub)) {
+      // Program-dependent bounds: keep the counter's expression, the trip count is not needed here.
+      const Sym *l = get(f.getLowerBound());
+      if (!l || l->kind != Sym::Int || !l->data.empty())
+        return success();
+      unsigned id = loopIds.lookup(f);
+      setInt(f.getInductionVar(), l->expr + getAffineSymbolExpr(id, ctx) * *step);
+      return evalBody(f, id, std::nullopt);
+    }
     if (!lb || !ub || !step || *step <= 0)
-      return f.emitError("furiosa: loop bounds vary inside a program instance");
+      return fail(f.getOperation(), "furiosa: loop bounds vary inside a program instance");
     unsigned id = loopIds.lookup(f);
     int64_t trip = std::max<int64_t>(0, (*ub - *lb + *step - 1) / *step);
     trips[id] = trip;
-    AffineExpr t = getAffineSymbolExpr(id, ctx);
-    setInt(f.getInductionVar(), cst(*lb) + t * *step);
+    setInt(f.getInductionVar(), cst(*lb) + getAffineSymbolExpr(id, ctx) * *step);
+    return evalBody(f, id, trip);
+  }
 
+  /// The body of loop `f` (counter symbol `id`): carried indices in closed form, then every op.
+  LogicalResult evalBody(scf::ForOp f, unsigned id, std::optional<int64_t> trip) {
+    AffineExpr t = getAffineSymbolExpr(id, ctx);
     // Index-typed iter args (pointer increments): closed form init + t * delta, with delta read off a
     // first evaluation of the body at the initial value.
     SmallVector<unsigned> carried;
@@ -534,26 +647,40 @@ private:
     if (!carried.empty()) {
       if (failed(evalBlock(*f.getBody())))
         return failure();
+      SmallVector<unsigned> affine;
       for (unsigned i : carried) {
         const Sym *init = get(f.getInitArgs()[i]);
         const Sym *next = get(yield.getOperand(i));
-        if (!next || next->data.size() != init->data.size())
-          return f.emitError("furiosa: loop-carried index is not affine");
-        AffineExpr delta = next->expr - init->expr;
-        if (delta.isFunctionOfSymbol(id))
-          return f.emitError("furiosa: loop-carried index does not advance by a loop-invariant amount");
+        // A carried integer that does not advance by a loop-invariant amount is data, not an index.
+        if (!next || next->kind != init->kind || next->data.size() != init->data.size() ||
+            (next->expr - init->expr).isFunctionOfSymbol(id)) {
+          if (init->kind == Sym::Ptr)
+            return fail(f.getOperation(), "furiosa: loop-carried pointer does not advance by a loop-invariant amount");
+          continue;
+        }
         Sym s = *init;
-        s.expr = init->expr + t * delta;
+        s.expr = init->expr + t * (next->expr - init->expr);
         syms[f.getRegionIterArgs()[i]] = s;
+        affine.push_back(i);
       }
+      for (unsigned i : carried)
+        if (!llvm::is_contained(affine, i))
+          syms.erase(f.getRegionIterArgs()[i]);
+      // Forget what the first pass derived; the second pass recomputes it from the closed forms.
+      f.getBody()->walk([&](Operation *op) {
+        for (Value r : op->getResults())
+          syms.erase(r);
+      });
+      carried = affine;
     }
     if (failed(evalBlock(*f.getBody())))
       return failure();
-    for (unsigned i : carried) {
-      Sym s = *get(f.getRegionIterArgs()[i]);
-      s.expr = s.expr.replace(t, cst(trip));
-      syms[f.getResult(i)] = s;
-    }
+    if (trip)
+      for (unsigned i : carried) {
+        Sym s = *get(f.getRegionIterArgs()[i]);
+        s.expr = s.expr.replace(t, cst(*trip));
+        syms[f.getResult(i)] = s;
+      }
     return success();
   }
 };
@@ -599,6 +726,9 @@ struct Gen {
   SmallVector<int> coordPos;      // store-view dim -> generic dim (-1: absent)
   SmallVector<int64_t> lo, extent; // per generic dim: offset of linalg.index, and extent
   DenseMap<unsigned, int> loopPos; // loop id -> generic dim
+  DenseMap<unsigned, Value> loopIv; // loop id -> its counter, for loops kept as scf.for
+  // Iter args of kept loops -> their state tensor and its dims (generic dims of this generic).
+  std::map<void *, std::pair<Value, SmallVector<int>>> state;
   OpBuilder *ob = nullptr;
   Operation *anchor = nullptr;     // insertion point for what this generic reads
   SmallVector<Value> index;        // per generic dim, lazily created absolute index
@@ -632,8 +762,14 @@ private:
   SmallVector<int64_t> loopTrip;
   SmallVector<bool> varTrip;
   std::vector<std::unique_ptr<Evaluator>> evals;
+  // The instances that run the store being raised, with one control path and one store base.
+  SmallVector<Evaluator *> act;
+  // One evaluation with the program ids as symbols (null where something is not affine in them).
+  std::unique_ptr<Evaluator> symEval;
   std::map<int, Value> current;
-  std::map<int, Value> flat;
+  std::map<void *, Value> flat;                        // buffer version -> its flat view
+  SmallVector<std::tuple<Operation *, int, Value>> stores; // raised stores: op, buffer, version after it
+  SmallVector<Value> args;                              // the function's buffer arguments
   const StoreSpace *space = nullptr;
 
   LogicalResult parseLaunch();
@@ -645,15 +781,22 @@ private:
   FailureOr<AffineExpr> rewrite(Operation *at, const Gen &g, ArrayRef<Axis> env,
                                 std::function<AffineExpr(const Sym &)> select, Value v);
   FailureOr<AffineExpr> fitOrigins(Operation *at, const Gen &g, ArrayRef<int64_t> consts);
+  FailureOr<AffineExpr> rewriteSymbolic(Operation *at, const Gen &g, ArrayRef<Axis> env,
+                                        std::function<AffineExpr(const Sym &)> select, Value v);
   Value index(Gen &g, unsigned dim);
   Value exprValue(Gen &g, AffineExpr e);
-  Value flatOf(int arg);
+  Value flatOf(Value version, int arg);
+  Value versionAt(Operation *load, int arg);
   FailureOr<Value> emit(Gen &g, Value v, ArrayRef<Axis> env);
   FailureOr<Value> emitLoad(Gen &g, tt::LoadOp load, ArrayRef<Axis> env);
   FailureOr<Value> emitSym(Gen &g, Value v, const Sym &s0, ArrayRef<Axis> env);
   FailureOr<Value> emitDataTerms(Gen &g, const Sym &s0, ArrayRef<Axis> env);
   FailureOr<Value> emitElementwise(Gen &g, Operation *op, ArrayRef<Axis> env);
   FailureOr<Value> materialize(Gen &g, Value v, ArrayRef<Axis> env);
+  FailureOr<Value> materializeState(Gen &g, scf::ForOp loop, unsigned result, ArrayRef<Axis> env);
+  FailureOr<SmallVector<SmallVector<Axis>>> stateEnvs(scf::ForOp loop, unsigned result, ArrayRef<Axis> env);
+  FailureOr<Value> parallelGeneric(Gen &parent, Type elem, std::function<FailureOr<Value>(Gen &)> fn);
+  std::map<std::pair<Operation *, Operation *>, SmallVector<Value>> keptLoops; // (loop, consumer anchor)
 
   /// Builds one generic whose first dims are `parentDims` of `parent` (a subset, in order) followed by
   /// `ownExtents`; `body` yields the value at a point given the generic, the out value (accumulator)
@@ -707,6 +850,9 @@ LogicalResult Raiser::evaluate() {
         if (failed(evals.back()->run(kernel)))
           return failure();
       }
+  symEval = std::make_unique<Evaluator>(ctx, (unsigned)loopTrip.size(), grid, argIndex, loopIds);
+  if (failed(symEval->run(kernel)))
+    symEval.reset();
   // A loop's reduction extent is its longest trip; instances with shorter trips mask the rest.
   varTrip.assign(loopTrip.size(), false);
   for (unsigned id = 0; id < loopTrip.size(); ++id) {
@@ -788,11 +934,11 @@ bool components(AffineExpr e, int64_t scale, SmallVectorImpl<Component> &out) {
 } // namespace
 
 FailureOr<StoreSpace> Raiser::storeSpace(tt::StoreOp store) {
-  if (store->getParentOp() != kernel.getOperation())
-    return store.emitError("furiosa: stores inside loops or branches are not raised yet"), failure();
+  if (store->getParentOfType<scf::ForOp>())
+    return store.emitError("furiosa: stores inside loops are not raised yet"), failure();
   SmallVector<int64_t> shape = shapeOf(store.getValue().getType());
   unsigned rank = shape.size();
-  const Sym *p0 = evals[0]->get(store.getPtr());
+  const Sym *p0 = act[0]->get(store.getPtr());
   if (!p0 || p0->kind != Sym::Ptr || !p0->data.empty())
     return store.emitError("furiosa: store address is not an affine function of program ids and axes"), failure();
   int arg = p0->base;
@@ -801,11 +947,11 @@ FailureOr<StoreSpace> Raiser::storeSpace(tt::StoreOp store) {
 
   // Axes the address takes apart with div/mod get a per-instance origin read off the atoms
   // (`origin + axis` inside each), so the address becomes one expression of their global indices.
-  std::vector<SmallVector<int64_t>> digitOrigin(evals.size(), SmallVector<int64_t>(rank, 0));
+  std::vector<SmallVector<int64_t>> digitOrigin(act.size(), SmallVector<int64_t>(rank, 0));
   SmallVector<bool> isDigit(rank, false);
-  SmallVector<AffineExpr> rest(evals.size());
-  SmallVector<int64_t> constant(evals.size());
-  for (auto [n, ev] : llvm::enumerate(evals)) {
+  SmallVector<AffineExpr> rest(act.size());
+  SmallVector<int64_t> constant(act.size());
+  for (auto [n, ev] : llvm::enumerate(act)) {
     const Sym *p = ev->get(store.getPtr());
     if (!p || p->kind != Sym::Ptr || p->base != arg || !p->data.empty())
       return store.emitError("furiosa: store base differs between program instances"), failure();
@@ -885,21 +1031,36 @@ FailureOr<StoreSpace> Raiser::storeSpace(tt::StoreOp store) {
   SmallVector<int64_t> bufStrides(buf.shape.size(), 1);
   for (int i = (int)buf.shape.size() - 2; i >= 0; --i)
     bufStrides[i] = bufStrides[i + 1] * buf.shape[i + 1];
-  for (bool withBuffer : {true, false}) {
+  // View candidates, in order: the address strides plus the buffer's own dim strides (nicest), the
+  // address strides alone, then both again refined by the spacing of the tile origins (when tiles
+  // cover a strided subset of a dim). Each is checked by enumeration.
+  std::string why = "store strides do not nest: " + show(rest[0]);
+  SmallVector<int64_t> probeStrides;
+  std::vector<SmallVector<int64_t>> probeOrigins;
+  for (int attempt = 0; attempt < 4; ++attempt) {
     std::set<int64_t, std::greater<int64_t>> strides{1};
     for (const Component &c : comps)
       strides.insert(c.stride);
-    if (withBuffer)
+    if (attempt == 0 || attempt == 2)
       strides.insert(bufStrides.begin(), bufStrides.end());
+    if (attempt >= 2) {
+      size_t before = strides.size();
+      for (unsigned j = 0; j < probeStrides.size() && !probeOrigins.empty(); ++j) {
+        int64_t step = 0;
+        for (auto &o : probeOrigins)
+          step = std::gcd(step, std::abs(o[j] - probeOrigins[0][j]));
+        if (step > 1)
+          strides.insert(probeStrides[j] * step);
+      }
+      if (strides.size() == before)
+        break;
+    }
     SmallVector<int64_t> st(strides.begin(), strides.end());
     bool nests = numel % st[0] == 0;
     for (unsigned j = 1; j < st.size(); ++j)
       nests &= st[j - 1] % st[j] == 0;
-    if (!nests) {
-      if (withBuffer)
-        continue;
-      return store.emitError("furiosa: store strides do not nest: ") << show(rest[0]), failure();
-    }
+    if (!nests)
+      continue;
     unsigned nd = st.size();
     StoreSpace sp;
     sp.arg = arg;
@@ -927,7 +1088,7 @@ FailureOr<StoreSpace> Raiser::storeSpace(tt::StoreOp store) {
         sp.freeDims.push_back(j);
     // Linear axes and free dims take their origins from the constant; digits carry their own.
     bool ok = true;
-    for (auto [n, ev] : llvm::enumerate(evals)) {
+    for (auto [n, ev] : llvm::enumerate(act)) {
       SmallVector<int64_t> viewOrigin(nd, 0);
       int64_t c = constant[n];
       for (unsigned j = 0; j < nd; ++j) {
@@ -950,11 +1111,14 @@ FailureOr<StoreSpace> Raiser::storeSpace(tt::StoreOp store) {
       for (unsigned f : sp.freeDims)
         origin.push_back(viewOrigin[f]);
       sp.origin.push_back(origin);
+      if (attempt == 1)
+        probeOrigins.push_back(viewOrigin);
     }
+    if (attempt == 1)
+      probeStrides = st;
     if (!ok) {
-      if (withBuffer)
-        continue;
-      return store.emitError("furiosa: store origins do not fit the view"), failure();
+      why = "store origins do not fit the view";
+      continue;
     }
 
     // Enumerate every point: it must land where the view says, once.
@@ -965,8 +1129,8 @@ FailureOr<StoreSpace> Raiser::storeSpace(tt::StoreOp store) {
     for (int64_t d : shape)
       total *= d;
     SmallVector<int64_t> idx(rank), coord(nd);
-    std::string why;
-    for (auto [n, ev] : llvm::enumerate(evals)) {
+    why.clear();
+    for (auto [n, ev] : llvm::enumerate(act)) {
       const Sym *p = ev->get(store.getPtr());
       const Sym *m = store.getMask() ? ev->get(store.getMask()) : nullptr;
       if (store.getMask() && (!m || m->kind != Sym::Mask))
@@ -1013,17 +1177,19 @@ FailureOr<StoreSpace> Raiser::storeSpace(tt::StoreOp store) {
         break;
     }
     if (!why.empty()) {
-      if (withBuffer && why == "a store tile crosses a view boundary")
-        continue;
-      return store.emitError("furiosa: ") << why, failure();
+      if (why == "two stores of the grid write the same element")
+        return store.emitError("furiosa: ") << why, failure();
+      continue;
     }
     if (!count)
       return store.emitError("furiosa: the store never writes"), failure();
     int64_t volume = 1;
     for (unsigned j = 0; j < nd; ++j)
       volume *= sp.boxHi[j] - sp.boxLo[j] + 1;
-    if (volume != count)
-      return store.emitError("furiosa: the grid writes a non-rectangular region"), failure();
+    if (volume != count) {
+      why = "the grid writes a non-rectangular region";
+      continue;
+    }
     sp.full = (count == numel);
     // Tile phase per axis, for recovering origins from global indices.
     sp.extent.assign(rank, 0);
@@ -1038,7 +1204,7 @@ FailureOr<StoreSpace> Raiser::storeSpace(tt::StoreOp store) {
     }
     return sp;
   }
-  llvm_unreachable("the second view candidate always returns");
+  return store.emitError("furiosa: ") << why, failure();
 }
 
 /// The basis element k (a stored axis origin, or a free dim coordinate) as an expression of the
@@ -1074,7 +1240,7 @@ FailureOr<AffineExpr> Raiser::rewrite(Operation *at, const Gen &g, ArrayRef<Axis
   for (int pos : g.coordPos)
     viewToGen.push_back(pos >= 0 ? getAffineDimExpr(pos, ctx) : getAffineConstantExpr(0, ctx));
   SmallVector<AffineExpr> per;
-  for (auto [n, ev] : llvm::enumerate(evals)) {
+  for (auto [n, ev] : llvm::enumerate(act)) {
     const Sym *s = ev->get(v);
     if (!s)
       return at->emitError("furiosa: value is not symbolic in every instance"), failure();
@@ -1095,13 +1261,16 @@ FailureOr<AffineExpr> Raiser::rewrite(Operation *at, const Gen &g, ArrayRef<Axis
     SmallVector<AffineExpr> syms;
     for (unsigned l = 0; l < loopTrip.size(); ++l) {
       auto it = g.loopPos.find(l);
-      syms.push_back(it == g.loopPos.end() ? getAffineConstantExpr(0, ctx) : getAffineDimExpr(it->second, ctx));
+      if (it != g.loopPos.end())
+        syms.push_back(getAffineDimExpr(it->second, ctx));
+      else
+        syms.push_back(g.loopIv.count(l) ? getAffineSymbolExpr(l, ctx) : getAffineConstantExpr(0, ctx));
     }
     AffineExpr e = select(*s);
     for (unsigned l = 0; l < loopTrip.size(); ++l)
-      if (e.isFunctionOfSymbol(l) && !g.loopPos.count(l))
+      if (e.isFunctionOfSymbol(l) && !g.loopPos.count(l) && !g.loopIv.count(l))
         return at->emitError("furiosa: a loop counter is used outside its loop"), failure();
-    per.push_back(simplify(e.replaceDimsAndSymbols(dims, syms), nd, 0));
+    per.push_back(simplify(e.replaceDimsAndSymbols(dims, syms), nd, loopTrip.size()));
   }
   auto [rest0, c0] = splitConstant(per[0]);
   SmallVector<int64_t> consts;
@@ -1116,10 +1285,90 @@ FailureOr<AffineExpr> Raiser::rewrite(Operation *at, const Gen &g, ArrayRef<Axis
   if (same)
     return per[0];
 
-  auto fitted = fitOrigins(at, g, consts);
-  if (failed(fitted))
+  {
+    // Try quietly; the symbolic path below reports if both fail.
+    ScopedDiagnosticHandler quiet(ctx, [](Diagnostic &) { return success(); });
+    auto fitted = fitOrigins(at, g, consts);
+    if (succeeded(fitted))
+      return simplify(rest0 + *fitted, nd, loopTrip.size());
+  }
+  auto sym = rewriteSymbolic(at, g, env, select, v);
+  if (succeeded(sym))
+    return sym;
+  return fitOrigins(at, g, consts); // for its diagnostic
+}
+
+/// The same rewrite from the symbolic-pid evaluation: each program id is recovered from a tile origin
+/// that depends on it alone (origin = a * pid + c, so pid = (origin - c) floordiv a), which handles
+/// per-instance values that are not affine in the origins (pid floordiv 2, ...).
+FailureOr<AffineExpr> Raiser::rewriteSymbolic(Operation *at, const Gen &g, ArrayRef<Axis> env,
+                                              std::function<AffineExpr(const Sym &)> select, Value v) {
+  if (!symEval)
     return failure();
-  return simplify(rest0 + *fitted, nd, 0);
+  const Sym *s = symEval->get(v), *s0 = act[0]->get(v);
+  // Masks fold differently with constant program ids; only use shapes that line up.
+  if (!s || !s0 || s->kind != s0->kind || s->conds.size() != s0->conds.size())
+    return failure();
+  unsigned nd = g.extent.size(), nl = loopTrip.size(), nb = space->origin[0].size();
+  SmallVector<SmallVector<int64_t>> pids;
+  for (Evaluator *ev : act)
+    pids.push_back(SmallVector<int64_t>(ev->programId()));
+  // Each basis element (axis origin, free coordinate) as an affine function of the program ids.
+  SmallVector<SmallVector<int64_t>> basisOf;
+  for (unsigned k = 0; k < nb; ++k) {
+    SmallVector<int64_t> y;
+    for (auto &o : space->origin)
+      y.push_back(o[k]);
+    auto c = fitAffine(pids, y);
+    if (!c)
+      return failure();
+    basisOf.push_back(*c);
+  }
+  // Each program id from a basis element that depends on it alone.
+  SmallVector<AffineExpr> pidExpr(3);
+  for (unsigned d = 0; d < 3; ++d) {
+    if (llvm::all_of(pids, [&](auto &p) { return p[d] == pids[0][d]; })) {
+      pidExpr[d] = getAffineConstantExpr(pids[0][d], ctx);
+      continue;
+    }
+    for (unsigned k = 0; k < nb && !pidExpr[d]; ++k) {
+      bool alone = basisOf[k][d] != 0;
+      for (unsigned e = 0; e < 3; ++e)
+        alone &= e == d || basisOf[k][e] == 0;
+      AffineExpr o = alone ? originExpr(g, k) : AffineExpr();
+      if (o)
+        pidExpr[d] = (o - basisOf[k][3]).floorDiv(basisOf[k][d]);
+    }
+    if (!pidExpr[d])
+      return failure();
+  }
+  SmallVector<AffineExpr> viewToGen;
+  for (int pos : g.coordPos)
+    viewToGen.push_back(pos >= 0 ? getAffineDimExpr(pos, ctx) : getAffineConstantExpr(0, ctx));
+  SmallVector<AffineExpr> dims;
+  for (const Axis &a : env) {
+    if (a.kind == Axis::Store) {
+      AffineExpr origin = getAffineConstantExpr(basisOf[a.dim][3], ctx);
+      for (unsigned d = 0; d < 3; ++d)
+        origin = origin + pidExpr[d] * basisOf[a.dim][d];
+      dims.push_back(space->global[a.dim].replaceDims(viewToGen) - origin);
+    } else if (a.kind == Axis::Iter) {
+      dims.push_back(getAffineDimExpr(a.dim, ctx));
+    } else {
+      dims.push_back(getAffineConstantExpr(0, ctx));
+    }
+  }
+  SmallVector<AffineExpr> syms;
+  for (unsigned l = 0; l < nl; ++l) {
+    auto it = g.loopPos.find(l);
+    if (it != g.loopPos.end())
+      syms.push_back(getAffineDimExpr(it->second, ctx));
+    else
+      syms.push_back(g.loopIv.count(l) ? getAffineSymbolExpr(l, ctx) : getAffineConstantExpr(0, ctx));
+  }
+  for (unsigned d = 0; d < 3; ++d)
+    syms.push_back(pidExpr[d]);
+  return simplify(select(*s).replaceDimsAndSymbols(dims, syms), nd, nl);
 }
 
 /// consts[n] (one integer per instance) as beta + sum_k alpha_k * origin_k, with each origin rewritten
@@ -1129,7 +1378,7 @@ FailureOr<AffineExpr> Raiser::fitOrigins(Operation *at, const Gen &g, ArrayRef<i
   unsigned nb = space->origin[0].size(), nv = nb + 1;
   std::vector<std::vector<double>> a(nv, std::vector<double>(nv, 0.0));
   std::vector<double> rhs(nv, 0.0);
-  for (unsigned n = 0; n < evals.size(); ++n) {
+  for (unsigned n = 0; n < act.size(); ++n) {
     SmallVector<double> row;
     for (int64_t o : space->origin[n])
       row.push_back((double)o);
@@ -1167,14 +1416,24 @@ FailureOr<AffineExpr> Raiser::fitOrigins(Operation *at, const Gen &g, ArrayRef<i
   for (unsigned k = 0; k < nb; ++k)
     alpha.push_back(std::llround(x[k]));
   int64_t beta = std::llround(x[nb]);
-  for (unsigned n = 0; n < evals.size(); ++n) {
+  for (unsigned n = 0; n < act.size(); ++n) {
     int64_t val = beta;
     for (unsigned k = 0; k < nb; ++k)
       val += alpha[k] * space->origin[n][k];
-    if (val != consts[n])
+    if (val != consts[n]) {
+      std::string detail;
+      llvm::raw_string_ostream os(detail);
+      for (unsigned m = 0; m < std::min<unsigned>(act.size(), 4); ++m) {
+        os << " [" << consts[m] << " @";
+        for (int64_t o : space->origin[m])
+          os << " " << o;
+        os << "]";
+      }
       return at->emitError("furiosa: an address varies between program instances in a way the store "
-                           "tiles do not explain"),
+                           "tiles do not explain; constant @ origins:")
+                 << detail,
              failure();
+    }
   }
   AffineExpr out = getAffineConstantExpr(beta, ctx);
   for (unsigned k = 0; k < nb; ++k)
@@ -1205,6 +1464,8 @@ Value Raiser::exprValue(Gen &g, AffineExpr e) {
     return arith::ConstantIndexOp::create(ob, loc, c.getValue());
   if (auto d = dyn_cast<AffineDimExpr>(e))
     return index(g, d.getPosition());
+  if (auto sy = dyn_cast<AffineSymbolExpr>(e))
+    return g.loopIv.lookup(sy.getPosition());
   auto bin = cast<AffineBinaryOpExpr>(e);
   Value l = exprValue(g, bin.getLHS()), r = exprValue(g, bin.getRHS());
   switch (e.getKind()) {
@@ -1248,16 +1509,33 @@ Value Raiser::reshape(Value t, ArrayRef<int64_t> shape) {
                                          ArrayRef<ReassociationIndices>{all});
 }
 
-Value Raiser::flatOf(int arg) {
-  if (!flat.count(arg)) {
+Value Raiser::flatOf(Value version, int arg) {
+  Value &f = flat[version.getAsOpaquePointer()];
+  if (!f) {
     OpBuilder::InsertionGuard guard(b);
-    if (auto def = current[arg].getDefiningOp())
+    if (auto def = version.getDefiningOp())
       b.setInsertionPointAfter(def);
     else
-      b.setInsertionPointToStart(current[arg].getParentBlock());
-    flat[arg] = reshape(current[arg], {buffers[arg].numel()});
+      b.setInsertionPointToStart(version.getParentBlock());
+    f = reshape(version, {buffers[arg].numel()});
   }
-  return flat[arg];
+  return f;
+}
+
+/// The version of buffer `arg` a load reads: what the last store before it in program order left
+/// (within one program, a load sees its own earlier stores and none of the later ones).
+Value Raiser::versionAt(Operation *load, int arg) {
+  auto before = [&](Operation *a, Operation *b) {
+    for (Operation *x = a; x; x = x->getParentOp())
+      if (Operation *y = x->getBlock() ? x->getBlock()->findAncestorOpInBlock(*b) : nullptr)
+        return x != y && x->isBeforeInBlock(y);
+    return false;
+  };
+  Value v = args[arg];
+  for (auto &[st, a, after] : stores)
+    if (a == arg && before(st, load))
+      v = after;
+  return v;
 }
 
 Value Raiser::constantOf(Type t, Attribute a) {
@@ -1318,11 +1596,11 @@ FailureOr<Value> Raiser::emitSym(Gen &g, Value v, const Sym &s0, ArrayRef<Axis> 
 
 FailureOr<Value> Raiser::emitLoad(Gen &g, tt::LoadOp load, ArrayRef<Axis> env) {
   OpBuilder &ob = *g.ob;
-  const Sym *p0 = evals[0]->get(load.getPtr());
+  const Sym *p0 = act[0]->get(load.getPtr());
   if (!p0 || p0->kind != Sym::Ptr)
     return load.emitError("furiosa: load address is not a pointer expression"), failure();
   int arg = p0->base;
-  for (auto &ev : evals) {
+  for (Evaluator *ev : act) {
     const Sym *p = ev->get(load.getPtr());
     if (!p || p->base != arg || p->data.size() != p0->data.size())
       return load.emitError("furiosa: load base differs between program instances"), failure();
@@ -1330,20 +1608,22 @@ FailureOr<Value> Raiser::emitLoad(Gen &g, tt::LoadOp load, ArrayRef<Axis> env) {
   auto addr = rewrite(load, g, env, [](const Sym &s) { return s.expr; }, load.getPtr());
   if (failed(addr))
     return failure();
-  SmallVector<Interval> ranges;
+  SmallVector<Interval> ranges, symRanges;
   for (unsigned d = 0; d < g.extent.size(); ++d)
     ranges.push_back({g.lo[d], g.lo[d] + g.extent[d] - 1});
+  for (int64_t trip : loopTrip)
+    symRanges.push_back({0, std::max<int64_t>(trip - 1, 0)});
 
   Value on;
   if (load.getMask()) {
-    const Sym *m0 = evals[0]->get(load.getMask());
+    const Sym *m0 = act[0]->get(load.getMask());
     if (!m0 || m0->kind != Sym::Mask)
       return load.emitError("furiosa: load mask is not an index predicate"), failure();
     for (unsigned c = 0; c < m0->conds.size(); ++c) {
       auto e = rewrite(load, g, env, [c](const Sym &s) { return s.conds[c]; }, load.getMask());
       if (failed(e))
         return failure();
-      if (bounds(*e, ranges).lo >= 0)
+      if (bounds(*e, ranges, symRanges).lo >= 0)
         continue; // the iteration domain already guarantees it
       Value ok = arith::CmpIOp::create(ob, loc, arith::CmpIPredicate::sge, exprValue(g, *e),
                                           arith::ConstantIndexOp::create(ob, loc, 0));
@@ -1358,10 +1638,11 @@ FailureOr<Value> Raiser::emitLoad(Gen &g, tt::LoadOp load, ArrayRef<Axis> env) {
   auto data = emitDataTerms(g, *p0, env);
   if (failed(data))
     return failure();
-  Interval range = bounds(*addr, ranges);
+  Interval range = bounds(*addr, ranges, symRanges);
   bool mayLeave = *data || range.lo < 0 || range.hi >= numel;
   // A load in an iteration that a shorter trip masks off may be clamped: its value is discarded.
-  bool guarded = llvm::any_of(g.loopPos, [&](auto kv) { return varTrip[kv.first]; });
+  bool guarded = llvm::any_of(g.loopPos, [&](auto kv) { return varTrip[kv.first]; }) ||
+                 llvm::any_of(g.loopIv, [&](auto kv) { return varTrip[kv.first]; });
   if (*data)
     i = arith::AddIOp::create(ob, loc, i, *data);
   if (mayLeave) {
@@ -1370,7 +1651,7 @@ FailureOr<Value> Raiser::emitLoad(Gen &g, tt::LoadOp load, ArrayRef<Axis> env) {
     i = arith::MaxSIOp::create(ob, loc, i, arith::ConstantIndexOp::create(ob, loc, 0));
     i = arith::MinSIOp::create(ob, loc, i, arith::ConstantIndexOp::create(ob, loc, numel - 1));
   }
-  Value src = flatOf(arg);
+  Value src = flatOf(versionAt(load, arg), arg);
   Value elem = tensor::ExtractOp::create(ob, loc, src, ValueRange{i});
   if (on) {
     Attribute otherAttr;
@@ -1436,10 +1717,18 @@ FailureOr<Value> Raiser::emit(Gen &g, Value v, ArrayRef<Axis> env) {
     return it->second;
   FailureOr<Value> out = failure();
   Operation *def = v.getDefiningOp();
-  if (const Sym *s = evals[0]->get(v)) {
+  if (const Sym *s = act[0]->get(v)) {
     out = emitSym(g, v, *s, env);
+  } else if (auto it = g.state.find(v.getAsOpaquePointer()); it != g.state.end()) {
+    SmallVector<Value> idx;
+    for (int d : it->second.second) {
+      if (d < 0)
+        return kernel.emitError("furiosa: internal: loop state read without its dims"), failure();
+      idx.push_back(linalg::IndexOp::create(*g.ob, loc, d));
+    }
+    out = tensor::ExtractOp::create(*g.ob, loc, it->second.first, idx).getResult();
   } else if (!def) {
-    return kernel.emitError("furiosa: a loop-carried value is used outside an accumulation"), failure();
+    return kernel.emitError("furiosa: a loop-carried value is used outside its loop"), failure();
   } else if (auto c = dyn_cast<arith::ConstantOp>(def)) {
     OpBuilder::InsertionGuard guard(b);
     b.setInsertionPoint(g.ob->getInsertionBlock(), g.ob->getInsertionPoint());
@@ -1463,6 +1752,14 @@ FailureOr<Value> Raiser::emit(Gen &g, Value v, ArrayRef<Axis> env) {
     out = emit(g, t.getSrc(), senv);
   } else if (auto load = dyn_cast<tt::LoadOp>(def)) {
     out = emitLoad(g, load, env);
+  } else if (auto branch = dyn_cast<scf::IfOp>(def)) {
+    // The partition's instances all take the same branch: follow its yield.
+    bool then = act[0]->taken.lookup(branch);
+    if (llvm::any_of(act, [&](Evaluator *ev) { return ev->taken.lookup(branch) != then; }))
+      return branch.emitError("furiosa: internal: instances of one partition branch differently"), failure();
+    Region &region = then ? branch.getThenRegion() : branch.getElseRegion();
+    auto yield = cast<scf::YieldOp>(region.front().getTerminator());
+    out = emit(g, yield.getOperand(cast<OpResult>(v).getResultNumber()), env);
   } else if (isa<tt::ReduceOp, tt::DotOp, scf::ForOp>(def)) {
     out = materialize(g, v, env);
   } else if (isElementwise(def)) {
@@ -1508,6 +1805,13 @@ Raiser::buildGeneric(Gen &parent, ArrayRef<unsigned> parentDims, ArrayRef<int64_
         g.loopPos[l] = remap[pos];
     for (auto [l, own] : loopDims)
       g.loopPos[l] = np + own;
+    g.loopIv = parent.loopIv;
+    for (auto &[k, st] : parent.state) {
+      SmallVector<int> dims;
+      for (int d : st.second)
+        dims.push_back(d >= 0 ? remap[d] : -1);
+      g.state[k] = {st.first, dims};
+    }
 
     SmallVector<int64_t> outShape;
     for (unsigned d = 0; d < np; ++d)
@@ -1732,7 +2036,7 @@ FailureOr<Value> Raiser::materialize(Gen &g, Value v, ArrayRef<Axis> env) {
       if (inner && inner->getParentOp() == cur.getOperation()) {
         unsigned r = cast<OpResult>(next).getResultNumber();
         if (inner.getInitArgs()[r] != iter || !iter.hasOneUse())
-          return cur.emitError("furiosa: the loop carries state other than an accumulation"), failure();
+          return materializeState(g, loop, i, env);
         cur = inner;
         idx = r;
         continue;
@@ -1740,7 +2044,7 @@ FailureOr<Value> Raiser::materialize(Gen &g, Value v, ArrayRef<Axis> env) {
       upd = next.getDefiningOp();
       if (!upd || upd->getParentOp() != cur.getOperation() || !iter.hasOneUse() ||
           iter.getUses().begin()->getOwner() != upd)
-        return cur.emitError("furiosa: the loop carries state other than an accumulation"), failure();
+        return materializeState(g, loop, i, env);
       break;
     }
     auto initFn = [&](Gen &gi, ArrayRef<int> remap) { return emit(gi, init, remapEnv(env, remap)); };
@@ -1751,7 +2055,7 @@ FailureOr<Value> Raiser::materialize(Gen &g, Value v, ArrayRef<Axis> env) {
         if (!varTrip[id])
           continue;
         SmallVector<int64_t> trips;
-        for (auto &ev : evals)
+        for (Evaluator *ev : act)
           trips.push_back(ev->trips.lookup(id));
         auto trip = fitOrigins(loop, gg, trips);
         if (failed(trip))
@@ -1801,7 +2105,7 @@ FailureOr<Value> Raiser::materialize(Gen &g, Value v, ArrayRef<Axis> env) {
             return guard(gg, acc, gg.ob->create(state)->getResult(0));
           });
     } else {
-      return upd->emitError("furiosa: the loop carries state other than an accumulation"), failure();
+      return materializeState(g, loop, i, env);
     }
   }
   if (failed(built))
@@ -1813,6 +2117,233 @@ FailureOr<Value> Raiser::materialize(Gen &g, Value v, ArrayRef<Axis> env) {
     idx.push_back(i);
   }
   return tensor::ExtractOp::create(*g.ob, loc, tensor, idx).getResult();
+}
+
+/// A tensor over every dim of `parent` (all parallel), computed by `fn` at each point.
+FailureOr<Value> Raiser::parallelGeneric(Gen &parent, Type elem, std::function<FailureOr<Value>(Gen &)> fn) {
+  OpBuilder::InsertionGuard guard(b);
+  b.setInsertionPoint(parent.anchor);
+  Operation *anchor = arith::ConstantIndexOp::create(b, loc, 0);
+  llvm::scope_exit dropAnchor([&] { anchor->erase(); });
+  Gen g;
+  g.coordPos = parent.coordPos;
+  g.lo = parent.lo;
+  g.extent = parent.extent;
+  g.loopPos = parent.loopPos;
+  g.loopIv = parent.loopIv;
+  g.state = parent.state;
+  g.anchor = anchor;
+  unsigned nd = g.extent.size();
+  Value empty = tensor::EmptyOp::create(b, loc, g.extent, elem);
+  LogicalResult status = success();
+  auto op = linalg::GenericOp::create(
+      b, loc, TypeRange{empty.getType()}, ValueRange{}, ValueRange{empty},
+      ArrayRef<AffineMap>{AffineMap::getMultiDimIdentityMap(nd, ctx)},
+      SmallVector<utils::IteratorType>(nd, utils::IteratorType::parallel), [&](OpBuilder &ob, Location, ValueRange) {
+        g.ob = &ob;
+        g.index.assign(nd, Value());
+        auto v = fn(g);
+        if (failed(v)) {
+          status = failure();
+          linalg::YieldOp::create(ob, loc, ValueRange{arith::ConstantOp::create(ob, loc, ob.getZeroAttr(elem))});
+          return;
+        }
+        linalg::YieldOp::create(ob, loc, ValueRange{*v});
+      });
+  if (failed(status))
+    return failure();
+  return op.getResult(0);
+}
+
+/// Bindings of every data iter arg of `loop`, from the binding `env` of result `result`: axes are
+/// unified through the body (elementwise, broadcast, expand_dims, trans, reduce, dot) and through
+/// init = iter arg = yield = result.
+FailureOr<SmallVector<SmallVector<Axis>>> Raiser::stateEnvs(scf::ForOp loop, unsigned result, ArrayRef<Axis> env) {
+  std::map<std::pair<void *, unsigned>, int> ids;
+  SmallVector<int> parent;
+  SmallVector<std::optional<Axis>> bound;
+  auto node = [&](Value v, unsigned axis) {
+    auto key = std::make_pair(v.getAsOpaquePointer(), axis);
+    auto [it, fresh] = ids.insert({key, (int)parent.size()});
+    if (fresh) {
+      parent.push_back(parent.size());
+      bound.push_back(std::nullopt);
+    }
+    return it->second;
+  };
+  std::function<int(int)> find = [&](int x) { return parent[x] == x ? x : parent[x] = find(parent[x]); };
+  bool conflict = false;
+  auto unite = [&](Value a, unsigned ax, Value c, unsigned cx) {
+    int x = find(node(a, ax)), y = find(node(c, cx));
+    if (x == y)
+      return;
+    if (bound[x] && bound[y] && (bound[x]->kind != bound[y]->kind || bound[x]->dim != bound[y]->dim))
+      conflict = true;
+    parent[y] = x;
+    if (!bound[x])
+      bound[x] = bound[y];
+  };
+  auto rank = [](Value v) { return (unsigned)shapeOf(v.getType()).size(); };
+  auto dim = [](Value v, unsigned k) { return shapeOf(v.getType())[k]; };
+  auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+  for (unsigned j = 0; j < loop.getNumRegionIterArgs(); ++j)
+    for (unsigned k = 0; k < rank(loop.getRegionIterArgs()[j]); ++k) {
+      unite(loop.getRegionIterArgs()[j], k, yield.getOperand(j), k);
+      unite(loop.getRegionIterArgs()[j], k, loop.getResult(j), k);
+    }
+  loop.getBody()->walk([&](Operation *op) {
+    if (op->getNumResults() != 1 || !isa<RankedTensorType>(op->getResult(0).getType()))
+      return;
+    Value r = op->getResult(0);
+    if (auto br = dyn_cast<tt::BroadcastOp>(op)) {
+      for (unsigned k = 0; k < rank(r); ++k)
+        if (dim(br.getSrc(), k) == dim(r, k))
+          unite(r, k, br.getSrc(), k);
+    } else if (auto e = dyn_cast<tt::ExpandDimsOp>(op)) {
+      for (unsigned k = 0; k < rank(r); ++k)
+        if (k != e.getAxis())
+          unite(r, k, e.getSrc(), k < e.getAxis() ? k : k - 1);
+    } else if (auto t = dyn_cast<tt::TransOp>(op)) {
+      for (auto [k, o] : llvm::enumerate(t.getOrder()))
+        unite(r, k, t.getSrc(), o);
+    } else if (auto red = dyn_cast<tt::ReduceOp>(op)) {
+      for (unsigned k = 0; k < rank(r); ++k)
+        unite(r, k, red.getOperand(0), k < red.getAxis() ? k : k + 1);
+    } else if (auto d = dyn_cast<tt::DotOp>(op)) {
+      unite(r, 0, d.getA(), 0);
+      unite(r, 1, d.getB(), 1);
+      unite(r, 0, d.getC(), 0);
+      unite(r, 1, d.getC(), 1);
+      unite(d.getA(), 1, d.getB(), 0);
+    } else if (isElementwise(op) || isa<arith::SelectOp, arith::CmpFOp, arith::CmpIOp>(op)) {
+      for (Value o : op->getOperands())
+        if (rank(o) == rank(r))
+          for (unsigned k = 0; k < rank(r); ++k)
+            if (dim(o, k) == dim(r, k))
+              unite(r, k, o, k);
+    }
+  });
+  for (auto [k, a] : llvm::enumerate(env))
+    if (a.kind != Axis::Unit) {
+      int x = find(node(loop.getResult(result), k));
+      if (bound[x] && (bound[x]->kind != a.kind || bound[x]->dim != a.dim))
+        conflict = true;
+      bound[x] = a;
+    }
+  if (conflict)
+    return loop.emitError("furiosa: loop state axes bind to two different output coordinates"), failure();
+  SmallVector<SmallVector<Axis>> envs;
+  for (Value arg : loop.getRegionIterArgs()) {
+    SmallVector<Axis> e;
+    for (unsigned k = 0; k < rank(arg); ++k) {
+      if (dim(arg, k) == 1) {
+        e.push_back(Axis{});
+        continue;
+      }
+      auto b = bound[find(node(arg, k))];
+      if (!b)
+        return loop.emitError("furiosa: a loop state axis does not relate to the output coordinates"), failure();
+      e.push_back(*b);
+    }
+    envs.push_back(e);
+  }
+  return envs;
+}
+
+/// A loop whose iter args carry state other than an accumulation, kept as scf.for over its trip count:
+/// each state is a tensor over every dim of the consumer, and each iteration computes the next states
+/// as parallel generics. Instances with a shorter trip keep their state unchanged.
+FailureOr<Value> Raiser::materializeState(Gen &g, scf::ForOp loop, unsigned result, ArrayRef<Axis> env) {
+  auto extractAll = [&](Value t) {
+    SmallVector<Value> idx;
+    for (unsigned d = 0; d < g.extent.size(); ++d)
+      idx.push_back(linalg::IndexOp::create(*g.ob, loc, d));
+    return tensor::ExtractOp::create(*g.ob, loc, t, idx).getResult();
+  };
+  auto key = std::make_pair(loop.getOperation(), g.anchor);
+  if (auto it = keptLoops.find(key); it != keptLoops.end())
+    return extractAll(it->second[result]);
+  auto envs = stateEnvs(loop, result, env);
+  if (failed(envs))
+    return failure();
+  unsigned id = loopIds.lookup(loop);
+  SmallVector<unsigned> dataArgs;
+  for (auto [j, arg] : llvm::enumerate(loop.getRegionIterArgs()))
+    if (!act[0]->get(arg))
+      dataArgs.push_back(j);
+  if (!llvm::is_contained(dataArgs, result))
+    return loop.emitError("furiosa: internal: an index loop result used as data"), failure();
+  SmallVector<int> allDims;
+  for (unsigned d = 0; d < g.extent.size(); ++d)
+    allDims.push_back(d);
+
+  SmallVector<Value> inits;
+  for (unsigned j : dataArgs) {
+    auto init = parallelGeneric(g, getElementTypeOrSelf(loop.getInitArgs()[j].getType()),
+                                [&](Gen &gg) { return emit(gg, loop.getInitArgs()[j], (*envs)[j]); });
+    if (failed(init))
+      return failure();
+    inits.push_back(*init);
+  }
+  // Bodies share one builder with `b`, so the loop is built under a guard that ends before the
+  // consumer reads it.
+  LogicalResult status = success();
+  scf::ForOp forOp;
+  {
+  OpBuilder::InsertionGuard guard(b);
+  b.setInsertionPoint(g.anchor);
+  Value lb = arith::ConstantIndexOp::create(b, loc, 0), ub = arith::ConstantIndexOp::create(b, loc, loopTrip[id]),
+        one = arith::ConstantIndexOp::create(b, loc, 1);
+  forOp = scf::ForOp::create(b, loc, lb, ub, one, inits, [&](OpBuilder &nb, Location, Value iv, ValueRange args) {
+    Operation *anchor = arith::ConstantIndexOp::create(nb, loc, 0);
+    Gen gl;
+    gl.coordPos = g.coordPos;
+    gl.lo = g.lo;
+    gl.extent = g.extent;
+    gl.loopPos = g.loopPos;
+    gl.loopIv = g.loopIv;
+    gl.loopIv[id] = iv;
+    gl.state = g.state;
+    for (auto [k, j] : llvm::enumerate(dataArgs))
+      gl.state[loop.getRegionIterArgs()[j].getAsOpaquePointer()] = {args[k], allDims};
+    gl.anchor = anchor;
+    auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+    SmallVector<Value> next;
+    for (auto [k, j] : llvm::enumerate(dataArgs)) {
+      auto v = parallelGeneric(gl, getElementTypeOrSelf(yield.getOperand(j).getType()), [&](Gen &gg) -> FailureOr<Value> {
+        auto n = emit(gg, yield.getOperand(j), (*envs)[j]);
+        if (failed(n) || !varTrip[id])
+          return n;
+        SmallVector<int64_t> trips;
+        for (Evaluator *ev : act)
+          trips.push_back(ev->trips.lookup(id));
+        auto trip = fitOrigins(loop, gg, trips);
+        if (failed(trip))
+          return failure();
+        Value active = arith::CmpIOp::create(*gg.ob, loc, arith::CmpIPredicate::slt, iv, exprValue(gg, *trip));
+        auto old = emit(gg, loop.getRegionIterArgs()[j], (*envs)[j]);
+        if (failed(old))
+          return failure();
+        return arith::SelectOp::create(*gg.ob, loc, active, *n, *old).getResult();
+      });
+      if (failed(v)) {
+        status = failure();
+        next.push_back(args[k]);
+        continue;
+      }
+      next.push_back(*v);
+    }
+    scf::YieldOp::create(nb, loc, next);
+    anchor->erase();
+  });
+  }
+  if (failed(status))
+    return failure();
+  SmallVector<Value> results(loop.getNumResults());
+  for (auto [k, j] : llvm::enumerate(dataArgs))
+    results[j] = forOp.getResult(k);
+  keptLoops[key] = results;
+  return extractAll(results[result]);
 }
 
 LogicalResult Raiser::raiseStore(tt::StoreOp store) {
@@ -1879,7 +2410,7 @@ LogicalResult Raiser::raiseStore(tt::StoreOp store) {
                                                              getAsIndexOpFoldResult(ctx, SmallVector<int64_t>(nd, 1)))
                                  .getResult();
   current[arg] = reshape(updated, buffers[arg].shape);
-  flat.erase(arg);
+  stores.push_back({store.getOperation(), arg, current[arg]});
   anchor->erase();
   space = nullptr;
   return success();
@@ -1892,27 +2423,37 @@ LogicalResult Raiser::run() {
   SmallVector<Type> argTypes;
   for (auto &[i, buf] : buffers)
     argTypes.push_back(RankedTensorType::get(buf.shape, buf.elem));
-  // Stores, in program order, decide the results.
+  // Stores, in program order, decide the results. The instances that run a store are split by their
+  // control path and the buffer they write; each part is raised on its own.
   SmallVector<tt::StoreOp> stores;
-  for (Operation &op : kernel.getBody().front())
+  bool atomics = false;
+  kernel.walk([&](Operation *op) {
     if (auto s = dyn_cast<tt::StoreOp>(op))
       stores.push_back(s);
-  bool nested = false;
-  kernel.walk([&](tt::StoreOp s) { nested |= s->getParentOp() != kernel.getOperation(); });
-  if (nested)
-    return kernel.emitError("furiosa: stores inside loops or branches are not raised yet");
-  kernel.walk([&](Operation *op) {
-    if (isa<tt::AtomicRMWOp, tt::AtomicCASOp>(op))
-      nested = true;
+    atomics |= isa<tt::AtomicRMWOp, tt::AtomicCASOp>(op);
   });
-  if (nested)
+  if (atomics)
     return kernel.emitError("furiosa: atomics are not raised");
+  SmallVector<Operation *> branches;
+  kernel.walk([&](scf::IfOp i) { branches.push_back(i); });
+  std::vector<std::pair<tt::StoreOp, SmallVector<Evaluator *>>> parts;
   std::set<int> writtenSet;
-  for (tt::StoreOp s : stores) {
-    const Sym *p = evals[0]->get(s.getPtr());
-    if (!p || p->kind != Sym::Ptr)
-      return s.emitError("furiosa: store address is not a pointer expression");
-    writtenSet.insert(p->base);
+  for (tt::StoreOp st : stores) {
+    std::map<std::pair<int, std::vector<int>>, SmallVector<Evaluator *>> byKey;
+    for (auto &ev : evals) {
+      if (!ev->executed.count(st))
+        continue;
+      const Sym *p = ev->get(st.getPtr());
+      if (!p || p->kind != Sym::Ptr)
+        return st.emitError("furiosa: store address is not a pointer expression");
+      std::vector<int> path;
+      for (Operation *br : branches)
+        path.push_back(ev->taken.count(br) ? (int)ev->taken.lookup(br) : -1);
+      byKey[{p->base, path}].push_back(ev.get());
+      writtenSet.insert(p->base);
+    }
+    for (auto &[key, instances] : byKey)
+      parts.push_back({st, instances});
   }
   SmallVector<Type> resultTypes;
   for (int w : writtenSet)
@@ -1920,13 +2461,17 @@ LogicalResult Raiser::run() {
   auto func = func::FuncOp::create(b, loc, kernel.getName(), b.getFunctionType(argTypes, resultTypes));
   Block *entry = func.addEntryBlock();
   b.setInsertionPointToStart(entry);
-  for (auto [i, arg] : llvm::enumerate(entry->getArguments()))
+  for (auto [i, arg] : llvm::enumerate(entry->getArguments())) {
     current[i] = arg;
-  for (tt::StoreOp s : stores)
-    if (failed(raiseStore(s))) {
+    args.push_back(arg);
+  }
+  for (auto &[st, instances] : parts) {
+    act = instances;
+    if (failed(raiseStore(st))) {
       func.erase();
       return failure();
     }
+  }
   SmallVector<Value> results;
   SmallVector<int64_t> written;
   for (int w : writtenSet) {
@@ -1935,8 +2480,21 @@ LogicalResult Raiser::run() {
   }
   func::ReturnOp::create(b, loc, results);
   func->setAttr("furiosa.written", b.getI64ArrayAttr(written));
-  if (failed(verify(func)))
-    return kernel.emitError("furiosa: internal error: the raised function does not verify");
+  std::string why;
+  bool invalid;
+  {
+    // Collect the verifier's messages into the one diagnostic this pass reports.
+    ScopedDiagnosticHandler capture(ctx, [&](Diagnostic &d) {
+      why += " | " + d.str();
+      return success();
+    });
+    invalid = failed(verify(func));
+  }
+  if (invalid) {
+    if (std::getenv("FURIOSA_DEBUG"))
+      func.print(llvm::errs());
+    return kernel.emitError("furiosa: internal error: the raised function does not verify") << why;
+  }
   kernel.erase();
   return success();
 }
