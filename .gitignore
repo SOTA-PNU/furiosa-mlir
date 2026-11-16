@@ -66,3 +66,18 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local tools (cargo-furiosa-opt) and harness outputs
+.tools/
+harness/golden/
+harness/out/
+target/
+
+# Compiler build
+compiler/.venv/

@@ -1,0 +1,26 @@
+[project]
+name = "furiosa-mlir"
+version = "0.1.0"
+description = "Models written in pure Triton, and their Triton-dialect MLIR, as workloads for the Furiosa MLIR stack"
+requires-python = ">=3.12"
+# Model files and scripts/dump_mlir.py need nothing but Triton.
+dependencies = ["triton==3.9.0"]
+
+[dependency-groups]
+# GPU verification only: Triton's launcher allocates and streams through torch, and the tests
+# compare against torchvision / transformers.
+dev = [
+    "pytest",
+    "torch==2.15.0",
+    "torchvision",
+    "transformers",
+    "safetensors",
+    "huggingface_hub",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]

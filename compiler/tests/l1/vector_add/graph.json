@@ -1,0 +1,60 @@
+{
+  "model": "harness/cases/vector_add.py",
+  "kernels": {
+    "add_kernel_0": {
+      "kernel": "add_kernel",
+      "pointer_args": [
+        "x_ptr",
+        "y_ptr",
+        "out_ptr"
+      ],
+      "written": [
+        2
+      ],
+      "linalg": "kernels/add_kernel_0/linalg.mlir"
+    }
+  },
+  "graphs": [
+    {
+      "name": "vector_add",
+      "buffers": {
+        "x": {
+          "kind": "input",
+          "dtype": "fp32",
+          "shape": [
+            2048
+          ]
+        },
+        "y": {
+          "kind": "input",
+          "dtype": "fp32",
+          "shape": [
+            2048
+          ]
+        },
+        "out": {
+          "kind": "output",
+          "dtype": "fp32",
+          "shape": [
+            2048
+          ]
+        }
+      },
+      "launches": [
+        {
+          "kernel": "add_kernel_0",
+          "args": [
+            "x",
+            "y",
+            "out"
+          ],
+          "grid": [
+            4,
+            1,
+            1
+          ]
+        }
+      ]
+    }
+  ]
+}

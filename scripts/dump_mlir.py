@@ -50,9 +50,11 @@ def load_model(path: Path):
 def specialize(launch, backend):
     """The (options, signature, constexprs, attrs) Triton's JIT would compile ``launch`` with."""
     fn = launch.kernel
+    # As in Triton, a kernel parameter shadows a launch option of the same name (e.g. num_stages).
+    launch_options = {k: v for k, v in launch.options.items() if k not in launch.args}
     binder = create_function_from_signature(fn.signature, fn.params, backend)
-    bound, specialization, options = binder(**launch.args, **launch.options)
-    return fn._pack_args(backend, launch.options, bound, specialization, options)
+    bound, specialization, options = binder(**launch.args, **launch_options)
+    return fn._pack_args(backend, launch_options, bound, specialization, options)
 
 
 def split_ttir(text: str, symbol: str, kernel_name: str):
@@ -130,6 +132,7 @@ def main():
             ]
             header.append(f"//     {i:4d}  @{next(it)}  grid={launch.grid}  {' '.join(runtime)}")
 
+    out.parent.mkdir(parents=True, exist_ok=True)
     text = "\n".join(header + aliases_before + ["module {"] + [line for f in funcs for line in f] + ["}"] + aliases_after) + "\n"
     out.write_text(text)
 
