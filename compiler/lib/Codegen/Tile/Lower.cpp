@@ -479,14 +479,21 @@ LogicalResult Lowering::planLayout() {
   if (c % 2)
     return fail("an odd column count " + std::to_string(c) + " (DMA rows are 8-byte units)");
   if (gemm) {
+    // The inner K axis: one the stream operand reads alone in a dim (preferably its contiguous last dim, else the
+    // largest), so it moves as a whole in each tap's DMA; every other K axis is a tap.
     const Read &s = p.reads[gemm->stream];
-    for (unsigned a : gemm->k) {
-      const Lin &last = s.index.back();
-      if (!kl.inner && last.terms.size() == 1 && last.terms[0].first == a && last.terms[0].second == 1)
+    auto alone = [&](unsigned a, const Lin &l) { return l.terms.size() == 1 && l.terms[0].first == a; };
+    for (unsigned a : gemm->k)
+      if (alone(a, s.index.back()) && s.index.back().terms[0].second == 1)
         kl.inner = a;
-      else
+    if (!kl.inner)
+      for (unsigned a : gemm->k)
+        if (llvm::any_of(s.index, [&](const Lin &l) { return alone(a, l); }) &&
+            (!kl.inner || p.axes[a].size > p.axes[*kl.inner].size))
+          kl.inner = a;
+    for (unsigned a : gemm->k)
+      if (!kl.inner || a != *kl.inner)
         kl.taps.push_back(a);
-    }
     int64_t t = 1;
     for (unsigned a : kl.taps)
       t *= p.axes[a].size;
@@ -758,6 +765,21 @@ FailureOr<Value> Lowering::materialize(const Read &r, ArrayRef<unsigned> rowAxes
   auto isTap = [&](unsigned a) { return llvm::is_contained(taps, a); };
   std::optional<unsigned> innerAxis = k ? k->inner : std::nullopt;
   int64_t innerSize = innerAxis ? p.axes[*innerAxis].size : 1;
+  // Taps that are each alone in a buffer dim (no window: a weight's kernel position) move in one DMA as axes of
+  // their own, then into the padded K layout in a second one, instead of one DMA per tap.
+  SmallVector<unsigned> peeled;
+  bool windowFree = !taps.empty() && llvm::all_of(taps, [&](unsigned a) {
+    int dims = 0;
+    for (const Lin &l : r.index)
+      if (l.uses(a)) {
+        if (l.terms.size() != 1)
+          return false;
+        ++dims;
+      }
+    return dims == 1;
+  });
+  if (windowFree)
+    std::swap(peeled, taps);
 
   // Per dim: the low padding, the extent (every tap's window inside, divisible by its coefficients) and the
   // terms that are not taps, by decreasing coefficient.
@@ -870,7 +892,18 @@ FailureOr<Value> Lowering::materialize(const Read &r, ArrayRef<unsigned> rowAxes
     dstParts.push_back(extentOf(a) > p.axes[a].size ? m.padTo(extentOf(a)) : m);
   }
   MapAttr tq;
-  if (k) {
+  MapAttr innerExpr; // the inner axis as the source names it
+  for (auto &ds : dig)
+    for (auto &g : ds)
+      if (g.axis && innerAxis && *g.axis == *innerAxis)
+        innerExpr = g.expr;
+  SmallVector<MapAttr> rowParts(dstParts);
+  if (k && windowFree) {
+    for (unsigned a : peeled)
+      dstParts.push_back(named.at(a));
+    if (innerExpr)
+      dstParts.push_back(innerExpr);
+  } else if (k) {
     if (k->tapPad > 1) {
       tq = kb.axis(tag + "TQ", k->tapPad);
       dstParts.push_back(tq);
@@ -882,19 +915,12 @@ FailureOr<Value> Lowering::materialize(const Read &r, ArrayRef<unsigned> rowAxes
   int64_t numTaps = 1;
   for (unsigned a : taps)
     numTaps *= p.axes[a].size;
-  if (k && (k->tapPad > numTaps || k->innerPad > innerSize))
+  if (k && !windowFree && (k->tapPad > numTaps || k->innerPad > innerSize))
     fill(dst, 0.0);
 
-  for (int64_t t = 0; t < numTaps; ++t) {
-    std::map<unsigned, int64_t> at;
-    int64_t rest = t;
-    for (int i = taps.size() - 1; i >= 0; --i) {
-      at[taps[i]] = rest % p.axes[taps[i]].size;
-      rest /= p.axes[taps[i]].size;
-    }
-    Value s = reshapeView(view(source, false), pairOf(srcParts));
-    SmallVector<MapAttr> cur(srcParts);
-    unsigned pos = 0;
+  // Every tap's view starts (one per source digit) and its index into the taps axis.
+  auto startsOf = [&](std::map<unsigned, int64_t> &at, SmallVector<int64_t> &st, int64_t &index) -> LogicalResult {
+    st.clear();
     for (unsigned j = 0; j < nd; ++j) {
       if (extent[j] == 1)
         continue;
@@ -909,29 +935,171 @@ FailureOr<Value> Lowering::materialize(const Read &r, ArrayRef<unsigned> rowAxes
         int64_t len = !g.axis ? 1 : (innerAxis && *g.axis == *innerAxis) ? innerSize : p.axes[*g.axis].size;
         if (start + len > g.radix)
           return fail("a window that carries across digits");
-        if (!(start == 0 && len == g.radix)) {
-          cur[pos] = len == 1 ? kb.one().padTo(g.radix) : g.expr.resize(len).padTo(g.radix);
-          s = tileView(s, g.expr, len, start, pairOf(cur));
-        }
-        ++pos;
+        st.push_back(start);
       }
     }
+    index = 0;
+    for (unsigned a : taps)
+      index = index * p.axes[a].size + at[a];
+    return success();
+  };
+  SmallVector<int64_t> lens, radix;
+  for (auto &ds : dig)
+    for (auto &g : ds) {
+      lens.push_back(!g.axis ? 1 : (innerAxis && *g.axis == *innerAxis) ? innerSize : p.axes[*g.axis].size);
+      radix.push_back(g.radix);
+    }
+  // The taps split into classes (a residue of each tap axis modulo its period) in which every start is affine in
+  // the quotients; each class is one nest of kept loops around a single DMA (unrolled DMAs cost the NPU compiler
+  // superlinearly). A stride-s window has period s on its tap axis; a stride-1 window period 1.
+  auto affineClass = [&](unsigned axis, int64_t m) -> bool {
+    int64_t n = p.axes[axis].size;
+    for (int64_t rr = 0; rr < m; ++rr) {
+      std::map<unsigned, int64_t> at;
+      SmallVector<int64_t> s0, s1, sq;
+      int64_t i0, i1, iq;
+      at[axis] = rr;
+      if (failed(startsOf(at, s0, i0)))
+        return false;
+      if (rr + m >= n)
+        continue;
+      at[axis] = rr + m;
+      if (failed(startsOf(at, s1, i1)))
+        return false;
+      for (int64_t v = rr + 2 * m; v < n; v += m) {
+        at[axis] = v;
+        if (failed(startsOf(at, sq, iq)))
+          return false;
+        int64_t q = (v - rr) / m;
+        for (unsigned x = 0; x < s0.size(); ++x)
+          if (sq[x] != s0[x] + q * (s1[x] - s0[x]))
+            return false;
+        if (iq != i0 + q * (i1 - i0))
+          return false;
+      }
+    }
+    return true;
+  };
+  SmallVector<int64_t> period;
+  for (unsigned a : taps) {
+    int64_t m = 1;
+    while (m < p.axes[a].size && !affineClass(a, m))
+      ++m;
+    period.push_back(m);
+  }
+  // Class combinations: residues per tap axis, mixed radix.
+  int64_t numClasses = 1;
+  for (int64_t m : period)
+    numClasses *= m;
+  for (int64_t cls = 0; cls < numClasses; ++cls) {
+    SmallVector<int64_t> residue(taps.size()), count(taps.size());
+    int64_t rest = cls;
+    for (int i = taps.size() - 1; i >= 0; --i) {
+      residue[i] = rest % period[i];
+      rest /= period[i];
+      count[i] = (p.axes[taps[i]].size - residue[i] + period[i] - 1) / period[i];
+    }
+    std::map<unsigned, int64_t> at;
+    for (auto [i, a] : llvm::enumerate(taps))
+      at[a] = residue[i];
+    SmallVector<int64_t> base, step;
+    int64_t baseIndex;
+    if (failed(startsOf(at, base, baseIndex)))
+      return failure();
+    // Per looped tap axis: its slopes and loop.
+    SmallVector<SmallVector<int64_t>> slopes;
+    SmallVector<int64_t> indexSlopes;
+    SmallVector<Value> ivs;
+    OpBuilder::InsertionGuard guard(b);
+    for (auto [i, a] : llvm::enumerate(taps)) {
+      if (count[i] == 1)
+        continue;
+      std::map<unsigned, int64_t> next(at);
+      next[a] += period[i];
+      int64_t nextIndex;
+      if (failed(startsOf(next, step, nextIndex)))
+        return failure();
+      SmallVector<int64_t> sl;
+      for (unsigned x = 0; x < base.size(); ++x)
+        sl.push_back(step[x] - base[x]);
+      slopes.push_back(sl);
+      indexSlopes.push_back(nextIndex - baseIndex);
+      auto loop = ForOp::create(b, loc(), b.getI64IntegerAttr(count[i]));
+      Block *body = new Block();
+      loop.getBody().push_back(body);
+      ivs.push_back(body->addArgument(b.getIndexType(), loc()));
+      b.setInsertionPointToStart(body);
+    }
+    auto tileAt = [&](Value v, MapAttr index, int64_t len, int64_t start, ArrayRef<int64_t> coeffs,
+                      MapAttr element) -> Value {
+      SmallVector<Value> used;
+      SmallVector<int64_t> cs;
+      for (auto [iv, c] : llvm::zip(ivs, coeffs))
+        if (c) {
+          used.push_back(iv);
+          cs.push_back(c);
+        }
+      if (used.empty())
+        return tileView(v, index, len, start, element);
+      auto t = cast<HbmViewType>(v.getType());
+      return TileAtOp::create(b, loc(), HbmViewType::get(ctx, t.getElementType(), t.getChip(), element, t.getIsMut()),
+                              v, index, b.getI64IntegerAttr(len), b.getI64IntegerAttr(start), used,
+                              b.getDenseI64ArrayAttr(cs))
+          .getResult();
+    };
+    Value sv = reshapeView(view(source, false), pairOf(srcParts));
+    SmallVector<MapAttr> cur(srcParts);
+    for (unsigned x = 0; x < srcParts.size(); ++x) {
+      if (lens[x] == radix[x])
+        continue;
+      SmallVector<int64_t> coeffs;
+      for (auto &sl : slopes)
+        coeffs.push_back(sl[x]);
+      cur[x] = lens[x] == 1 ? kb.one().padTo(radix[x]) : srcParts[x].resize(lens[x]).padTo(radix[x]);
+      sv = tileAt(sv, srcParts[x], lens[x], base[x], coeffs, pairOf(cur));
+    }
     Value d = view(dst, true);
-    if (k) {
+    if (k && !windowFree) {
       SmallVector<MapAttr> dc(dstParts);
       if (tq) {
-        int64_t index = 0;
-        for (unsigned a : taps)
-          index = index * p.axes[a].size + at[a];
         *llvm::find(dc, tq) = kb.one().padTo(k->tapPad, PadKind::Bottom);
-        d = tileView(d, tq, 1, index, pairOf(dc));
+        d = tileAt(d, tq, 1, baseIndex, indexSlopes, pairOf(dc));
       }
       if (cq && innerSize < k->innerPad) {
         *llvm::find(dc, cq) = cq.resize(innerSize).padTo(k->innerPad, PadKind::Bottom);
         d = tileView(d, cq, innerSize, 0, pairOf(dc));
       }
     }
-    copy(s, d);
+    copy(sv, d);
+  }
+  if (k && windowFree) {
+    // Into the padded K layout: the tap axes read as one (a reshape of the whole read view).
+    int64_t numPeeled = 1;
+    for (unsigned a : peeled)
+      numPeeled *= p.axes[a].size;
+    SmallVector<MapAttr> padded(rowParts), flat(rowParts);
+    tq = kb.axis(tag + "TQ", k->tapPad);
+    padded.push_back(tq);
+    flat.push_back(numPeeled == k->tapPad ? tq : tq.resize(numPeeled));
+    if (cq) {
+      padded.push_back(cq);
+      flat.push_back(innerExpr ? innerExpr : cq.resize(1));
+    }
+    Value full = allocHbm(pairOf(padded), r.type);
+    if (k->tapPad > numPeeled || k->innerPad > innerSize)
+      fill(full, 0.0);
+    Value d = view(full, true);
+    SmallVector<MapAttr> dc(padded);
+    if (numPeeled < k->tapPad) {
+      *llvm::find(dc, tq) = tq.resize(numPeeled).padTo(k->tapPad, PadKind::Bottom);
+      d = tileView(d, tq, numPeeled, 0, pairOf(dc));
+    }
+    if (cq && innerSize < k->innerPad) {
+      *llvm::find(dc, cq) = cq.resize(innerSize).padTo(k->innerPad, PadKind::Bottom);
+      d = tileView(d, cq, innerSize, 0, pairOf(dc));
+    }
+    copy(reshapeView(view(dst, false), pairOf(flat)), d);
+    dst = full;
   }
 
   SmallVector<MapAttr> canon = canonical(rowAxes, false);

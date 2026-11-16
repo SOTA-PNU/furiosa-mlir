@@ -67,4 +67,22 @@ def Fopt_VectorTagCmpOp : Fopt_StageOp<"vector_tag_cmp"> {
   let assemblyFormat = "$cmps $input attr-dict `:` qualified(type($input)) `->` qualified(type($result))";
 }
 
+// Kept device loops: `for i in 0..count { body }`. The body block's one index argument is the induction variable;
+// tile_at views inside index with it, so one DMA statement covers every iteration (the NPU keeps HBM loops,
+// where unrolled DMAs cost compile time superlinearly).
+def Fopt_ForOp : Fopt_Op<"for", [SingleBlock, NoTerminator]> {
+  let summary = "for i in 0..count { body }";
+  let arguments = (ins I64Attr:$count);
+  let regions = (region SizedRegion<1>:$body);
+  let hasVerifier = 1;
+}
+
+def Fopt_TileAtOp : Fopt_Op<"tile_at", [Pure]> {
+  let summary = "v.tile::<Index, LEN, Element2>(start + sum(coeffs[i] * ivs[i]))";
+  let arguments = (ins Fopt_HbmView:$source, Fopt_MapAttr:$index, I64Attr:$len, I64Attr:$start,
+                       Variadic<Index>:$ivs, DenseI64ArrayAttr:$coeffs);
+  let results = (outs Fopt_HbmView:$result);
+  let hasVerifier = 1;
+}
+
 #endif // FURIOSA_CODEGEN_FOPT_TILE_OPS

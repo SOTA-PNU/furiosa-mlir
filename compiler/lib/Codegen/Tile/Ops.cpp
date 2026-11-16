@@ -12,9 +12,14 @@ LogicalResult ReshapeHbmOp::verify() {
   if (src.getElement().size() != out.getElement().size())
     return emitOpError("a reshape keeps the size: ") << src.getElement().size() << " vs " << out.getElement().size();
   // Rust moves the source into the reshape: every other use must come before it.
-  for (Operation *user : getSource().getUsers())
-    if (user != getOperation() && (user->getBlock() != getOperation()->getBlock() || !user->isBeforeInBlock(*this)))
+  for (Operation *user : getSource().getUsers()) {
+    if (user == getOperation())
+      continue;
+    // A use inside a loop counts at the loop.
+    Operation *at = getOperation()->getBlock()->findAncestorOpInBlock(*user);
+    if (!at || !at->isBeforeInBlock(*this))
       return emitOpError("consumes its source, which must have no use after it");
+  }
   return success();
 }
 
@@ -44,5 +49,24 @@ LogicalResult VectorAluOp::verify() {
 LogicalResult VectorTagCmpOp::verify() {
   if (getCmps().size() != 4)
     return emitOpError("a comparison tag has four Cmp cases");
+  return success();
+}
+
+LogicalResult ForOp::verify() {
+  if (getCount() < 1)
+    return emitOpError("a loop runs at least once");
+  Block &body = getBody().front();
+  if (body.getNumArguments() != 1 || !body.getArgument(0).getType().isIndex())
+    return emitOpError("the body takes one index argument");
+  return success();
+}
+
+LogicalResult TileAtOp::verify() {
+  if (getCoeffs().size() != getIvs().size())
+    return emitOpError("one coefficient per induction variable");
+  auto src = getSource().getType(), out = getResult().getType();
+  if (src.getElementType() != out.getElementType() || src.getChip() != out.getChip() ||
+      src.getIsMut() != out.getIsMut())
+    return emitOpError("a tile keeps the view's element type, chip and mutability");
   return success();
 }

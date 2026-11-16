@@ -185,6 +185,16 @@ FailureOr<std::string> Emitter::view(Value v) {
       return failure();
     return *base + ".pad::<" + m(o.getType().getElement()) + ">()";
   }
+  if (auto o = dyn_cast_or_null<TileAtOp>(op)) {
+    FailureOr<std::string> base = view(o.getSource());
+    if (failed(base))
+      return failure();
+    std::string start = std::to_string(o.getStart());
+    for (auto [iv, c] : llvm::zip(o.getIvs(), o.getCoeffs()))
+      start += " + " + (c == 1 ? std::string() : std::to_string(c) + " * ") + nameOf(iv);
+    return *base + ".tile::<" + m(o.getIndex()) + ", " + std::to_string(o.getLen()) + ", " +
+           m(o.getType().getElement()) + ">(" + start + ")";
+  }
   if (auto o = dyn_cast_or_null<ViewReshapeOp>(op)) {
     FailureOr<std::string> base = view(o.getSource());
     if (failed(base))
@@ -418,11 +428,22 @@ LogicalResult Emitter::emit(func::FuncOp kernel) {
     return isa<ToHbmOp>(op) && op->getResult(0).hasOneUse() && *op->getResult(0).getUsers().begin() == returnOp;
   };
   llvm::DenseMap<Value, std::string> tails;
-  for (Operation &op : kernel.getBody().front()) {
+  // Statements of a block (kept loops print their bodies inside `for`).
+  std::function<LogicalResult(Block &)> emitBlock = [&](Block &block) -> LogicalResult {
+  for (Operation &op : block) {
     if (isa<func::ReturnOp>(op))
       break;
     LogicalResult ok =
         llvm::TypeSwitch<Operation *, LogicalResult>(&op)
+            .Case([&](ForOp o) -> LogicalResult {
+              Block &body = o.getBody().front();
+              names[body.getArgument(0)] = fresh("i" + std::to_string(names.size()));
+              os << "    for " << names[body.getArgument(0)] << " in 0.." << o.getCount() << " {\n";
+              if (failed(emitBlock(body)))
+                return failure();
+              os << "    }\n";
+              return success();
+            })
             .Case([&](ToDmOp o) {
               names[o] = fresh(nameOf(o.getSource()) + "_dm");
               os << "    let " << names[o] << ": " << rustType(o.getType()) << " = " << nameOf(o.getSource())
@@ -526,6 +547,10 @@ LogicalResult Emitter::emit(func::FuncOp kernel) {
     if (failed(ok))
       return failure();
   }
+  return success();
+  };
+  if (failed(emitBlock(kernel.getBody().front())))
+    return failure();
   auto value = [&](Value v) { return tails.count(v) ? tails[v] : nameOf(v); };
   if (returnOp.getNumOperands() == 1) {
     os << "    " << value(returnOp.getOperand(0)) << "\n";
