@@ -384,6 +384,57 @@ struct Promotion {
   AffineMap map;
 };
 
+/// What linalg's verifier demands of an operand map: evaluated at the first and last loop index, every result
+/// stays inside the operand, and a result that is a bare dim spans the operand exactly.
+bool verifierAccepts(AffineMap map, ArrayRef<Range> ranges, ArrayRef<int64_t> shape) {
+  SmallVector<int64_t> first, last;
+  for (const Range &r : ranges) {
+    first.push_back(r.lo);
+    last.push_back(r.hi);
+  }
+  SmallVector<int64_t> a = map.compose(first), z = map.compose(last);
+  for (unsigned j = 0; j < shape.size(); ++j) {
+    int64_t lo = std::min(a[j], z[j]), size = std::max(a[j], z[j]) + 1;
+    if (lo < 0 || size > shape[j])
+      return false;
+    if (isa<AffineDimExpr>(map.getResult(j)) && size != shape[j])
+      return false;
+  }
+  return true;
+}
+
+/// The promotion of `replaced` as a read of `base` through `idx`, with `base` sliced to the box the indices reach
+/// (so a bare-dim index spans its operand, as linalg requires), or nullopt if linalg would still reject the map.
+std::optional<Promotion> sliced(Operation *replaced, Value base, ArrayRef<AffineExpr> idx, ArrayRef<Range> ranges,
+                                linalg::GenericOp generic, OpBuilder &b) {
+  MLIRContext *ctx = generic.getContext();
+  unsigned nd = ranges.size();
+  auto type = cast<RankedTensorType>(base.getType());
+  SmallVector<int64_t> offsets, sizes;
+  SmallVector<AffineExpr> shifted;
+  bool whole = true;
+  for (auto [j, e] : llvm::enumerate(idx)) {
+    Range r = bounds(e, ranges);
+    offsets.push_back(r.lo);
+    sizes.push_back(r.hi - r.lo + 1);
+    shifted.push_back(simplifyAffineExpr(e - r.lo, nd, 0));
+    whole &= r.lo == 0 && r.hi == type.getDimSize(j) - 1;
+  }
+  AffineMap map = AffineMap::get(nd, 0, whole ? SmallVector<AffineExpr>(idx) : shifted, ctx);
+  if (!verifierAccepts(map, ranges, whole ? SmallVector<int64_t>(type.getShape()) : sizes))
+    return std::nullopt;
+  Value source = base;
+  if (!whole) {
+    OpBuilder::InsertionGuard guard(b);
+    b.setInsertionPoint(generic);
+    SmallVector<int64_t> ones(idx.size(), 1);
+    source = tensor::ExtractSliceOp::create(b, generic.getLoc(), RankedTensorType::get(sizes, type.getElementType()),
+                                            base, getAsIndexOpFoldResult(ctx, offsets),
+                                            getAsIndexOpFoldResult(ctx, sizes), getAsIndexOpFoldResult(ctx, ones));
+  }
+  return Promotion{replaced, source, map};
+}
+
 /// Plans the promotion of `extract`, or returns nullopt to leave it.
 std::optional<Promotion> plan(tensor::ExtractOp extract, linalg::GenericOp generic, ArrayRef<Range> ranges,
                               OpBuilder &b) {
@@ -448,8 +499,10 @@ std::optional<Promotion> plan(tensor::ExtractOp extract, linalg::GenericOp gener
         Range r = bounds(e, ranges);
         fits &= r.lo >= 0 && r.hi < s;
       }
-      if (fits)
-        return Promotion{extract, base, AffineMap::get(nd, 0, idx, ctx)};
+      if (!fits)
+        continue;
+      if (auto p = sliced(extract, base, idx, ranges, generic, b))
+        return p;
       continue;
     }
 
@@ -493,7 +546,10 @@ std::optional<Promotion> plan(tensor::ExtractOp extract, linalg::GenericOp gener
     SmallVector<AffineExpr> shifted;
     for (auto [j, e] : llvm::enumerate(idx))
       shifted.push_back(e + low[j]);
-    return Promotion{select, padded, AffineMap::get(nd, 0, shifted, ctx)};
+    if (auto p = sliced(select, padded, shifted, ranges, generic, b))
+      return p;
+    if (padded != base)
+      padded.getDefiningOp()->erase();
   }
   return std::nullopt;
 }

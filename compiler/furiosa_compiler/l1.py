@@ -39,7 +39,8 @@ class Kernels:
                 raise RuntimeError(f"{symbol}: no {self.stage} stage at {path}")
             text = path.read_text()
             if text.startswith("// furiosa codegen failed:"):
-                raise RuntimeError(f"{symbol}: {self.stage} stage failed: {text.splitlines()[1][3:300]}")
+                reason = " ".join(line[3:] for line in text.splitlines()[1:4])
+                raise RuntimeError(f"{symbol}: {self.stage} stage failed: {reason[:400]}")
             names = _FUNC.findall(text)
             name = entry["kernel"] if entry["kernel"] in names else (names[0] if names else None)
             if name is None:
