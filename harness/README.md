@@ -68,6 +68,18 @@ Triton graph run entirely in bf16 on the GPU (recorded in `registry.py`), plus t
 unchanged (`top1`). Qwen3 is a bf16 graph; its NPU tolerance equals its graph-level L1 tolerance and its
 greedy `next_token` must match exactly (integers are always exact).
 
+The Vector Engine's own arithmetic is measured, not assumed: `harness/characterize/` is a furiosa-opt crate that
+runs every f32 unary function of the Vector Engine over fixed input ranges on npu3 and compares with an f64
+reference; `npu3.jsonl` records the result. Measured: exp, log, sqrt, tanh, sigmoid, erf, sin and cos are within
+1.7 f32 ulps, but sin and cos return non-finite values for |x| > 2π, so a kernel's sin/cos must reach the
+hardware range-reduced (the compiler may not drop a kernel's own reduction, and must add one where the input
+range is not known to fit). Rerun after a firmware or furiosa-opt change:
+
+```
+cd harness/characterize && cargo furiosa-opt build --release --bin characterize   # CARGO_TARGET_DIR=../out/target/npu
+FURIOSA_VISIBLE_CHIPS=3 ../out/target/npu/release/characterize > npu3.jsonl
+```
+
 L3 and L4 compare with the case's NPU tolerance, which allows for the dtype policy the NPU forces
 (no fp32 or fp16 contraction: dots run in bf16 with fp32 accumulation). A match means
 `max|out - golden| <= atol + rtol * max|golden|` for every output.
