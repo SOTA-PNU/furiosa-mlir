@@ -115,19 +115,41 @@ def compile_case(name: str) -> Result:
     return _compiled[name]
 
 
+def shared_target(crate: Path, npu: bool) -> str:
+    """One target dir per crate family and backend: dependencies build once. Binaries are run by the
+    hashed path cargo reports, never target/release/run_graph, so crates sharing it cannot collide
+    (every crate's binary is named run_graph; cargo#6313)."""
+    return str(crate.parent.parent / "target" / ("npu" if npu else "cpu"))
+
+
+def build_run_graph(crate: Path, npu: bool) -> tuple[str | None, str]:
+    """Builds the crate's run_graph and returns its executable (or None and the build log)."""
+    cmd = ["cargo", "furiosa-opt", "build"] if npu else ["cargo", "build"]
+    cmd += ["--release", "--bin", "run_graph", "--message-format=json-render-diagnostics"]
+    code, log = sh(cmd, crate, cargo_env(shared_target(crate, npu), npu))
+    exe = None
+    for line in log.splitlines():
+        if line.startswith("{") and '"executable"' in line:
+            msg = json.loads(line)
+            if msg.get("executable") and msg.get("target", {}).get("name") == "run_graph":
+                exe = msg["executable"]
+    return (exe if code == 0 else None), log
+
+
 def run_graphs(name: str, crate: Path, npu: bool, tol) -> Result:
     """Runs run_graph for every golden graph index and compares its outputs."""
     meta = json.loads((GOLDEN / name / "meta.json").read_text())
-    target = str(crate / "target" / ("npu" if npu else "cpu"))
+    exe, log = build_run_graph(crate, npu)
+    if not exe:
+        return Result("FAIL", f"build: {tail(log)}")
     worst = []
     for graph in meta["graphs"]:
         i = graph["index"]
         out = OUT / name / ("npu" if npu else "cpu") / str(i) / "outputs.safetensors"
         out.parent.mkdir(parents=True, exist_ok=True)
         out.unlink(missing_ok=True)
-        args = ["--release", "--bin", "run_graph", "--", str(i), str(GOLDEN / name / str(i) / "inputs.safetensors"), str(out)]
-        cmd = ["cargo", "furiosa-opt", "run", *args] if npu else ["cargo", "run", *args]
-        code, log = sh(cmd, crate, cargo_env(target, npu))
+        cmd = [exe, str(i), str(GOLDEN / name / str(i) / "inputs.safetensors"), str(out)]
+        code, log = sh(cmd, crate, cargo_env(shared_target(crate, npu), npu))
         if code != 0 or not out.exists():
             return Result("FAIL", f"graph {i}: run_graph exited {code}: {tail(log)}")
         result = compare(out, GOLDEN / name / str(i) / "outputs.safetensors", tol)
@@ -182,10 +204,8 @@ def judge(name: str, level: str, impl: str) -> Result:
         if failed.exists():  # the compiler wrote a crate that only carries its codegen diagnostic
             reason = failed.read_text().strip().replace(str(ROOT) + "/", "")
             return Result("FAIL", f"codegen: {reason[:300]}")
-        # A target dir per crate: every crate's binary is named run_graph, so a shared one could run
-        # another crate's binary (cargo#6313).
-        target = str(crate / "target" / "npu")
-        code, log = sh(["cargo", "furiosa-opt", "build", "--release", "--bin", "run_graph"], crate, cargo_env(target, npu=True))
+        exe, log = build_run_graph(crate, npu=True)
+        code = 0 if exe else 1
         return Result("PASS") if code == 0 else Result("FAIL", tail(log))
     if not (GOLDEN / name / "meta.json").exists():
         return Result("SKIP", f"no golden (run: python -m harness.golden {name})")
