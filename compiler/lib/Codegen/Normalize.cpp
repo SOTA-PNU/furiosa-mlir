@@ -803,8 +803,9 @@ std::optional<bool> decides(arith::CmpIPredicate pred, int64_t lo, int64_t hi) {
 
 /// A generic that only chooses between two reads by an index comparison one loop decides alone (tl.cat's
 /// `i < n ? a : b`, tl.join's `j == 0`) splits at that loop's thresholds: one copy per run of the loop, reading
-/// its own side, inserted into the result. No index table remains, and each run is a box copy. A select inside
-/// a larger body, or with a constant side (a masked read maskToPad pads), stays for the row-wise class.
+/// its own side, inserted into the result. No index table remains, and each run is a box copy. With the oracle, a
+/// select inside a larger body splits likewise when its generic maps no other way (tl.maximum's NaN modes by
+/// column). A select with a constant side (a masked read maskToPad pads) stays for the row-wise class.
 void splitIndexSelects(ModuleOp module, function_ref<bool(linalg::GenericOp)> mapsAlone) {
   MLIRContext *ctx = module.getContext();
   SmallVector<linalg::GenericOp> work;
@@ -829,8 +830,9 @@ void splitIndexSelects(ModuleOp module, function_ref<bool(linalg::GenericOp)> ma
     };
     for (auto s : body.getOps<arith::SelectOp>()) {
       auto cmp = s.getCondition().getDefiningOp<arith::CmpIOp>();
-      if (body.getTerminator()->getOperand(0) != s.getResult() || !isa<BlockArgument>(s.getTrueValue()) ||
-          !isa<BlockArgument>(s.getFalseValue()) || constantLike(s.getTrueValue()) || constantLike(s.getFalseValue()))
+      bool choice = body.getTerminator()->getOperand(0) == s.getResult() && isa<BlockArgument>(s.getTrueValue()) &&
+                    isa<BlockArgument>(s.getFalseValue());
+      if ((!choice && !mapsAlone) || constantLike(s.getTrueValue()) || constantLike(s.getFalseValue()))
         continue;
       AffineExpr l = cmp ? affineIndex(cmp.getLhs(), body, ctx) : AffineExpr();
       AffineExpr r = cmp ? affineIndex(cmp.getRhs(), body, ctx) : AffineExpr();
