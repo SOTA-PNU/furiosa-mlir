@@ -20,6 +20,14 @@
 // CHECK: fopt.vector_reinterpret {{.*}} -> !fopt.tu<i32
 // CHECK: fopt.vector_tag_cmp ["Equal(0i32)", "False", "False", "False"]
 // CHECK: fopt.vector_intra_slice_reduce "Min" {{.*}} !fopt.tu<i32
+// A key per row (a table along d0) selects bitwise: masks of all ones where it passes or fails, computed along
+// the rows alone, then a & m (where(key, a, 0)) and (a & m) | (b & ~m) on the whole tile, the row mask from the VRF.
+
+// CHECK-LABEL: func.func @per_row
+// CHECK: fopt.vector_tag_cmp ["Equal(0i32)", "False", "False", "False"]
+// CHECK: fopt.vector_tag_cmp ["Equal(0i32)", "False", "False", "False"]
+// CHECK: "LogicBinaryOpI32::BitAnd" %{{[0-9]+}} vrf
+// CHECK: "LogicBinaryOpI32::BitOr" %{{[0-9]+}} vrf
 #id = affine_map<(d0, d1) -> (d0, d1)>
 #row = affine_map<(d0, d1) -> (d0)>
 #scalar = affine_map<(d0, d1) -> ()>
@@ -47,5 +55,19 @@ module {
       linalg.yield %m : i32
     } -> tensor<16xi32>
     return %r : tensor<16xi32>
+  }
+  func.func @per_row(%x: tensor<16x256xf32>, %k: tensor<16xi32>, %y: tensor<16x256xf32>, %o: tensor<16x256xf32>) -> tensor<16x256xf32> attributes {furiosa.written = [3]} {
+    %c0 = arith.constant 0 : i32
+    %zero = arith.constant 0.0 : f32
+    %e = tensor.empty() : tensor<16x256xf32>
+    %r = linalg.generic {indexing_maps = [#id, #row, #id, #id], iterator_types = ["parallel", "parallel"]} ins(%x, %k, %y : tensor<16x256xf32>, tensor<16xi32>, tensor<16x256xf32>) outs(%e : tensor<16x256xf32>) {
+    ^bb0(%a: f32, %key: i32, %b: f32, %out: f32):
+      %c = arith.cmpi ne, %key, %c0 : i32
+      %s = arith.select %c, %a, %zero : f32
+      %t = arith.select %c, %a, %b : f32
+      %u = arith.addf %s, %t : f32
+      linalg.yield %u : f32
+    } -> tensor<16x256xf32>
+    return %r : tensor<16x256xf32>
   }
 }

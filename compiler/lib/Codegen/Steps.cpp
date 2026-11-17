@@ -235,7 +235,8 @@ private:
   /// A step function for `g` that writes `outputs`, not inserted anywhere; fills `inputs` with the values
   /// it reads (kernel buffers, or outputs of earlier steps, by their original value).
   func::FuncOp outline(const Group &g, StringRef name, ArrayRef<Value> outputs, SmallVectorImpl<Value> &inputs);
-  bool mappable(const Group &g);
+  /// Whether an op class maps `g` in place of group `at`.
+  bool mappable(int at, const Group &g);
   /// Drops groups whose values no live group needs: every reader recomputes them.
   void prune();
   /// Orders the steps: after the steps whose results they read, and a step that leaves its result in a
@@ -292,11 +293,11 @@ SmallVector<Value> Splitter::outputsOf(int g, bool all) {
           Operation *user = use.getOwner();
           while (user->getBlock() != &block)
             user = user->getParentOp();
-          if (group.contains(user))
-            continue;
-          if (isAnchor(user) || all) {
+          // A user this group recomputes may be another group's own too: that group still reads the value.
+          bool mine = group.contains(user);
+          if (!mine && (isAnchor(user) || all)) {
             read = true;
-          } else if (isCheap(user)) {
+          } else if (!mine && isCheap(user)) {
             for (Value x : user->getResults())
               visit(x);
           } else {
@@ -543,11 +544,12 @@ func::FuncOp Splitter::outline(const Group &g, StringRef name, ArrayRef<Value> o
   return func;
 }
 
-bool Splitter::mappable(const Group &g) {
-  groups.push_back(g);
-  SmallVector<Value> inputs, outputs = outputsOf(groups.size() - 1, /*all=*/true);
+bool Splitter::mappable(int at, const Group &g) {
+  // The candidate stands in for the group it would replace, which must not count as another reader.
+  Group kept = std::exchange(groups[at], g);
+  SmallVector<Value> inputs, outputs = outputsOf(at, /*all=*/true);
   func::FuncOp func = outline(g, "candidate", outputs, inputs);
-  groups.pop_back();
+  groups[at] = std::move(kept);
   bool ok = mapsWhole(func);
   func.erase();
   return ok;
@@ -600,7 +602,7 @@ void Splitter::run(bool single) {
         for (Operation *op : groups[p].dups)
           if (!merged.contains(op))
             merged.dups.push_back(op);
-        if (!mappable(merged))
+        if (!mappable(g, merged))
           continue;
         if (move) {
           for (Operation *op : groups[p].ops)
@@ -640,7 +642,7 @@ void Splitter::run(bool single) {
       }
       if (merged.ops.size() == groups[g].ops.size() && merged.dups.size() == groups[g].dups.size())
         continue;
-      if (!mappable(merged))
+      if (!mappable(g, merged))
         continue;
       for (int p : moved) {
         for (Operation *op : groups[p].ops)

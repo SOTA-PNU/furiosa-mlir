@@ -358,10 +358,46 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
     Value acc = body.getArgument(g.getNumDpsInputs());
     std::function<FailureOr<int>(arith::SelectOp)> selectNode;
     std::function<FailureOr<int>(arith::SelectOp, arith::CmpIOp)> intSelectNode;
+    // A select whose key varies along less than its values (a per-row or per-column condition) selects bitwise:
+    // (a & m) | (b & ~m), m all ones where the key passes, computed along the key alone. Exact for any bits.
     auto addSelect = [&](Node n) -> int {
       for (int arg : n.args)
         n.shape = join(n.shape, dag.nodes[arg].shape);
-      return dag.add(n);
+      int key = n.args[0], a = n.args[1], f = n.args[2];
+      if (dag.nodes[key].shape == n.shape)
+        return dag.add(n);
+      auto constant = [&](int32_t bits) {
+        Node c{Node::Const};
+        c.value = llvm::bit_cast<float>(bits);
+        return dag.add(c);
+      };
+      auto isZero = [&](int v) {
+        return dag.nodes[v].kind == Node::Const && llvm::bit_cast<uint32_t>(dag.nodes[v].value) == 0;
+      };
+      auto op = [&](StringRef name, SmallVector<int> args, bool integer) {
+        Node o{Node::Op};
+        o.op = name.str();
+        o.args = args;
+        o.integer = integer;
+        for (int arg : args)
+          o.shape = join(o.shape, dag.nodes[arg].shape);
+        return dag.add(o);
+      };
+      auto mask = [&](bool where) {
+        Node m{Node::Op};
+        m.op = "select";
+        m.cmp = n.cmp;
+        m.integer = true;
+        m.args = {key, constant(where ? -1 : 0), constant(where ? 0 : -1)};
+        m.shape = dag.nodes[key].shape;
+        return dag.add(m);
+      };
+      // The result keeps the select's type: an f32's bits stay f32 (stored as they are), an i32 stays i32.
+      if (isZero(f))
+        return op("andi", {a, mask(true)}, n.integer);
+      if (isZero(a))
+        return op("andi", {f, mask(false)}, n.integer);
+      return op("ori", {op("andi", {a, mask(true)}, true), op("andi", {f, mask(false)}, true)}, n.integer);
     };
     llvm::DenseSet<Value> bad; // values already found unmappable: a DAG revisits them through every user
     std::function<FailureOr<int>(Value)> node = [&](Value v) -> FailureOr<int> {
