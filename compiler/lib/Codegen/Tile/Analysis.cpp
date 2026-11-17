@@ -579,7 +579,8 @@ public:
       }
       // Source dims = the digits of the collapsed index.
       auto srcShape = collapse.getSrcType().getShape();
-      SmallVector<AffineExpr> src(srcShape.size());
+      // Unit dims no group covers (collapsed into a rank-0 result) index 0.
+      SmallVector<AffineExpr> src(srcShape.size(), getAffineConstantExpr(0, ctx));
       for (auto [g, group] : llvm::enumerate(collapse.getReassociationIndices())) {
         int64_t stride = 1;
         for (int i = group.size() - 1; i >= 0; --i) {
@@ -893,7 +894,8 @@ FailureOr<Program> mlir::furiosa::tile::analyze(func::FuncOp func, ArrayRef<int6
     } else {
       auto expand = cast<tensor::ExpandShapeOp>(op);
       auto shape = expand.getResultType().getShape();
-      next.resize(shape.size());
+      // Unit dims no group covers (a rank-0 source expanded) index 0.
+      next.assign(shape.size(), getAffineConstantExpr(0, ctx));
       for (auto [g, group] : llvm::enumerate(expand.getReassociationIndices())) {
         int64_t stride = 1;
         for (int i = group.size() - 1; i >= 0; --i) {
