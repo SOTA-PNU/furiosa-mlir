@@ -24,6 +24,8 @@ npu stage) against GPU goldens.
   shapes, 32 more matrix cases (0e97b8c).
 - i8 and i16 ride in i32 lanes with wraps at their width; bf16 bitcasts to i16 through the f32 bits: `tl.flip` on bf16
   bit-exact on npu3 (db8aa18; fp16 stays out, it lives on the device as f32).
+- The tiled path's select takes each branch under the tag, bit for bit: a NaN or infinity in the branch not taken
+  no longer leaks (it blended a·s + b·(1−s)), and selects with infinite constants map (057b951).
 
 ## 1.1.0 (2026-11-17, release/1.1.0)
 
