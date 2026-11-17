@@ -56,6 +56,13 @@ struct Gemm {
   unsigned stream, trf;
   SmallVector<unsigned> m, n, k;
   SmallVector<unsigned> streamExtras, trfExtras; // further factors of each operand (reads)
+  SmallVector<unsigned> b;                       // batch axes: output axes both operands index
+  /// The TRF operand's axes: the batch axes, then the column.
+  SmallVector<unsigned> trfAxes() const {
+    SmallVector<unsigned> a(b);
+    llvm::append_range(a, n);
+    return a;
+  }
 };
 
 /// The K layout of a contraction's operands: taps (axes peeled into one DMA each) times the inner axis.
@@ -377,11 +384,28 @@ LogicalResult Lowering::tryGemm(unsigned node) {
   // Factors fall into two operands by the output axes they share; a factor with only contraction axes (a
   // per-K scale) joins the smaller operand. Each operand is its largest factor times the others, multiplied in
   // on the Vector Engine.
+  // An output axis two factors share is a batch axis: one contraction per batch index, laid out over the
+  // slices (both operands distributed by it) and tiles, never in time.
+  std::map<unsigned, int> uses;
+  for (unsigned f : factors)
+    for (unsigned a : outAxes(f))
+      ++uses[a];
+  SmallVector<unsigned> batch;
+  for (auto [a, n] : uses)
+    if (n > 1)
+      batch.push_back(a);
+  auto nonBatch = [&](unsigned read) {
+    SmallVector<unsigned> o;
+    for (unsigned a : outAxes(read))
+      if (!llvm::is_contained(batch, a))
+        o.push_back(a);
+    return o;
+  };
   SmallVector<SmallVector<unsigned>> groups; // factor indices
   SmallVector<std::set<unsigned>> groupAxes;
   SmallVector<unsigned> free;
   for (unsigned f = 0; f < factors.size(); ++f) {
-    SmallVector<unsigned> o = outAxes(factors[f]);
+    SmallVector<unsigned> o = nonBatch(factors[f]);
     if (o.empty()) {
       free.push_back(f);
       continue;
@@ -454,6 +478,8 @@ LogicalResult Lowering::tryGemm(unsigned node) {
       g.trfExtras.push_back(factors[f]);
   g.m = o[s];
   g.n = o[1 - s];
+  g.b = batch;
+  llvm::sort(g.b, [&](unsigned x, unsigned y) { return llvm::find(p.out, x) < llvm::find(p.out, y); });
   g.k = SmallVector<unsigned>(red.axes);
   llvm::sort(g.m, [&](unsigned x, unsigned y) { return llvm::find(p.out, x) < llvm::find(p.out, y); });
   gemm = g;
@@ -462,7 +488,8 @@ LogicalResult Lowering::tryGemm(unsigned node) {
 
 LogicalResult Lowering::planLayout() {
   if (gemm) {
-    rows = gemm->m;
+    rows = gemm->b;
+    llvm::append_range(rows, gemm->m);
     col = gemm->n[0];
   } else {
     // The column: the output axis contiguous (stride 1) in the most reads, else the innermost output axis; an
@@ -630,6 +657,9 @@ int64_t Lowering::assignRows(int64_t rowSlices, int64_t perRow, SmallVector<Digi
   for (int i = cur.size() - 1; i >= 0; --i) {
     Cursor &cu = cur[i];
     if ((total + have - 1) / have <= rowSlices || have >= maxLocal)
+      break;
+    // The TRF holds one batch index per slice: batch axes stay out of time.
+    if (gemm && llvm::is_contained(gemm->b, cu.axis))
       break;
     int64_t need = (total / have + rowSlices - 1) / rowSlices;
     int64_t d = 0;
@@ -1570,7 +1600,7 @@ FailureOr<Value> Lowering::contract(ArrayRef<int64_t> tileIndex) {
   MapAttr k = kLocal();
   auto trfHbm = hbmOfRead.find(~g.trf);
   if (trfHbm == hbmOfRead.end()) {
-    auto h = materialize(p.reads[g.trf], g.n, &kl);
+    auto h = materialize(p.reads[g.trf], g.trfAxes(), &kl);
     if (failed(h))
       return failure();
     trfHbm = hbmOfRead.insert({~g.trf, *h}).first;
@@ -1595,14 +1625,14 @@ FailureOr<Value> Lowering::contract(ArrayRef<int64_t> tileIndex) {
   Value acc;
   for (int64_t kt = 0; kt < kTiles(); ++kt) {
     // The TRF operand: columns over lanes (and lane groups), this K tile in the element.
-    Value bDm = toDm(trfHbm->second, g.n, tileIndex, pairOf({cl, k}), true, kt);
+    Value bDm = toDm(trfHbm->second, g.trfAxes(), tileIndex, pairOf({cl, k}), true, kt);
     for (unsigned e : g.trfExtras) {
-      auto h = extraHbm(e, g.n);
+      auto h = extraHbm(e, g.trfAxes());
       if (failed(h))
         return failure();
       AluSpec mul{"vector_fp_zip", "FpBinaryOp::MulF(FpMulAlu::Mul0)"};
       mul.fp = true;
-      bDm = zip(convert(bDm, f32), convert(toDm(*h, g.n, tileIndex, pairOf({cl, k}), true, kt), f32), mul);
+      bDm = zip(convert(bDm, f32), convert(toDm(*h, g.trfAxes(), tileIndex, pairOf({cl, k}), true, kt), f32), mul);
     }
     MapAttr tt = pairOf({lane, group, k.stride(16)});
     Type bt = cast<DmTensorType>(bDm.getType()).getElementType();
