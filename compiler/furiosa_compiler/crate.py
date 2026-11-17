@@ -344,6 +344,8 @@ class RunGraph:
                 defined.update(outs)
 
         emit(plan["steps"], "    ")
+        for r in plan.get("returns", []):  # a kept loop's final carried value is the written buffer
+            lines.append(f"    let p{r['buffer']} = v{r['carried']};")
         params = "".join(f", p{a}: HbmBuffer" for a in info["reads"])
         rets = "".join(f"p{a}, " for a in info["writes"])
         return (
@@ -377,6 +379,7 @@ class RunGraph:
                 a = where(arg).get("buffer")
                 if a is not None and a not in writes:
                     writes.append(a)
+        writes += [r["buffer"] for r in plan.get("returns", []) if r["buffer"] not in writes]
         dtypes, elements = {}, {}
         for a, buffer in enumerate(launch["args"]):
             d = graph["buffers"][buffer]["dtype"]

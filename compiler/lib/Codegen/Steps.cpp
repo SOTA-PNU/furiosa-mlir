@@ -796,7 +796,7 @@ FailureOr<std::string> mlir::furiosa::stepsPlan(ModuleOp module) {
     return std::string("null");
   // Slots: the kernel's buffers, then the temporaries; reshapes keep their operand's slot.
   llvm::DenseMap<Value, llvm::json::Object> slot;
-  llvm::json::Array temps, steps, consts;
+  llvm::json::Array temps, steps, consts, returns;
   auto slotOf = [&](Value v) -> llvm::json::Value {
     auto it = slot.find(v);
     return it == slot.end() ? llvm::json::Value(nullptr) : llvm::json::Value(llvm::json::Object(it->second));
@@ -969,6 +969,11 @@ FailureOr<std::string> mlir::furiosa::stepsPlan(ModuleOp module) {
         for (auto [r, v] : llvm::enumerate(ret.getOperands())) {
           auto it = slot.find(v);
           int64_t buffer = cast<IntegerAttr>(written[r]).getInt();
+          // A kept loop's final carried value is the buffer itself: the host hands it back as the result.
+          if (it != slot.end() && it->second.get("carried") && !it->second.get("offset")) {
+            returns.push_back(llvm::json::Object{{"buffer", buffer}, {"carried", *it->second.getInteger("carried")}});
+            continue;
+          }
           if (it == slot.end() || it->second.getInteger("buffer") != buffer)
             return ret.emitError("result ") << r << " is not left in buffer " << buffer;
         }
@@ -983,6 +988,7 @@ FailureOr<std::string> mlir::furiosa::stepsPlan(ModuleOp module) {
   llvm::json::Object plan{{"kernel", kernel.getName().str()},
                           {"temps", std::move(temps)},
                           {"consts", std::move(consts)},
+                          {"returns", std::move(returns)},
                           {"steps", std::move(steps)}};
   std::string text;
   llvm::raw_string_ostream os(text);
