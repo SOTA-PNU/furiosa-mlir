@@ -9,8 +9,10 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/AffineExprVisitor.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Matchers.h"
@@ -396,9 +398,274 @@ void splitLongReductions(ModuleOp module) {
   }
 }
 
+/// The value an index-only body value takes where loop index `dim` is `at`: linalg.index of that dim, integer
+/// constants and integer arithmetic; nothing for anything else (another index, a block argument).
+std::optional<int64_t> evalAt(Value v, unsigned dim, int64_t at) {
+  if (APInt c; matchPattern(v, m_ConstantInt(&c)))
+    return c.getSExtValue();
+  Operation *op = v.getDefiningOp();
+  if (auto index = dyn_cast_or_null<linalg::IndexOp>(op))
+    return index.getDim() == dim ? std::optional<int64_t>(at) : std::nullopt;
+  if (isa_and_nonnull<arith::IndexCastOp>(op))
+    return evalAt(op->getOperand(0), dim, at);
+  if (!isa_and_nonnull<arith::AddIOp, arith::SubIOp, arith::MulIOp>(op))
+    return std::nullopt;
+  std::optional<int64_t> a = evalAt(op->getOperand(0), dim, at), b = evalAt(op->getOperand(1), dim, at);
+  if (!a || !b)
+    return std::nullopt;
+  return isa<arith::AddIOp>(op) ? *a + *b : isa<arith::SubIOp>(op) ? *a - *b : *a * *b;
+}
+
+/// A selection reduction: one accumulator takes the greatest (least) value, the other the payload at the same
+/// element, ties going to the least (greatest) payload. tl.argmax/argmin's combiner, read by what it does:
+/// select both accumulators by order(acc, x) | (acc == x & tie(acc_payload, x_payload)).
+struct Selection {
+  unsigned value, payload; // result indices
+  BlockArgument in;        // the compared input's block argument
+  Value term;              // the payload's term (the element's)
+  bool max, leastPayload;
+};
+
+std::optional<Selection> matchSelection(linalg::GenericOp g) {
+  if (g.getNumDpsInits() != 2 || g.getNumReductionLoops() != 1)
+    return std::nullopt;
+  Block &body = *g.getBody();
+  unsigned nIn = g.getNumDpsInputs();
+  auto yield = cast<linalg::YieldOp>(body.getTerminator());
+  auto s0 = yield.getOperand(0).getDefiningOp<arith::SelectOp>();
+  auto s1 = yield.getOperand(1).getDefiningOp<arith::SelectOp>();
+  if (!s0 || !s1 || s0.getCondition() != s1.getCondition() || s0.getTrueValue() != body.getArgument(nIn) ||
+      s1.getTrueValue() != body.getArgument(nIn + 1))
+    return std::nullopt;
+  // cmp(out, in) as +1 (greater), -1 (less), 0 (equal); nothing for another predicate or operands.
+  auto rel = [](Value cond, Value out, Value in) -> std::optional<int> {
+    Value l, r;
+    int sign;
+    if (auto f = cond.getDefiningOp<arith::CmpFOp>()) {
+      using P = arith::CmpFPredicate;
+      l = f.getLhs(), r = f.getRhs();
+      P p = f.getPredicate();
+      if (p != P::OGT && p != P::OLT && p != P::OEQ)
+        return std::nullopt;
+      sign = p == P::OGT ? 1 : p == P::OLT ? -1 : 0;
+    } else if (auto i = cond.getDefiningOp<arith::CmpIOp>()) {
+      using P = arith::CmpIPredicate;
+      l = i.getLhs(), r = i.getRhs();
+      P p = i.getPredicate();
+      if (p != P::sgt && p != P::slt && p != P::eq)
+        return std::nullopt;
+      sign = p == P::sgt ? 1 : p == P::slt ? -1 : 0;
+    } else {
+      return std::nullopt;
+    }
+    if (l == out && r == in)
+      return sign;
+    if (l == in && r == out)
+      return -sign;
+    return std::nullopt;
+  };
+  auto readsOuts = [&](Value v) {
+    SmallVector<Value> work{v};
+    llvm::DenseSet<Value> seen;
+    while (!work.empty()) {
+      Value x = work.pop_back_val();
+      if (!seen.insert(x).second)
+        continue;
+      if (auto arg = dyn_cast<BlockArgument>(x); arg && arg.getOwner() == &body && arg.getArgNumber() >= nIn)
+        return true;
+      if (Operation *op = x.getDefiningOp(); op && op->getBlock() == &body)
+        llvm::append_range(work, op->getOperands());
+    }
+    return false;
+  };
+  Value c = s0.getCondition();
+  for (unsigned v : {0u, 1u}) {
+    Value outV = body.getArgument(nIn + v), outP = body.getArgument(nIn + 1 - v);
+    Value inV = (v ? s1 : s0).getFalseValue(), inP = (v ? s0 : s1).getFalseValue();
+    auto inArg = dyn_cast<BlockArgument>(inV);
+    if (!inArg || inArg.getOwner() != &body || inArg.getArgNumber() >= nIn || readsOuts(inP))
+      continue;
+    std::optional<int> order = rel(c, outV, inV), tie;
+    if (order == 0)
+      order.reset();
+    if (auto either = c.getDefiningOp<arith::OrIOp>(); !order && either)
+      for (int side : {0, 1}) {
+        std::optional<int> o = rel(either->getOperand(side), outV, inV);
+        auto both = either->getOperand(1 - side).getDefiningOp<arith::AndIOp>();
+        if (!o || *o == 0 || !both)
+          continue;
+        for (int k : {0, 1}) {
+          std::optional<int> eq = rel(both->getOperand(k), outV, inV), t = rel(both->getOperand(1 - k), outP, inP);
+          if (eq == 0 && t && *t != 0)
+            order = o, tie = t;
+        }
+      }
+    if (order)
+      return Selection{v, 1 - v, inArg, inP, *order > 0, !tie || *tie < 0};
+  }
+  return std::nullopt;
+}
+
+/// A selection reduction seeded by its first element (how the raise starts a reduction with no identity: the
+/// accumulators from element 0, the reduction over elements 1..) becomes two reductions with identities over all
+/// the elements: the greatest (least) value m, then the least (greatest) payload of the elements equal to m.
+/// Seeded means: the compared input is a box of some tensor T from element 1 along the reduced dim; the
+/// accumulators come from one parallel generic that reads T's element 0 there and yields it and, for the payload,
+/// a constant the payload's term (an index-only value of the reduced dim) takes at element 0.
+void selectionReductions(ModuleOp module) {
+  SmallVector<linalg::GenericOp> generics;
+  module.walk([&](linalg::GenericOp g) { generics.push_back(g); });
+  for (linalg::GenericOp g : generics) {
+    std::optional<Selection> sel = matchSelection(g);
+    if (!sel)
+      continue;
+    unsigned r = 0;
+    for (auto [d, it] : llvm::enumerate(g.getIteratorTypesArray()))
+      if (it == utils::IteratorType::reduction)
+        r = d;
+    OpOperand *x = g.getDpsInputOperand(sel->in.getArgNumber());
+    AffineMap xMap = g.getMatchingIndexingMap(x);
+    std::optional<unsigned> k = xMap.getResultPosition(getAffineDimExpr(r, g.getContext()));
+    auto box = x->get().getDefiningOp<tensor::ExtractSliceOp>();
+    if (!k || !box || !box.hasUnitStride() || box.getSourceType().getRank() != box.getType().getRank() ||
+        ShapedType::isDynamicShape(box.getStaticOffsets()) || ShapedType::isDynamicShape(box.getStaticSizes()))
+      continue;
+    Value t = box.getSource();
+    auto tType = cast<RankedTensorType>(t.getType());
+    // A box of `t` from element `from` along dim k, `len` long, whole along the others.
+    // A box of `t` (or of what `t` pads at its high ends, which holds the same leading elements) from element
+    // `from` along dim k, `len` long, whole along the others.
+    auto pad = t.getDefiningOp<tensor::PadOp>();
+    Value unpadded = pad && llvm::all_of(pad.getStaticLow(), [](int64_t l) { return l == 0; }) ? pad.getSource() : t;
+    auto isBox = [&](tensor::ExtractSliceOp s, int64_t from, int64_t len) {
+      if (!s || (s.getSource() != t && s.getSource() != unpadded) || !s.hasUnitStride() ||
+          s.getType().getRank() != tType.getRank())
+        return false;
+      for (int64_t d = 0; d < tType.getRank(); ++d)
+        if (s.getStaticOffsets()[d] != (d == *k ? from : 0) || s.getStaticSizes()[d] != (d == *k ? len : tType.getDimSize(d)))
+          return false;
+      return true;
+    };
+    int64_t n = tType.getDimSize(*k);
+    Value initV = g.getDpsInits()[sel->value], initP = g.getDpsInits()[sel->payload];
+    auto seed = initV.getDefiningOp<linalg::GenericOp>();
+    if (!isBox(box, 1, n - 1) || !seed || initP.getDefiningOp() != seed || seed.getNumDpsInputs() != 1 ||
+        seed.getNumReductionLoops() != 0 || !isBox(seed.getDpsInputs()[0].getDefiningOp<tensor::ExtractSliceOp>(), 0, 1))
+      continue;
+    // The seed reads element 0 where the reduction reads its element: the reduced dim at 0, each other dim the
+    // seed's loop the generic's output places it at.
+    AffineMap outMap = g.getIndexingMapsArray()[g.getNumDpsInputs() + sel->value];
+    AffineMap seedMap = seed.getIndexingMapsArray()[0];
+    bool aligned = seedMap.getNumResults() == xMap.getNumResults() &&
+                   llvm::all_of(ArrayRef(seed.getIndexingMapsArray()).drop_front(), [](AffineMap m) { return m.isIdentity(); });
+    for (unsigned i = 0; aligned && i < xMap.getNumResults(); ++i) {
+      AffineExpr e = xMap.getResult(i), s = seedMap.getResult(i);
+      if (i == *k || isa<AffineConstantExpr>(e)) {
+        aligned = s == (i == *k ? getAffineConstantExpr(0, g.getContext()) : e);
+        continue;
+      }
+      auto d = dyn_cast<AffineDimExpr>(e);
+      std::optional<unsigned> at = d ? outMap.getResultPosition(d) : std::nullopt;
+      aligned = at && s == getAffineDimExpr(*at, g.getContext());
+    }
+    auto seedYield = cast<linalg::YieldOp>(seed.getBody()->getTerminator());
+    unsigned vAt = cast<OpResult>(initV).getResultNumber(), pAt = cast<OpResult>(initP).getResultNumber();
+    APInt seedPayload;
+    if (!aligned || seedYield.getOperand(vAt) != seed.getBody()->getArgument(0) ||
+        !matchPattern(seedYield.getOperand(pAt), m_ConstantInt(&seedPayload)) ||
+        evalAt(sel->term, r, -1) != seedPayload.getSExtValue())
+      continue;
+
+    Type vt = getElementTypeOrSelf(initV.getType()), pt = getElementTypeOrSelf(initP.getType());
+    bool fv = isa<FloatType>(vt);
+    if ((!fv && !vt.isInteger(32)) || !pt.isInteger(32))
+      continue;
+    OpBuilder b(g);
+    Location loc = g.getLoc();
+    auto fill = [&](Value like, TypedAttr value) {
+      auto type = cast<RankedTensorType>(like.getType());
+      Value empty = tensor::EmptyOp::create(b, loc, type.getShape(), type.getElementType());
+      return linalg::FillOp::create(b, loc, arith::ConstantOp::create(b, loc, value).getResult(), empty).getResult(0);
+    };
+    auto extreme = [&](Type et, bool high) -> TypedAttr {
+      if (auto ft = dyn_cast<FloatType>(et))
+        return b.getFloatAttr(ft, APFloat::getInf(ft.getFloatSemantics(), !high));
+      return b.getIntegerAttr(et, high ? APInt::getSignedMaxValue(32) : APInt::getSignedMinValue(32));
+    };
+    SmallVector<utils::IteratorType> iters = g.getIteratorTypesArray();
+    // m: the greatest (least) element, from the least (greatest) value.
+    auto value = linalg::GenericOp::create(
+        b, loc, TypeRange{initV.getType()}, ValueRange{t}, ValueRange{fill(initV, extreme(vt, !sel->max))},
+        ArrayRef<AffineMap>{xMap, outMap}, iters, [&](OpBuilder &nb, Location l, ValueRange args) {
+          Value m = fv ? (sel->max ? arith::MaximumFOp::create(nb, l, args[1], args[0]).getResult()
+                                   : arith::MinimumFOp::create(nb, l, args[1], args[0]).getResult())
+                       : (sel->max ? arith::MaxSIOp::create(nb, l, args[1], args[0]).getResult()
+                                   : arith::MinSIOp::create(nb, l, args[1], args[0]).getResult());
+          linalg::YieldOp::create(nb, l, m);
+        });
+    // The payload: the least (greatest) term of the elements equal to m. The term moves with the elements: its
+    // index is one less over t than over the box.
+    TypedAttr none = extreme(pt, sel->leastPayload);
+    auto payload = linalg::GenericOp::create(
+        b, loc, TypeRange{initP.getType()}, ValueRange{t, value.getResult(0)}, ValueRange{fill(initP, none)},
+        ArrayRef<AffineMap>{xMap, outMap, g.getIndexingMapsArray()[g.getNumDpsInputs() + sel->payload]}, iters,
+        [&](OpBuilder &nb, Location l, ValueRange args) {
+          IRMapping map;
+          Value index = linalg::IndexOp::create(nb, l, r);
+          Value before = arith::SubIOp::create(nb, l, index, arith::ConstantIndexOp::create(nb, l, 1));
+          std::function<Value(Value)> clone = [&](Value v) -> Value {
+            if (Value m = map.lookupOrNull(v))
+              return m;
+            Operation *op = v.getDefiningOp();
+            if (auto i = dyn_cast<linalg::IndexOp>(op); i && i.getDim() == r) {
+              map.map(v, before);
+              return before;
+            }
+            for (Value o : op->getOperands())
+              clone(o);
+            return nb.clone(*op, map)->getResult(cast<OpResult>(v).getResultNumber());
+          };
+          Value term = clone(sel->term);
+          Value eq = fv ? arith::CmpFOp::create(nb, l, arith::CmpFPredicate::OEQ, args[0], args[1]).getResult()
+                        : arith::CmpIOp::create(nb, l, arith::CmpIPredicate::eq, args[0], args[1]).getResult();
+          Value candidate = arith::SelectOp::create(nb, l, eq, term, arith::ConstantOp::create(nb, l, none));
+          Value p = sel->leastPayload ? arith::MinSIOp::create(nb, l, args[2], candidate).getResult()
+                                      : arith::MaxSIOp::create(nb, l, args[2], candidate).getResult();
+          linalg::YieldOp::create(nb, l, p);
+        });
+    g.getResult(sel->value).replaceAllUsesWith(value.getResult(0));
+    g.getResult(sel->payload).replaceAllUsesWith(payload.getResult(0));
+    g.erase();
+  }
+}
+
+/// Math ops the Vector Engine lacks, in ones it has: fma(a, b, c) = a*b + c (rounded twice) and log2(x) =
+/// ln(x) * log2(e) (within the engine's ln ulp budget, not bit-exact).
+void expandMath(ModuleOp module) {
+  SmallVector<Operation *> ops;
+  module.walk([&](Operation *op) {
+    if (isa<math::FmaOp, math::Log2Op>(op) && isa<FloatType>(op->getResult(0).getType()))
+      ops.push_back(op);
+  });
+  for (Operation *op : ops) {
+    OpBuilder b(op);
+    Location loc = op->getLoc();
+    Value v;
+    if (auto fma = dyn_cast<math::FmaOp>(op))
+      v = arith::AddFOp::create(b, loc, arith::MulFOp::create(b, loc, fma.getA(), fma.getB()), fma.getC());
+    else
+      v = arith::MulFOp::create(b, loc, math::LogOp::create(b, loc, op->getOperand(0)),
+                                arith::ConstantOp::create(b, loc, b.getFloatAttr(op->getResult(0).getType(), 1.4426950408889634)));
+    op->getResult(0).replaceAllUsesWith(v);
+    op->erase();
+  }
+}
+
 } // namespace
 
 void mlir::furiosa::normalizeKernels(ModuleOp module) {
+  expandMath(module);
+  selectionReductions(module);
   copiesToReshapes(module);
   splitLongReductions(module);
   padsToInserts(module);

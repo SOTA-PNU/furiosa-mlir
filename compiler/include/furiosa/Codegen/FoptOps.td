@@ -392,6 +392,12 @@ def Fopt_VectorReinterpretOp : Fopt_StageOp<"vector_reinterpret"> {
   let assemblyFormat = "$input attr-dict `:` qualified(type($input)) `->` qualified(type($result))";
 }
 
+def Fopt_VectorFxpToFpOp : Fopt_StageOp<"vector_fxp_to_fp"> {
+  let summary = ".vector_fxp_to_fp(int_width) (i32 fixed point with 31 - int_width fraction bits to f32; 31: integers)";
+  let arguments = (ins Fopt_Stream:$input, I32Attr:$int_width);
+  let assemblyFormat = "$input `,` $int_width attr-dict `:` qualified(type($input)) `->` qualified(type($result))";
+}
+
 def Fopt_VectorFxpOp : Fopt_StageOp<"vector_fxp"> {
   let summary = ".vector_fxp(FxpBinaryOp::<op>, imm) (an i32 ALU op with an immediate)";
   let arguments = (ins Fopt_Stream:$input, StrAttr:$op, I32Attr:$imm);

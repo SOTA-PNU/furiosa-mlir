@@ -541,7 +541,9 @@ LogicalResult VectorReinterpretOp::verify() {
 }
 
 LogicalResult VectorIntraSliceReduceOp::verify() {
-  if (failed(verifyOpName(*this, getOp(), {"Add", "Max", "Min"})))
+  bool i32 = getInput().getType().getElementType().isInteger(32);
+  if (failed(verifyOpName(*this, getOp(), i32 ? ArrayRef<StringRef>{"AddSat", "Max", "Min"}
+                                              : ArrayRef<StringRef>{"Add", "Max", "Min"})))
     return failure();
   if (failed(verifySamePlacement(*this, getInput().getType(), getResult().getType())))
     return failure();
@@ -712,6 +714,14 @@ LogicalResult GatherOp::verify() {
 
 static constexpr StringRef kFxpOps[] = {"AddFxp",  "AddFxpSat",       "SubFxp",         "SubFxpSat", "LeftShift",
                                         "LeftShiftSat", "MulFxp", "MulInt", "LogicRightShift", "ArithRightShift"};
+
+LogicalResult VectorFxpToFpOp::verify() {
+  if (!getInput().getType().getElementType().isInteger(32) || !getResult().getType().getElementType().isF32())
+    return emitOpError("converts an i32 stream to f32");
+  if (getIntWidth() < 0 || getIntWidth() > 31)
+    return emitOpError("an integer width within [0, 31]");
+  return verifySamePlacement(*this, getInput().getType(), getResult().getType());
+}
 
 LogicalResult VectorFxpOp::verify() {
   if (failed(verifyOpName(*this, getOp(), kFxpOps)))

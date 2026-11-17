@@ -4,7 +4,8 @@
 // unit strides; reshapes around the buffers move no data, so the box is described in the slice's own shape.
 // An insert into a zero fill (a padded read) writes the box into the fresh written buffer, which starts as
 // zeros; an insert into a table (a padding constant) copies the table into the written buffer first. A
-// linalg.transpose of a buffer is one DMA between the two layouts.
+// relayout of a buffer (a linalg.transpose, or a generic that only permutes or broadcasts its input) is one
+// DMA between the two layouts.
 
 #include "Mapping.h"
 
@@ -81,14 +82,18 @@ FailureOr<Copy> find(RaisedKernel &kernel) {
   return c;
 }
 
-/// A transpose of a buffer into the written buffer: `perm[i]` is the input dimension output dimension i reads.
-struct Transpose {
+/// A relayout of a buffer into the written buffer: output dimension i reads input dimension `reads[i]`, or
+/// repeats the input over it (-1, a broadcast). A linalg.transpose, or a generic that only yields its input
+/// through a projected permutation whose constant results index unit dimensions (`unit`, left out of the layout),
+/// or another buffer returned as it is (a copy).
+struct Relayout {
   BlockArgument from;
-  RankedTensorType type; // the input's
-  SmallVector<int64_t> perm;
+  RankedTensorType in, out;
+  SmallVector<int64_t> reads;
+  SmallVector<bool> unit;
 };
 
-FailureOr<Transpose> findTranspose(RaisedKernel &kernel) {
+FailureOr<Relayout> findRelayout(RaisedKernel &kernel) {
   Block &block = kernel.func.getBody().front();
   auto ret = cast<func::ReturnOp>(block.getTerminator());
   if (kernel.written.size() != 1 || ret.getNumOperands() != 1)
@@ -96,47 +101,82 @@ FailureOr<Transpose> findTranspose(RaisedKernel &kernel) {
   Value result = ret.getOperand(0);
   while (result.getDefiningOp() && isa<tensor::CollapseShapeOp, tensor::ExpandShapeOp>(result.getDefiningOp()))
     result = result.getDefiningOp()->getOperand(0);
-  auto t = result.getDefiningOp<linalg::TransposeOp>();
-  if (!t || !t.getInit().getDefiningOp<tensor::EmptyOp>())
+  Operation *op = result.getDefiningOp();
+  Relayout c;
+  Value input, init;
+  if (auto t = dyn_cast_or_null<linalg::TransposeOp>(op)) {
+    input = t.getInput(), init = t.getInit();
+    c.reads = llvm::to_vector(t.getPermutation());
+  } else if (auto arg = argOf(result, block)) {
+    input = init = arg;
+    c.reads = llvm::to_vector(llvm::seq<int64_t>(0, cast<RankedTensorType>(arg.getType()).getRank()));
+  } else if (auto g = dyn_cast_or_null<linalg::GenericOp>(op)) {
+    if (g.getNumDpsInputs() != 1 || g.getNumDpsInits() != 1 || g.getNumReductionLoops() != 0 ||
+        !g.getIndexingMapsArray()[1].isIdentity() ||
+        cast<linalg::YieldOp>(g.getBody()->getTerminator()).getOperand(0) != g.getBody()->getArgument(0))
+      return failure();
+    input = g.getDpsInputs()[0], init = g.getDpsInits()[0];
+    auto inType = cast<RankedTensorType>(input.getType());
+    c.reads.assign(g.getNumLoops(), -1);
+    c.unit.assign(inType.getRank(), false);
+    for (auto [k, e] : llvm::enumerate(g.getIndexingMapsArray()[0].getResults())) {
+      auto d = dyn_cast<AffineDimExpr>(e);
+      auto zero = dyn_cast<AffineConstantExpr>(e);
+      if (d && c.reads[d.getPosition()] < 0)
+        c.reads[d.getPosition()] = k;
+      else if (zero && zero.getValue() == 0 && inType.getDimSize(k) == 1)
+        c.unit[k] = true;
+      else
+        return failure();
+    }
+  } else {
     return failure();
-  Transpose c{argOf(t.getInput(), block), cast<RankedTensorType>(t.getInput().getType()),
-              llvm::to_vector(t.getPermutation())};
-  if (!c.from || int64_t(c.from.getArgNumber()) == kernel.written[0])
+  }
+  c.from = argOf(input, block);
+  c.in = cast<RankedTensorType>(input.getType());
+  c.out = cast<RankedTensorType>(init.getType());
+  c.unit.resize(c.in.getRank(), false);
+  if ((op && !init.getDefiningOp<tensor::EmptyOp>()) || !c.from || int64_t(c.from.getArgNumber()) == kernel.written[0])
     return failure();
-  for (Operation &op : block.without_terminator())
-    if (&op != t && !isa<tensor::CollapseShapeOp, tensor::ExpandShapeOp, tensor::EmptyOp>(op))
+  for (Operation &o : block.without_terminator())
+    if (&o != op && !isa<tensor::CollapseShapeOp, tensor::ExpandShapeOp, tensor::EmptyOp>(o))
       return failure();
   return c;
 }
 
-bool match(RaisedKernel &kernel) { return succeeded(find(kernel)) || succeeded(findTranspose(kernel)); }
+bool match(RaisedKernel &kernel) { return succeeded(find(kernel)) || succeeded(findRelayout(kernel)); }
 
-/// One DMA between the input's layout and the permuted one: the axes name elements, the maps lay them out.
-LogicalResult mapTranspose(RaisedKernel &kernel, const Transpose &c) {
+/// One DMA between the input's layout and the output's: the axes name elements, the maps lay them out; an
+/// output axis the input lacks repeats it.
+LogicalResult mapRelayout(RaisedKernel &kernel, const Relayout &c) {
   KernelBuilder kb(kernel);
   MLIRContext *ctx = kb.getContext();
-  Type et = c.type.getElementType();
-  SmallVector<MapAttr> axes, permuted;
-  for (int64_t d = 0; d < c.type.getRank(); ++d)
-    axes.push_back(kb.axis("D" + std::to_string(d), c.type.getDimSize(d)));
-  for (int64_t d : c.perm)
-    permuted.push_back(axes[d]);
-  MapAttr fromMap = MapAttr::pair(ctx, axes), toMap = MapAttr::pair(ctx, permuted);
-  unsigned from = kb.input(c.from.getArgNumber(), et, fromMap);
-  unsigned to = kb.inout(kernel.written[0], et, toMap);
+  Type et = c.in.getElementType();
+  SmallVector<MapAttr> axes(c.in.getRank()), from, to;
+  for (int64_t d = 0; d < c.in.getRank(); ++d)
+    if (!c.unit[d])
+      from.push_back(axes[d] = kb.axis("D" + std::to_string(d), c.in.getDimSize(d)));
+  for (auto [i, d] : llvm::enumerate(c.reads))
+    if (d >= 0)
+      to.push_back(axes[d]);
+    else if (c.out.getDimSize(i) > 1)
+      to.push_back(kb.axis("B" + std::to_string(i), c.out.getDimSize(i)));
+  MapAttr fromMap = MapAttr::pair(ctx, from), toMap = MapAttr::pair(ctx, to);
+  unsigned src = kb.input(c.from.getArgNumber(), et, fromMap);
+  unsigned dst = kb.inout(kernel.written[0], et, toMap);
   kb.beginBody();
   OpBuilder &b = kb.builder();
   Location loc = kb.loc();
-  Value src = ViewOp::create(b, loc, HbmViewType::get(ctx, et, kb.chip(), fromMap, false), kb.param(from));
-  Value dst = ViewOp::create(b, loc, HbmViewType::get(ctx, et, kb.chip(), toMap, true), kb.param(to));
-  HbmToHbmViewOp::create(b, loc, src, dst);
+  Value srcView = ViewOp::create(b, loc, HbmViewType::get(ctx, et, kb.chip(), fromMap, false), kb.param(src));
+  Value dstView = ViewOp::create(b, loc, HbmViewType::get(ctx, et, kb.chip(), toMap, true), kb.param(dst));
+  HbmToHbmViewOp::create(b, loc, srcView, dstView);
   kb.finish({});
   return success();
 }
 
 LogicalResult map(RaisedKernel &kernel) {
-  if (FailureOr<Transpose> t = findTranspose(kernel); succeeded(t))
-    return mapTranspose(kernel, *t);
+  if (FailureOr<Relayout> r = findRelayout(kernel); succeeded(r))
+    return mapRelayout(kernel, *r);
   FailureOr<Copy> found = find(kernel);
   if (failed(found))
     return kernel.func.emitError("copy: not a box copy between buffers");

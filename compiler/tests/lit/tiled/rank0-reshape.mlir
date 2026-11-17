@@ -1,12 +1,14 @@
-// RUN: env FURIOSA_TILED_DEBUG=1 not furiosa-mlir-opt --furiosa-linalg-to-fopt %s 2>&1 | FileCheck %s
+// RUN: env FURIOSA_TILED_DEBUG=1 furiosa-mlir-opt --furiosa-linalg-to-fopt %s 2>&1 | FileCheck %s
 
 // A row sum stored through a reshape of its rank-0 result (one row, as a split step of a 1-row reduction gets
 // it): the expand_shape's unit dim, which no reassociation group covers, indexes 0. The analysis used to leave
-// that index null and crash; now the program folds, and the class declines a scalar output cleanly.
+// that index null and crash; now the program folds, and the class declines a scalar output cleanly. The row-wise
+// class maps the kernel (one row's sum, stored through the reshape).
 
 // CHECK: tiled: row_sum:
 // CHECK: store arg1[0]
 // CHECK: tiled: row_sum: a scalar output
+// CHECK: func.func @row_sum(%arg0: !fopt.hbm<f32, <"1">, <"H{1024}">>
 
 #x = affine_map<(d0) -> (0, d0)>
 #s = affine_map<(d0) -> ()>

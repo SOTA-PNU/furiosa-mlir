@@ -131,8 +131,15 @@ private:
     auto add = [&](const std::string &a) { args += (args.empty() ? "" : ", ") + a; };
     if (auto mode = o.getMode())
       add("BinaryArgMode::" + mode->str());
+    // An i32 op (its enum's type says) takes its immediates' bits as i32.
+    StringRef op = o.getOp();
+    bool i32 = op.starts_with("FxpBinaryOp::") || op.starts_with("ClipBinaryOpI32::") ||
+               op.starts_with("LogicBinaryOpI32::");
+    auto immediate = [&](const APFloat &v) {
+      return i32 ? std::to_string(int32_t(v.bitcastToAPInt().getZExtValue())) + "i32" : rustF32(v.convertToFloat());
+    };
     if (auto imm = o.getImm())
-      add(rustF32(imm->convertToFloat()));
+      add(immediate(*imm));
     else if (Value v = o.getVrf(); v && !o.getBranches())
       add("&" + nameOf(v));
     else if (o.getStash() && !o.getBranches())
@@ -150,7 +157,7 @@ private:
           guard += "])";
         }
         if (auto f = dyn_cast<FloatAttr>(pair[1]))
-          b += "::imm(" + guard + ", " + rustF32(f.getValueAsDouble()) + ")";
+          b += "::imm(" + guard + ", " + immediate(f.getValue()) + ")";
         else if (Value v = o.getVrf())
           b += "::rf(" + guard + ", &" + nameOf(v) + ")";
         else
@@ -310,6 +317,10 @@ FailureOr<std::string> Emitter::chain(Value stream) {
             })
             .Case([&](VectorStashOp) {
               out << "\n.vector_stash()";
+              return success();
+            })
+            .Case([&](VectorFxpToFpOp o) {
+              out << "\n.vector_fxp_to_fp(" << o.getIntWidth() << ")";
               return success();
             })
             .Case([&](VectorFxpOp o) {

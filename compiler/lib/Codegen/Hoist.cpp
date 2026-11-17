@@ -296,20 +296,30 @@ void selectsToArithmetic(Block &body) {
   }
 }
 
+/// Whether an index-typed value only computes data (it reaches no tensor address): an index value feeding
+/// arithmetic that is cast back to an integer, like tl.arange(..) + x on i32s.
+bool onlyData(Value v) {
+  return llvm::all_of(v.getUsers(), [](Operation *user) {
+    if (isa<arith::IndexCastOp>(user))
+      return !user->getResult(0).getType().isIndex() || onlyData(user->getResult(0));
+    return isa<arith::AddIOp, arith::SubIOp, arith::MulIOp, arith::MaxSIOp, arith::MinSIOp>(user) && onlyData(user->getResult(0));
+  });
+}
+
 /// Hoists the index-only values of one generic; returns the generic that replaces it (or the same one).
 linalg::GenericOp hoist(linalg::GenericOp generic) {
   Block &body = generic.getRegion().front();
   selectsToArithmetic(body);
   llvm::DenseMap<Value, bool> memo;
   // Frontier values: index-only, of a scalar element type, read by something that is not, and computed
-  // (not a constant, not an index, which is addressing).
+  // (not a constant, not an index unless it only computes data: an index addresses).
   SmallVector<Value> frontier;
   for (Operation &op : body) {
     if (op.getNumResults() != 1 || op.hasTrait<OpTrait::ConstantLike>() || isa<linalg::IndexOp>(op))
       continue;
     Value v = op.getResult(0);
     Type t = v.getType();
-    if (t.isIndex() || !(t.isIntOrFloat()) || !isIndexOnly(v, body, memo))
+    if ((t.isIndex() && !onlyData(v)) || !t.isIntOrIndexOrFloat() || !isIndexOnly(v, body, memo))
       continue;
     if (llvm::any_of(v.getUsers(), [&](Operation *user) {
           return user->getNumResults() != 1 || !isIndexOnly(user->getResult(0), body, memo);
@@ -338,6 +348,9 @@ linalg::GenericOp hoist(linalg::GenericOp generic) {
     if (count > kMaxElements)
       continue;
     Type t = v.getType();
+    // A table holds bytes: a predicate is an i32 table compared with 0, an index an i32 table cast to index.
+    bool widened = t.isInteger(1) || t.isIndex();
+    Type tt = widened ? b.getI32Type() : t;
     SmallVector<Attribute> elements;
     SmallVector<int64_t> point(ranges.size(), 0);
     bool ok = true;
@@ -354,18 +367,21 @@ linalg::GenericOp hoist(linalg::GenericOp generic) {
       }
       if (isa<FloatType>(t))
         elements.push_back(b.getFloatAttr(t, x->f));
+      else if (widened && x->i != int32_t(x->i))
+        ok = false;
       else
-        elements.push_back(b.getIntegerAttr(t, x->i));
+        elements.push_back(b.getIntegerAttr(tt, x->i));
     }
     if (!ok)
       continue;
     if (dims.empty()) {
       // No dim: an ordinary constant, folded in place.
       OpBuilder inner = OpBuilder::atBlockBegin(&body);
-      v.replaceAllUsesWith(arith::ConstantOp::create(inner, v.getLoc(), cast<TypedAttr>(elements.front())));
+      Attribute c = widened ? b.getIntegerAttr(t, cast<IntegerAttr>(elements.front()).getInt()) : elements.front();
+      v.replaceAllUsesWith(arith::ConstantOp::create(inner, v.getLoc(), cast<TypedAttr>(c)));
       continue;
     }
-    auto type = RankedTensorType::get(shape, t);
+    auto type = RankedTensorType::get(shape, tt);
     constants.push_back(arith::ConstantOp::create(b, v.getLoc(), DenseElementsAttr::get(type, elements)));
     SmallVector<AffineExpr> results;
     for (unsigned d : dims)
@@ -392,8 +408,16 @@ linalg::GenericOp hoist(linalg::GenericOp generic) {
   Block &moved = replacement.getRegion().front();
   unsigned at = generic.getNumDpsInputs();
   for (auto [k, v] : llvm::enumerate(replaced)) {
-    BlockArgument arg = moved.insertArgument(at + k, v.getType(), v.getLoc());
-    v.replaceAllUsesWith(arg);
+    Type tt = cast<RankedTensorType>(constants[k].getType()).getElementType();
+    BlockArgument arg = moved.insertArgument(at + k, tt, v.getLoc());
+    Value read = arg;
+    OpBuilder inner = OpBuilder::atBlockBegin(&moved);
+    if (v.getType().isInteger(1))
+      read = arith::CmpIOp::create(inner, v.getLoc(), arith::CmpIPredicate::ne, arg,
+                                   arith::ConstantOp::create(inner, v.getLoc(), inner.getI32IntegerAttr(0)));
+    else if (v.getType().isIndex())
+      read = arith::IndexCastOp::create(inner, v.getLoc(), v.getType(), arg);
+    v.replaceAllUsesWith(read);
   }
   generic.replaceAllUsesWith(replacement.getResults());
   generic.erase();

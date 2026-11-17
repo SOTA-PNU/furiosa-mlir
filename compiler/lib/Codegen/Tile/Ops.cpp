@@ -37,8 +37,9 @@ LogicalResult ViewReshapeOp::verify() {
 }
 
 LogicalResult VectorAluOp::verify() {
-  if (!getInput().getType().getElementType().isF32() || !getResult().getType().getElementType().isF32())
-    return emitOpError("Vector Engine ALU calls of tiled kernels run on f32");
+  Type et = getInput().getType().getElementType();
+  if ((!et.isF32() && !et.isInteger(32)) || getResult().getType().getElementType() != et)
+    return emitOpError("Vector Engine ALU calls run on f32 or i32 streams and keep the type");
   int operands = (getImm() ? 1 : 0) + (getVrf() && !getBranches() ? 1 : 0) + (getStash() && !getBranches() ? 1 : 0) +
                  (getBranches() ? 1 : 0);
   if (operands > 1)
