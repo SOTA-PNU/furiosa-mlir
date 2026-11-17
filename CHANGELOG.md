@@ -26,6 +26,8 @@ npu stage) against GPU goldens.
   bit-exact on npu3 (db8aa18; fp16 stays out, it lives on the device as f32).
 - The tiled path's select takes each branch under the tag, bit for bit: a NaN or infinity in the branch not taken
   no longer leaks (it blended a·s + b·(1−s)), and selects with infinite constants map (057b951).
+- `tl.dot` on fp8 and int8 operands on npu3: fp8 buffers live as f32 like fp16 (decoded exactly, stored to the
+  nearest code); int8 sums run on the f32 path where exact (K <= 1024) (ae033b8).
 
 ## 1.1.0 (2026-11-17, release/1.1.0)
 
