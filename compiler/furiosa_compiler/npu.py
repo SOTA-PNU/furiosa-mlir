@@ -98,7 +98,10 @@ def executable(launch: Launch) -> tuple[Path, Path]:
         if record.exists() and Path(record.read_text()).exists():
             return Path(record.read_text()), work
         graph = Graph(launch.kernel.__name__, {b.name: b for b in launch.args.values() if isinstance(b, Buf)}, [launch])
-        result = driver.compile_graphs([graph], launch.kernel.__name__, work / "out")
+        # The crate is named after the work dir (kernel and specialization hash): every specialization of a kernel
+        # is its own workspace, so with one name they would share cargo's unit hashes, and a build in a target slot
+        # could take another specialization's binary as fresh.
+        result = driver.compile_graphs([graph], work.name, work / "out")
         build_crate(result, work / "out", work / "crate")
         env = dict(os.environ, FURIOSA_VISIBLE_CHIPS=NPU, PATH=f"{ROOT / '.tools' / 'bin'}:{os.environ['PATH']}")
         env.setdefault("LIBCLANG_PATH", "/usr/lib/llvm-18/lib")
