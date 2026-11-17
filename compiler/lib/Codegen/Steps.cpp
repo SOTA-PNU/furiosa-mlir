@@ -109,6 +109,18 @@ Value throughReshapes(Value v) {
   return v;
 }
 
+/// An identity generic copying `v` into a fresh tensor: a step of its own, the copy class's relayout.
+Value copyOf(OpBuilder &b, Location loc, Value v) {
+  auto t = cast<RankedTensorType>(v.getType());
+  Value empty = tensor::EmptyOp::create(b, loc, t.getShape(), t.getElementType());
+  AffineMap id = b.getMultiDimIdentityMap(t.getRank());
+  return linalg::GenericOp::create(
+             b, loc, TypeRange{t}, ValueRange{v}, ValueRange{empty}, ArrayRef<AffineMap>{id, id},
+             SmallVector<utils::IteratorType>(t.getRank(), utils::IteratorType::parallel),
+             [](OpBuilder &nb, Location l, ValueRange args) { linalg::YieldOp::create(nb, l, args[0]); })
+      .getResult(0);
+}
+
 /// Whether some op class maps `func` (mapped on a copy, its diagnostics dropped): an op class's match is a
 /// quick filter, its map the authority.
 /// The tensor constants of a function's body (tables hoistIndexOnly made): data the host uploads.
@@ -670,6 +682,7 @@ void Splitter::run(bool single) {
   auto written = returnOp ? kernel->getAttrOfType<ArrayAttr>("furiosa.written") : ArrayAttr();
   OpBuilder b(kernel.getContext());
   SmallVector<Operation *> outlinedOps;
+  SmallVector<std::pair<Value, unsigned>> misplaced; // results a step left in a temporary: (value, buffer)
   for (auto [s, group] : llvm::enumerate(groups)) {
     SmallVector<Value> inputs, outputs = outputsOf(s, /*all=*/false);
     std::string name;
@@ -705,7 +718,11 @@ void Splitter::run(bool single) {
         bool free = bt.getNumElements() == ot.getNumElements() && bt.getElementType() == ot.getElementType();
         for (size_t h = s + 1; h < groups.size() && free; ++h)
           free = !reads[h].contains(index);
-        if (free)
+        // A step that reads the buffer itself cannot take it as its destination too (the runtime refuses the
+        // aliasing): its result goes to a temporary, copied into the buffer last.
+        if (free && reads[s].contains(index))
+          misplaced.push_back({out, index});
+        else if (free)
           dest = reshapeTo(b, kernel.getLoc(), buffer, ot);
         break;
       }
@@ -718,6 +735,24 @@ void Splitter::run(bool single) {
     for (auto [out, result] : llvm::zip(outputs, call.getResults()))
       resultOf[out] = reshapeTo(b, kernel.getLoc(), result, cast<RankedTensorType>(out.getType()));
     llvm::append_range(outlinedOps, group.ops);
+  }
+  for (auto [out, index] : misplaced) {
+    Value value = resultOf[out];
+    auto t = cast<RankedTensorType>(value.getType());
+    std::string name;
+    for (int k = 0; name.empty() || module.lookupSymbol(name); ++k)
+      name = (kernel.getName() + "__s" + Twine(k)).str();
+    OpBuilder detached(kernel.getContext());
+    auto copy = func::FuncOp::create(detached, kernel.getLoc(), name, b.getFunctionType({t, t}, {t}));
+    copy->setAttr("furiosa.written", b.getI64ArrayAttr({1}));
+    OpBuilder cb = OpBuilder::atBlockBegin(copy.addEntryBlock());
+    func::ReturnOp::create(cb, kernel.getLoc(), copyOf(cb, kernel.getLoc(), copy.getArgument(0)));
+    copy.setPrivate();
+    module.push_back(copy);
+    b.setInsertionPoint(terminator);
+    resultOf[out] = func::CallOp::create(b, kernel.getLoc(), copy,
+                                         ValueRange{value, reshapeTo(b, kernel.getLoc(), kernel.getArgument(index), t)})
+                        .getResult(0);
   }
   // The kernel now only calls steps: what remains reads the step results; the unit ops (outlined, or
   // recomputed by every step that read them) go.
@@ -780,8 +815,30 @@ void Splitter::run(bool single) {
 
 } // namespace
 
+namespace {
+/// A buffer argument the kernel returns into another written buffer (an atomic's old value) is a copy, which
+/// order() runs before a step overwrites its source.
+void copyReturnedArguments(func::FuncOp kernel) {
+  Block &block = kernel.getBody().front();
+  auto ret = dyn_cast<func::ReturnOp>(block.getTerminator());
+  auto written = kernel->getAttrOfType<ArrayAttr>("furiosa.written");
+  if (!ret || !written)
+    return;
+  OpBuilder b(ret);
+  for (OpOperand &use : ret->getOpOperands()) {
+    auto arg = dyn_cast<BlockArgument>(throughReshapes(use.get()));
+    if (!arg || arg.getOwner() != &block ||
+        int64_t(arg.getArgNumber()) == cast<IntegerAttr>(written[use.getOperandNumber()]).getInt())
+      continue;
+    use.set(copyOf(b, ret.getLoc(), use.get()));
+  }
+}
+
+} // namespace
+
 LogicalResult mlir::furiosa::splitSteps(ModuleOp module) {
-  module.getContext()->loadDialect<fopt::FoptDialect>(); // the mapping oracle builds fopt kernels
+  // The mapping oracle builds fopt kernels; steps add tensor and linalg ops to a kernel that may have had none.
+  module.getContext()->loadDialect<fopt::FoptDialect, tensor::TensorDialect, linalg::LinalgDialect>();
   SmallVector<func::FuncOp> kernels;
   for (auto func : module.getOps<func::FuncOp>())
     if (func.isPublic() && !func->hasAttr(kStepsAttr))
@@ -801,6 +858,8 @@ LogicalResult mlir::furiosa::splitSteps(ModuleOp module) {
     return failure();
   hoistIndexOnly(module);
   sliceKeptLoops(module);
+  for (func::FuncOp kernel : kernels)
+    copyReturnedArguments(kernel);
   for (func::FuncOp kernel : kernels) {
     // A kept loop's body splits into steps of its own, which the plan runs once per iteration; the fills that
     // start its carried values become tables.
