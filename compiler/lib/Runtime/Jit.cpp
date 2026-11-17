@@ -27,6 +27,8 @@
 #include "mlir/Dialect/MemRef/Transforms/BufferViewFlowOpInterfaceImpl.h"
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/PatternMatch.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Dialect/SCF/IR/ValueBoundsOpInterfaceImpl.h"
 #include "mlir/Dialect/SCF/Transforms/BufferDeallocationOpInterfaceImpl.h"
 #include "mlir/Dialect/SCF/Transforms/BufferizableOpInterfaceImpl.h"
@@ -62,6 +64,38 @@ namespace {
 // model graph calls kernels hundreds of times), then lower to the LLVM dialect. Arguments are marked
 // non-writable first, so bufferization copies instead of writing them.
 // The pipeline text is relative to the module-anchored pass manager it is parsed into.
+/// arith.extf from f8E4M3FN, which LLVM has no type for, decoded from its bits: sign, 4 exponent bits
+/// (bias 7), 3 mantissa bits; exponent 0 is subnormal (mantissa * 2^-9); S.1111.111 is NaN, and there
+/// are no infinities.
+struct ExtFromF8E4M3FN : OpRewritePattern<arith::ExtFOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(arith::ExtFOp op, PatternRewriter &rw) const override {
+    if (!isa<Float8E4M3FNType>(op.getIn().getType()))
+      return failure();
+    Location loc = op.getLoc();
+    Type i32 = rw.getI32Type(), f32 = rw.getF32Type();
+    auto c = [&](int64_t v) -> Value { return arith::ConstantIntOp::create(rw, loc, i32, v); };
+    Value bits = arith::ExtUIOp::create(rw, loc, i32, arith::BitcastOp::create(rw, loc, rw.getI8Type(), op.getIn()));
+    Value sign = arith::ShLIOp::create(rw, loc, arith::ShRUIOp::create(rw, loc, bits, c(7)), c(31));
+    Value exp = arith::AndIOp::create(rw, loc, arith::ShRUIOp::create(rw, loc, bits, c(3)), c(15));
+    Value man = arith::AndIOp::create(rw, loc, bits, c(7));
+    Value normal = arith::OrIOp::create(rw, loc, arith::ShLIOp::create(rw, loc, arith::AddIOp::create(rw, loc, exp, c(120)), c(23)),
+                                        arith::ShLIOp::create(rw, loc, man, c(20)));
+    Value sub = arith::BitcastOp::create(
+        rw, loc, i32, arith::MulFOp::create(rw, loc, arith::UIToFPOp::create(rw, loc, f32, man),
+                                            arith::ConstantFloatOp::create(rw, loc, cast<FloatType>(f32), APFloat(0x1p-9f))));
+    Value isSub = arith::CmpIOp::create(rw, loc, arith::CmpIPredicate::eq, exp, c(0));
+    Value isNan = arith::CmpIOp::create(rw, loc, arith::CmpIPredicate::eq, arith::AndIOp::create(rw, loc, bits, c(127)), c(127));
+    Value mag = arith::SelectOp::create(rw, loc, isNan, c(0x7fc00000), arith::SelectOp::create(rw, loc, isSub, sub, normal));
+    Value f = arith::BitcastOp::create(rw, loc, f32, arith::OrIOp::create(rw, loc, sign, mag));
+    if (op.getType() != f32)
+      f = op.getType().getIntOrFloatBitWidth() > 32 ? arith::ExtFOp::create(rw, loc, op.getType(), f).getResult()
+                                                    : arith::TruncFOp::create(rw, loc, op.getType(), f).getResult();
+    rw.replaceOp(op, f);
+    return success();
+  }
+};
+
 constexpr const char *kPipeline =
     "one-shot-bufferize{bufferize-function-boundaries function-boundary-type-conversion=identity-layout-map "
     "allow-return-allocs-from-loops},"
@@ -183,6 +217,9 @@ std::unique_ptr<JitModule> JitModule::compile(llvm::StringRef text, std::string 
         func.setArgAttr(i, "bufferization.writable", BoolAttr::get(&ctx, false));
   }
 
+  RewritePatternSet f8(&ctx);
+  f8.add<ExtFromF8E4M3FN>(&ctx);
+  (void)applyPatternsGreedily(*module, std::move(f8));
   PassManager pm(&ctx);
   if (failed(parsePassPipeline(kPipeline, pm, diagnostics)) || failed(pm.run(*module))) {
     diagnostics << "lowering the raised module to LLVM failed\n";
