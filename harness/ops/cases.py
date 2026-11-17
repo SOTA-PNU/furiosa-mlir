@@ -22,7 +22,8 @@ EXTRA_DTYPES = {"reduce_or": ["int32"], "squeeze_ravel": ALL, "rand": ["float32"
                 "randint": ["int32"], "rand4x": ["float32"], "randn4x": ["float32"], "randint4x": ["int32"],
                 "join": ALL, "split": ALL, "interleave": ALL, "cat": ALL, "swizzle2d": ["int32"],
                 "umulhi": ["int32"], "gather_data": ["int32"], "histogram": ["int32"], "maximum_nan": ["float32"], "atomic_cas_old": ["int32"],
-                "device_print": ["float32"], "device_assert": ["float32"], "range_loop": ["float32"]}
+                "device_print": ["float32"], "device_assert": ["float32"], "while_loop": ["float32"],
+                "range_loop": ["float32"]}
 
 
 def _philox(seed: int, offs: np.ndarray) -> list:
@@ -303,6 +304,8 @@ def _build_extra(case: Case, rows: int, c: int, dt: str, g):
         refs["x_ptr"] = {"atomic_xchg_old": ys, "atomic_add_old": xs + ys,
                          "atomic_cas_old": torch.where(xs == xs * even, ys, xs)}[op]  # cmp: x on even offsets, else 0
         ref = xs
+    elif op == "while_loop":
+        ref = xs * 4
     else:  # range_loop
         ref = xs * 0 + 6
     refs["out_ptr"] = ref

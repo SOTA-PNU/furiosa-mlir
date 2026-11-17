@@ -13,6 +13,7 @@ add_triton_library(FuriosaTransforms
     MLIRTransformUtils
     MLIRMathDialect
     MLIRSCFDialect
+    MLIRSCFTransforms
     MLIRTensorDialect
     MLIRPass
     MLIRTransforms

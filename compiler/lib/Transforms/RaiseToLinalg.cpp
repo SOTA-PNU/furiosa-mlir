@@ -23,6 +23,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/SCF/Transforms/Transforms.h"
 #include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -3670,6 +3671,14 @@ LogicalResult Raiser::raiseStoreIn(Write store, const StoreSpace &spRef) {
 /// the identity elsewhere; otherwise with j's condition as one more operand, and a combiner that keeps
 /// the accumulator where it fails.
 void Raiser::lowerScans() {
+  // A counted while loop (cmpi on a counter it steps) is a for loop: upstream's uplift.
+  SmallVector<scf::WhileOp> whiles;
+  kernel.walk([&](scf::WhileOp w) { whiles.push_back(w); });
+  IRRewriter rw(ctx);
+  for (scf::WhileOp w : whiles) {
+    rw.setInsertionPoint(w);
+    (void)scf::upliftWhileToForLoop(rw, w);
+  }
   SmallVector<tt::ScanOp> scans;
   kernel.walk([&](tt::ScanOp s) { scans.push_back(s); });
   for (tt::ScanOp scan : scans) {

@@ -17,7 +17,7 @@ ATOMIC = ["atomic_add", "atomic_max", "atomic_min", "atomic_and", "atomic_or", "
 EXTRA = ["reduce_or", "topk", "map_elementwise", "squeeze_ravel", "broadcast", "rand", "randn", "randint", "rand4x",
          "randn4x", "randint4x", "associative_scan", "reduce_keep_dims", "join", "split", "interleave", "cat",
          "swizzle2d", "umulhi", "gather", "gather_data", "histogram", "maximum_nan", "atomic_xchg_old", "atomic_add_old", "atomic_cas_old",
-         "device_print", "device_assert", "range_loop"]
+         "device_print", "device_assert", "while_loop", "range_loop"]
 
 
 @triton.jit
@@ -345,6 +345,12 @@ def extra_kernel(x_ptr, y_ptr, out_ptr, R: tl.constexpr, C: tl.constexpr, OP: tl
     elif OP == 27:
         tl.device_assert(x == x, "x is not NaN")
         out = x
+    elif OP == 28:
+        out = x * 0
+        i = 0
+        while i < 4:
+            out += x
+            i += 1
     else:
         out = x * 0
         for i in tl.range(0, 4):
