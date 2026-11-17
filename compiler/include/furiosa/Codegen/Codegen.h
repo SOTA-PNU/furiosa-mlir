@@ -27,6 +27,10 @@ FailureOr<std::string> foptSignature(ModuleOp module);
 /// the radices and cut to a box, and drops inputs that only carried loop extents (lib/Codegen/Normalize.cpp).
 void normalizeKernels(ModuleOp module);
 
+/// Takes contractions apart into the 2-D form op classes map: computed factors become producers, a non-zero
+/// start is added after, batch dims split into slices, dims collapse (lib/Codegen/Contract.cpp).
+void normalizeContractions(ModuleOp module);
+
 /// Evaluates every value of a linalg.generic body that depends only on the iteration indices at compile time,
 /// over the dims it reads, and replaces it with a constant tensor input (lib/Codegen/Hoist.cpp).
 void hoistIndexOnly(ModuleOp module);

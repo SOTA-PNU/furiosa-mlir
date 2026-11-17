@@ -51,6 +51,82 @@ FailureOr<std::pair<int64_t, std::map<unsigned, int64_t>>> linearForm(AffineExpr
   return failure();
 }
 
+/// An index computed in a generic body as an affine function of the loop indices, or null.
+AffineExpr affineIndex(Value v, Block &body, MLIRContext *ctx) {
+  if (auto c = v.getDefiningOp<arith::ConstantOp>())
+    if (auto i = dyn_cast<IntegerAttr>(c.getValue()))
+      return getAffineConstantExpr(i.getInt(), ctx);
+  Operation *op = v.getDefiningOp();
+  if (!op || op->getBlock() != &body)
+    return {};
+  if (auto index = dyn_cast<linalg::IndexOp>(op))
+    return getAffineDimExpr(index.getDim(), ctx);
+  if (isa<arith::IndexCastOp, arith::IndexCastUIOp>(op))
+    return affineIndex(op->getOperand(0), body, ctx);
+  AffineExpr a = op->getNumOperands() == 2 ? affineIndex(op->getOperand(0), body, ctx) : AffineExpr();
+  AffineExpr b = op->getNumOperands() == 2 ? affineIndex(op->getOperand(1), body, ctx) : AffineExpr();
+  if (!a || !b)
+    return {};
+  if (isa<arith::AddIOp>(op))
+    return a + b;
+  if (isa<arith::SubIOp>(op))
+    return a - b;
+  if (isa<arith::MulIOp>(op) && (isa<AffineConstantExpr>(a) || isa<AffineConstantExpr>(b)))
+    return a * b;
+  return {};
+}
+
+/// Reads a generic body makes with tensor.extract at affine addresses of a buffer defined outside it become
+/// inputs read through that affine map (delinearize then makes them projections). Structure promotes such
+/// reads itself unless they are masked by a bound it cannot pad; the mask is maskToPad's.
+linalg::GenericOp promoteExtracts(linalg::GenericOp g) {
+  Block &body = g.getRegion().front();
+  MLIRContext *ctx = g.getContext();
+  SmallVector<tensor::ExtractOp> extracts;
+  SmallVector<AffineMap> maps;
+  body.walk([&](tensor::ExtractOp e) {
+    Value t = e.getTensor();
+    if (t.getParentBlock() == &body || e->getParentOp() != g.getOperation())
+      return;
+    SmallVector<AffineExpr> exprs;
+    for (Value index : e.getIndices()) {
+      AffineExpr x = affineIndex(index, body, ctx);
+      if (!x)
+        return;
+      exprs.push_back(x);
+    }
+    extracts.push_back(e);
+    maps.push_back(AffineMap::get(g.getNumLoops(), 0, exprs, ctx));
+  });
+  if (extracts.empty())
+    return g;
+  OpBuilder b(g);
+  SmallVector<Value> inputs(g.getDpsInputs());
+  SmallVector<AffineMap> allMaps;
+  for (OpOperand *in : g.getDpsInputOperands())
+    allMaps.push_back(g.getMatchingIndexingMap(in));
+  for (auto [e, m] : llvm::zip(extracts, maps)) {
+    inputs.push_back(e.getTensor());
+    allMaps.push_back(m);
+  }
+  for (OpOperand &out : g.getDpsInitsMutable())
+    allMaps.push_back(g.getMatchingIndexingMap(&out));
+  auto replacement = linalg::GenericOp::create(b, g.getLoc(), g.getResultTypes(), inputs, g.getDpsInits(), allMaps,
+                                               g.getIteratorTypesArray());
+  replacement->setDiscardableAttrs(g->getDiscardableAttrDictionary());
+  replacement.getRegion().takeBody(g.getRegion());
+  Block &moved = replacement.getRegion().front();
+  unsigned at = g.getNumDpsInputs();
+  for (auto [k, e] : llvm::enumerate(extracts)) {
+    BlockArgument arg = moved.insertArgument(at + k, e.getType(), e.getLoc());
+    e.replaceAllUsesWith(Value(arg));
+    e.erase();
+  }
+  g.replaceAllUsesWith(replacement.getResults());
+  g.erase();
+  return replacement;
+}
+
 /// Rewrites input `i` of `g` to a projected read when its map's results are mixed-radix combinations.
 void delinearize(linalg::GenericOp g, unsigned i) {
   OpOperand *operand = g.getDpsInputOperand(i);
@@ -265,6 +341,7 @@ void mlir::furiosa::normalizeKernels(ModuleOp module) {
   SmallVector<linalg::GenericOp> generics;
   module.walk([&](linalg::GenericOp g) { generics.push_back(g); });
   for (linalg::GenericOp g : generics) {
+    g = promoteExtracts(g);
     for (unsigned i = 0; i < g.getNumDpsInputs(); ++i) {
       delinearize(g, i);
       maskToPad(g, i);

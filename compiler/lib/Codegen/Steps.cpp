@@ -15,7 +15,9 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/IR/Verifier.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
 
 #include "llvm/ADT/SetVector.h"
@@ -32,13 +34,16 @@ constexpr llvm::StringLiteral kStepsAttr = "furiosa.steps";
 
 bool isReshape(Operation *op) { return isa<tensor::CollapseShapeOp, tensor::ExpandShapeOp>(op); }
 
+/// Ops cloned into every step that reads them: they move no data, or describe a read (a padded view) an op
+/// class may absorb.
 bool isCheap(Operation *op) {
-  return isReshape(op) || isa<tensor::EmptyOp, linalg::FillOp, arith::ConstantOp>(op);
+  return isReshape(op) || isa<tensor::EmptyOp, linalg::FillOp, arith::ConstantOp, tensor::PadOp>(op);
 }
 
+/// Everything else at the top level is part of some step: a step an op class may not map (a kept loop, say)
+/// still gives a valid plan, and L2 names it.
 bool isUnit(Operation *op) {
-  return (isa<linalg::LinalgOp>(op) && !isa<linalg::FillOp>(op)) ||
-         isa<tensor::InsertSliceOp, tensor::ExtractSliceOp>(op);
+  return !isCheap(op) && !isa<func::ReturnOp, func::CallOp>(op) && op->getNumResults() > 0;
 }
 
 /// `v` as a tensor of type `t` with the same elements in row-major order (collapse to 1-D, expand back).
@@ -376,9 +381,18 @@ func::FuncOp Splitter::outline(const Group &g, StringRef name, ArrayRef<Value> o
       return;
     if (def && def->getBlock() != &block)
       return; // defined inside one of the ops' own regions
-    if (def && isCheap(def) && !resultOf.count(v)) {
-      for (Value operand : def->getOperands())
-        need(operand);
+    // A reshape of something the step reads stays in the plan (it moves no data): the step reads the
+    // reshaped buffer, so op classes see a plain argument.
+    Operation *root = throughReshapes(v).getDefiningOp();
+    bool readsReshaped = def && isReshape(def) &&
+                         (!root || resultOf.count(throughReshapes(v)) || !(isCheap(root) || g.contains(root)));
+    if (def && isCheap(def) && !resultOf.count(v) && !readsReshaped) {
+      // Its own operands, and what its regions capture (a pad's padding value).
+      def->walk([&](Operation *nested) {
+        for (Value operand : nested->getOperands())
+          if (!(operand.getDefiningOp() && def->isAncestor(operand.getDefiningOp())))
+            need(operand);
+      });
       cloned.insert(def);
       return;
     }
@@ -402,7 +416,10 @@ func::FuncOp Splitter::outline(const Group &g, StringRef name, ArrayRef<Value> o
     // An insert_slice updates the buffer it writes (through reshapes) in place; order() put the steps that
     // read the buffer's earlier value first, and stepsPlan rejects a plan that would read it stale.
     auto insert = out.getDefiningOp<tensor::InsertSliceOp>();
-    auto dest = insert ? llvm::find(inputs, throughReshapes(insert.getDest())) : inputs.end();
+    auto dest = inputs.end();
+    Value d = insert ? insert.getDest() : Value();
+    while (d && (dest = llvm::find(inputs, d)) == inputs.end())
+      d = d.getDefiningOp() && isReshape(d.getDefiningOp()) ? d.getDefiningOp()->getOperand(0) : Value();
     if (dest != inputs.end()) {
       written.push_back(dest - inputs.begin());
     } else {
@@ -436,6 +453,13 @@ func::FuncOp Splitter::outline(const Group &g, StringRef name, ArrayRef<Value> o
   for (auto [out, w] : llvm::zip(outputs, written))
     results.push_back(reshapeTo(b, kernel.getLoc(), map.lookup(out), cast<RankedTensorType>(argTypes[w])));
   func::ReturnOp::create(b, kernel.getLoc(), results);
+  // Reshapes of fills and of other reshapes inside the step fold away (upstream canonicalizations).
+  MLIRContext *ctx = kernel.getContext();
+  RewritePatternSet patterns(ctx);
+  linalg::FillOp::getCanonicalizationPatterns(patterns, ctx);
+  tensor::CollapseShapeOp::getCanonicalizationPatterns(patterns, ctx);
+  tensor::ExpandShapeOp::getCanonicalizationPatterns(patterns, ctx);
+  (void)applyPatternsGreedily(func.getBody(), std::move(patterns));
   return func;
 }
 
@@ -625,8 +649,8 @@ void Splitter::run(bool single) {
         erased = true;
       }
   }
-  // The kernel's own cheap ops on step results move after the calls, each after its operands (those made
-  // with the calls are in place already).
+  // The kernel's own cheap ops on step results move right after their operands, before the later steps that
+  // read them (those made with the calls are in place already).
   llvm::SetVector<Operation *> late;
   for (bool grew = true; grew;) {
     grew = false;
@@ -644,7 +668,11 @@ void Splitter::run(bool single) {
             Operation *def = v.getDefiningOp();
             return !def || !late.contains(def) || moved.contains(def);
           })) {
-        op->moveBefore(returnOp);
+        Operation *last = nullptr;
+        for (Value v : op->getOperands())
+          if (Operation *def = v.getDefiningOp(); def && def->getBlock() == &block && (!last || last->isBeforeInBlock(def)))
+            last = def;
+        op->moveAfter(last);
         moved.insert(op);
       }
   kernel->setAttr(kStepsAttr, b.getUnitAttr());
@@ -658,7 +686,12 @@ LogicalResult mlir::furiosa::splitSteps(ModuleOp module) {
   for (auto func : module.getOps<func::FuncOp>())
     if (func.isPublic() && !func->hasAttr(kStepsAttr))
       kernels.push_back(func);
+  // Kernels an op class maps as raised stay as they are: normalizing could only lose that (a batched
+  // contraction mapped whole would split into a step per batch).
+  if (llvm::all_of(kernels, mapsWhole))
+    return success();
   normalizeKernels(module);
+  normalizeContractions(module);
   // Reads the normalization rewrote alike (each operand gets its own reshape and box) become one again.
   PassManager pm(module.getContext());
   pm.addPass(createCSEPass());
@@ -671,7 +704,8 @@ LogicalResult mlir::furiosa::splitSteps(ModuleOp module) {
     else if (!tensorConstants(kernel).empty())
       Splitter(kernel).run(/*single=*/true);
   }
-  return success();
+  // A bad split must fail here, not print in generic form for a later stage to choke on.
+  return verify(module);
 }
 
 FailureOr<std::string> mlir::furiosa::stepsPlan(ModuleOp module) {

@@ -3,11 +3,12 @@
 // `tensor.extract_slice %src`, the source's tile view copied whole into the written buffer. Static offsets,
 // unit strides; reshapes around the buffers move no data, so the box is described in the slice's own shape.
 // An insert into a zero fill (a padded read) writes the box into the fresh written buffer, which starts as
-// zeros.
+// zeros. A linalg.transpose of a buffer is one DMA between the two layouts.
 
 #include "Mapping.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Matchers.h"
 
@@ -73,9 +74,62 @@ FailureOr<Copy> find(RaisedKernel &kernel) {
   return c;
 }
 
-bool match(RaisedKernel &kernel) { return succeeded(find(kernel)); }
+/// A transpose of a buffer into the written buffer: `perm[i]` is the input dimension output dimension i reads.
+struct Transpose {
+  BlockArgument from;
+  RankedTensorType type; // the input's
+  SmallVector<int64_t> perm;
+};
+
+FailureOr<Transpose> findTranspose(RaisedKernel &kernel) {
+  Block &block = kernel.func.getBody().front();
+  auto ret = cast<func::ReturnOp>(block.getTerminator());
+  if (kernel.written.size() != 1 || ret.getNumOperands() != 1)
+    return failure();
+  Value result = ret.getOperand(0);
+  while (result.getDefiningOp() && isa<tensor::CollapseShapeOp, tensor::ExpandShapeOp>(result.getDefiningOp()))
+    result = result.getDefiningOp()->getOperand(0);
+  auto t = result.getDefiningOp<linalg::TransposeOp>();
+  if (!t || !t.getInit().getDefiningOp<tensor::EmptyOp>())
+    return failure();
+  Transpose c{argOf(t.getInput(), block), cast<RankedTensorType>(t.getInput().getType()),
+              llvm::to_vector(t.getPermutation())};
+  if (!c.from || int64_t(c.from.getArgNumber()) == kernel.written[0])
+    return failure();
+  for (Operation &op : block.without_terminator())
+    if (&op != t && !isa<tensor::CollapseShapeOp, tensor::ExpandShapeOp, tensor::EmptyOp>(op))
+      return failure();
+  return c;
+}
+
+bool match(RaisedKernel &kernel) { return succeeded(find(kernel)) || succeeded(findTranspose(kernel)); }
+
+/// One DMA between the input's layout and the permuted one: the axes name elements, the maps lay them out.
+LogicalResult mapTranspose(RaisedKernel &kernel, const Transpose &c) {
+  KernelBuilder kb(kernel);
+  MLIRContext *ctx = kb.getContext();
+  Type et = c.type.getElementType();
+  SmallVector<MapAttr> axes, permuted;
+  for (int64_t d = 0; d < c.type.getRank(); ++d)
+    axes.push_back(kb.axis("D" + std::to_string(d), c.type.getDimSize(d)));
+  for (int64_t d : c.perm)
+    permuted.push_back(axes[d]);
+  MapAttr fromMap = MapAttr::pair(ctx, axes), toMap = MapAttr::pair(ctx, permuted);
+  unsigned from = kb.input(c.from.getArgNumber(), et, fromMap);
+  unsigned to = kb.inout(kernel.written[0], et, toMap);
+  kb.beginBody();
+  OpBuilder &b = kb.builder();
+  Location loc = kb.loc();
+  Value src = ViewOp::create(b, loc, HbmViewType::get(ctx, et, kb.chip(), fromMap, false), kb.param(from));
+  Value dst = ViewOp::create(b, loc, HbmViewType::get(ctx, et, kb.chip(), toMap, true), kb.param(to));
+  HbmToHbmViewOp::create(b, loc, src, dst);
+  kb.finish({});
+  return success();
+}
 
 LogicalResult map(RaisedKernel &kernel) {
+  if (FailureOr<Transpose> t = findTranspose(kernel); succeeded(t))
+    return mapTranspose(kernel, *t);
   FailureOr<Copy> found = find(kernel);
   if (failed(found))
     return kernel.func.emitError("copy: not a box copy between buffers");

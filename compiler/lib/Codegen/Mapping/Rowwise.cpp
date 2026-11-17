@@ -27,6 +27,7 @@
 
 #include "llvm/ADT/TypeSwitch.h"
 
+#include <cmath>
 #include <map>
 #include <set>
 
@@ -103,20 +104,41 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
       full = t;
     dag.outTypes.push_back(t.getElementType());
   }
-  if (full.getRank() < 2) {
-    why = "expected a [rows..., columns] output";
-    return failure();
-  }
   for (Value result : ret.getOperands()) {
     auto t = cast<RankedTensorType>(result.getType());
-    if (t.getShape() != full.getShape() && t.getShape() != full.getShape().drop_back()) {
+    if (t.getShape() != full.getShape() && t.getShape() != full.getShape().drop_back() &&
+        !llvm::all_of(ret.getOperands(), [&](Value v) { return v.getType() == t; })) {
       why = "expected [rows..., columns] outputs of one shape, and [rows...] ones";
       return failure();
     }
   }
-  dag.rowExtents.assign(full.getShape().begin(), full.getShape().end() - 1);
-  dag.r = full.getNumElements() / full.getShape().back();
-  dag.h = full.getShape().back();
+  // Only row values stored: the rows are their shape, and the columns the extent a reduction over the rows
+  // reduces.
+  linalg::GenericOp reducer;
+  for (auto g : func.getOps<linalg::GenericOp>())
+    if (!reducer && g.getNumReductionLoops() == 1 &&
+        cast<RankedTensorType>(g.getResultTypes()[0]).getShape() == full.getShape())
+      reducer = g;
+  bool sameShapes = llvm::all_of(ret.getOperands(), [&](Value v) { return v.getType() == ret.getOperand(0).getType(); });
+  bool onlyRows = sameShapes && reducer;
+  if (!onlyRows && full.getRank() < 2) {
+    why = "expected a [rows..., columns] output";
+    return failure();
+  }
+  if (onlyRows) {
+    int64_t reduced = 1;
+    if (reducer)
+      for (auto [d, it] : llvm::enumerate(reducer.getIteratorTypesArray()))
+        if (it == utils::IteratorType::reduction)
+          reduced = reducer.getStaticLoopRanges()[d];
+    dag.rowExtents.assign(full.getShape().begin(), full.getShape().end());
+    dag.r = full.getNumElements();
+    dag.h = reduced;
+  } else {
+    dag.rowExtents.assign(full.getShape().begin(), full.getShape().end() - 1);
+    dag.r = full.getNumElements() / full.getShape().back();
+    dag.h = full.getShape().back();
+  }
   const unsigned k = dag.rowExtents.size();
 
   std::map<Operation *, int> genericNode; // a generic's yielded value at a point of its domain
@@ -214,6 +236,17 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
       n.col = read->col;
       return dag.add(n);
     }
+    // A fill is a constant.
+    if (auto fill = t.getDefiningOp<linalg::FillOp>()) {
+      llvm::APFloat f(0.0f);
+      if (matchPattern(fill.getInputs()[0], m_ConstantFloat(&f))) {
+        bool lost;
+        f.convert(llvm::APFloat::IEEEsingle(), llvm::APFloat::rmNearestTiesToEven, &lost);
+        Node n{Node::Const};
+        n.value = f.convertToFloat();
+        return dag.add(n);
+      }
+    }
     auto producer = t.getDefiningOp<linalg::GenericOp>();
     if (!producer) {
       why = "an operand is neither a buffer nor a generic's result";
@@ -281,6 +314,7 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
                              .Case<arith::MinimumFOp, arith::MinNumFOp>([](auto) { return "min"; })
                              .Case<arith::NegFOp>([](auto) { return "neg"; })
                              .Case<math::ExpOp>([](auto) { return "exp"; })
+                             .Case<math::Exp2Op>([](auto) { return "exp2"; })
                              .Case<math::SqrtOp>([](auto) { return "sqrt"; })
                              .Case<math::RsqrtOp>([](auto) { return "rsqrt"; })
                              .Case<math::TanhOp>([](auto) { return "tanh"; })
@@ -305,6 +339,17 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
       // Casts: an extension of an input is the f32 fetch; the final truncation is the output cast.
       if (name == "ext" || name == "trunc")
         return scalar[v] = args[0];
+      // 2^x = e^(x ln 2): the Vector Engine has e^x (within its ulp budget, not bit-exact to exp2).
+      if (name == "exp2") {
+        Node ln2{Node::Const};
+        ln2.value = float(M_LN2);
+        Node scaled{Node::Op};
+        scaled.op = "mul";
+        scaled.args = {args[0], dag.add(ln2)};
+        scaled.shape = dag.nodes[args[0]].shape;
+        name = "exp";
+        args = {dag.add(scaled)};
+      }
       Node n{Node::Op};
       n.op = name;
       n.args = args;
@@ -394,6 +439,26 @@ void rewriteRsqrt(Dag &dag) {
   }
 }
 
+/// c - x -> -x + c when x is the streamed operand (c of a smaller shape: a constant, a row value): the Vector
+/// Engine subtracts only from the streamed value. Negation is exact, so the sum is the difference.
+void rewriteReversedSub(Dag &dag) {
+  for (size_t i = 0; i < dag.nodes.size(); ++i) {
+    if (dag.nodes[i].kind != Node::Op || dag.nodes[i].op != "sub")
+      continue;
+    int c = dag.nodes[i].args[0], x = dag.nodes[i].args[1];
+    if (dag.nodes[c].shape == dag.nodes[i].shape)
+      continue;
+    Node neg{Node::Op};
+    neg.op = "neg";
+    neg.args = {x};
+    neg.shape = dag.nodes[x].shape;
+    int negNode = dag.add(neg);
+    Node &n = dag.nodes[i];
+    n.op = "add";
+    n.args = {negNode, c};
+  }
+}
+
 /// 1 / (1 + exp(-x)) -> sigmoid(x), and exp(-x) -> negexp(x): the Vector Engine computes both directly, and
 /// has no reciprocal for the first.
 void rewriteSigmoid(Dag &dag) {
@@ -424,7 +489,7 @@ enum Stage { Tag = 0, Narrow = 4, Fp = 5, Reduce = 6, FpDiv = 7, Widen = 8, Clip
 
 class Planner {
 public:
-  Planner(KernelBuilder &kb, Dag &dag) : kb(kb), dag(dag), ctx(kb.getContext()) {}
+  Planner(KernelBuilder &kb, Dag &dag, RaisedKernel &raised) : kb(kb), dag(dag), raised(raised), ctx(kb.getContext()) {}
 
   /// Declares the axes and the kernel's inputs and outputs (before the body).
   LogicalResult declare(func::FuncOp func, ArrayRef<int64_t> written);
@@ -436,6 +501,7 @@ public:
 private:
   KernelBuilder &kb;
   Dag &dag;
+  RaisedKernel &raised;
   MLIRContext *ctx;
   SmallVector<std::pair<int, MapAttr>> rowAxes; // (row dim, axis), outermost first; dim -1: the single row
   int64_t inner = 1;                             // rows inside the outermost row axis
@@ -450,8 +516,18 @@ private:
   MapAttr rowsMap(int64_t len);
   /// The HBM mapping of an input: the row axes it varies along, then the column axis.
   MapAttr inputMap(const Node &n);
-  /// The HBM mapping of an output: every row axis, then the column axis (not for a row value, one f32 a row).
+  /// The HBM mapping of an output: every row axis, then the column axis (none for row values, one f32 a row).
   MapAttr outMap(bool row = false);
+  /// A row value's f32 padded to 8 bytes, the unit DM moves: how row values cross between HBM and DM (through a
+  /// padded HBM scratch, byte-granular HBM-to-HBM copies on either side).
+  MapAttr padded(MapAttr rows) { return MapAttr::pair(ctx, {rows, rowPacket(2)}); }
+  /// The DM element of an input: the columns, or a row value's padded f32.
+  MapAttr inputElement(const Node &n) { return n.col ? H : rowPacket(2); }
+  /// An input's DmTensor from (a view of) its HBM tensor; a row value goes through a padded scratch.
+  Value loadInput(const Node &n, Value hbmView, MapAttr viewMap);
+  /// Writes a stored root's DmTensor to (a mutable view of) its HBM tensor; a row value goes through a padded
+  /// scratch.
+  void storeOutput(size_t k, Value dm, Value hbmView, MapAttr viewMap);
   bool rootRow(size_t k) { return dag.nodes[dag.roots[k]].shape == Shape::Row; }
   int64_t vrfBytes = 0;              // VRF taken per slice
 
@@ -514,8 +590,9 @@ FailureOr<Value> Planner::vrfOf(int node, func::FuncOp func) {
     auto dm = materialize(node, func);
     if (failed(dm))
       return failure();
-    Value s = BeginOp::create(b, loc, stream(f32(), kb.one(), rowPacket(8)), *dm, ContextKind::Sub);
-    s = FetchOp::create(b, loc, stream(f32(), kb.one(), rowPacket(8)), s);
+    MapAttr held = cast<DmTensorType>(dm->getType()).getElement(); // 1 # 8 when computed, 1 # 2 when read
+    Value s = BeginOp::create(b, loc, stream(f32(), kb.one(), held), *dm, ContextKind::Sub);
+    s = FetchOp::create(b, loc, stream(f32(), kb.one(), held), s);
     s = CollectOp::create(b, loc, stream(f32(), kb.one(), rowPacket(8)), s);
     v = ToVrfOp::create(b, loc, VrfTensorType::get(ctx, f32(), kb.chip(), kb.cluster(), slice, rowPacket(8)), s);
   } else {
@@ -617,10 +694,11 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
   Type sourceType = f32();
   bool rowStream = false;
   if (leafNode.kind == Node::Input) {
-    if (leafNode.shape != Shape::Full)
-      return fail(func, "a streamed input must vary along rows and columns"), failure();
+    if (leafNode.shape != Shape::Full && leafNode.shape != Shape::Row)
+      return fail(func, "a streamed input must vary along the rows"), failure();
     source = inputDm.at(leaf);
     sourceType = leafNode.type;
+    rowStream = leafNode.shape == Shape::Row;
   } else {
     source = materialized.at(leaf);
     sourceType = cast<DmTensorType>(source.getType()).getElementType();
@@ -645,8 +723,9 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
   Value s;
   auto begin = [&](Value dm, Type et) {
     if (row) {
-      s = BeginOp::create(b, loc, stream(f32(), kb.one(), rowPacket(8)), dm, ContextKind::Main);
-      s = FetchOp::create(b, loc, stream(f32(), kb.one(), rowPacket(8)), s);
+      MapAttr held = cast<DmTensorType>(dm.getType()).getElement();
+      s = BeginOp::create(b, loc, stream(f32(), kb.one(), held), dm, ContextKind::Main);
+      s = FetchOp::create(b, loc, stream(f32(), kb.one(), held), s);
       s = CollectOp::create(b, loc, stream(f32(), kb.one(), rowPacket(8)), s);
     } else {
       bool bf16 = et.isBF16();
@@ -861,7 +940,7 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
 }
 
 LogicalResult Planner::declare(func::FuncOp func, ArrayRef<int64_t> written) {
-  if (dag.h % 16)
+  if (dag.h % 16 && dag.h != 1)
     return fail(func, "a row length that is not a multiple of 16");
   // A row axis per row dim of more than one row (a single row keeps one axis of one), and the column axis.
   for (auto [i, extent] : llvm::enumerate(dag.rowExtents))
@@ -879,8 +958,6 @@ LogicalResult Planner::declare(func::FuncOp func, ArrayRef<int64_t> written) {
       continue;
     if (!n.type.isBF16() && !n.type.isF32())
       return fail(func, "inputs must be bf16 or f32");
-    if (!n.col)
-      return fail(func, "an input that does not vary along the columns (row values come from reductions)");
     MapAttr m = inputMap(n);
     if (cast<RankedTensorType>(func.getArgumentTypes()[n.arg]).getNumElements() != m.size())
       return fail(func, "an input whose shape is not the rows and columns its map reads");
@@ -921,6 +998,44 @@ MapAttr Planner::inputMap(const Node &n) {
   return MapAttr::pair(ctx, parts);
 }
 
+Value Planner::loadInput(const Node &n, Value hbmView, MapAttr viewMap) {
+  OpBuilder &b = kb.builder();
+  Location loc = kb.loc();
+  DmTensorType dm = kb.dmType(n.type, slice, inputElement(n));
+  if (n.col)
+    return ViewToDmOp::create(b, loc, dm, hbmView);
+  // The live rows of the view: its mapping with any padding of a tile dropped.
+  SmallVector<MapAttr> live;
+  for (Attribute a : viewMap.getKind() == MapKind::Pair ? viewMap.getOperands() : ArrayRef<Attribute>(viewMap)) {
+    MapAttr m = cast<MapAttr>(a);
+    live.push_back(m.getKind() == MapKind::Pad ? m.operand(0) : m);
+  }
+  MapAttr rows = MapAttr::pair(ctx, live);
+  Value scratch = AllocHbmOp::create(b, loc, kb.hbmType(n.type, padded(rows)));
+  Value into = ViewOp::create(b, loc, HbmViewType::get(ctx, n.type, kb.chip(), padded(rows), true), scratch);
+  HbmToHbmViewOp::create(b, loc, hbmView, into);
+  return ToDmOp::create(b, loc, dm, scratch);
+}
+
+void Planner::storeOutput(size_t k, Value dm, Value hbmView, MapAttr viewMap) {
+  OpBuilder &b = kb.builder();
+  Location loc = kb.loc();
+  Type et = dag.outTypes[k];
+  if (!rootRow(k)) {
+    DmToHbmViewOp::create(b, loc, dm, hbmView);
+    return;
+  }
+  SmallVector<MapAttr> live;
+  for (Attribute a : viewMap.getKind() == MapKind::Pair ? viewMap.getOperands() : ArrayRef<Attribute>(viewMap)) {
+    MapAttr m = cast<MapAttr>(a);
+    live.push_back(m.getKind() == MapKind::Pad ? m.operand(0) : m);
+  }
+  MapAttr rows = MapAttr::pair(ctx, live);
+  Value scratch = ToHbmOp::create(b, loc, kb.hbmType(et, padded(rows)), dm);
+  Value from = ViewOp::create(b, loc, HbmViewType::get(ctx, et, kb.chip(), padded(rows), false), scratch);
+  HbmToHbmViewOp::create(b, loc, from, hbmView);
+}
+
 MapAttr Planner::outMap(bool row) {
   SmallVector<MapAttr> parts;
   for (auto &[d, axis] : rowAxes)
@@ -935,7 +1050,12 @@ FailureOr<SmallVector<Value>> Planner::emitBody(func::FuncOp func) {
   Location loc = kb.loc();
   if (!tiled()) {
     for (auto [i, p] : params)
-      inputDm[i] = ToDmOp::create(b, loc, kb.dmType(dag.nodes[i].type, slice, H), kb.param(p));
+      inputDm[i] = loadInput(dag.nodes[i],
+                             ViewOp::create(b, loc,
+                                            HbmViewType::get(ctx, dag.nodes[i].type, kb.chip(), inputMap(dag.nodes[i]),
+                                                             false),
+                                            kb.param(p)),
+                             inputMap(dag.nodes[i]));
     return emitTile(func);
   }
   // Row tiles along the outermost row axis: each reads its rows of the inputs that have that axis through a
@@ -949,29 +1069,37 @@ FailureOr<SmallVector<Value>> Planner::emitBody(func::FuncOp func) {
     vrfs.clear();
     inputDm.clear();
     vrfBytes = 0;
-    // The tile of a view whose mapping has the outer axis.
-    auto tileOf = [&](Value hbm, Type et, MapAttr whole, bool mut) -> Value {
+    // The tile of a view whose mapping has the outer axis, and its mapping.
+    auto tileOf = [&](Value hbm, Type et, MapAttr whole, bool mut) -> std::pair<Value, MapAttr> {
       Value v = ViewOp::create(b, loc, HbmViewType::get(ctx, et, kb.chip(), whole, mut), hbm);
       SmallVector<MapAttr> parts;
       for (Attribute a : whole.getKind() == MapKind::Pair ? whole.getOperands() : ArrayRef<Attribute>(whole))
         parts.push_back(cast<MapAttr>(a) == outer
                             ? outer.resize(len).padTo(extent, mut ? PadKind::Bottom : PadKind::Top)
                             : cast<MapAttr>(a));
-      return TileOp::create(b, loc, HbmViewType::get(ctx, et, kb.chip(), MapAttr::pair(ctx, parts), mut), v, outer,
-                            b.getI64IntegerAttr(len), b.getI64IntegerAttr(start));
+      MapAttr part = MapAttr::pair(ctx, parts);
+      return {TileOp::create(b, loc, HbmViewType::get(ctx, et, kb.chip(), part, mut), v, outer,
+                             b.getI64IntegerAttr(len), b.getI64IntegerAttr(start)),
+              part};
     };
     for (auto [i, p] : params) {
       Node &n = dag.nodes[i];
-      DmTensorType dm = kb.dmType(n.type, slice, H);
       bool hasOuter = rowAxes.front().first >= 0 && (n.rows >> rowAxes.front().first) & 1;
-      inputDm[i] = hasOuter ? ViewToDmOp::create(b, loc, dm, tileOf(kb.param(p), n.type, inputMap(n), false)).getResult()
-                            : ToDmOp::create(b, loc, dm, kb.param(p)).getResult();
+      if (hasOuter) {
+        auto [view, map] = tileOf(kb.param(p), n.type, inputMap(n), false);
+        inputDm[i] = loadInput(n, view, map);
+      } else {
+        Value view = ViewOp::create(b, loc, HbmViewType::get(ctx, n.type, kb.chip(), inputMap(n), false), kb.param(p));
+        inputDm[i] = loadInput(n, view, inputMap(n));
+      }
     }
     FailureOr<SmallVector<Value>> dms = emitTile(func);
     if (failed(dms))
       return failure();
-    for (auto [k, dm] : llvm::enumerate(*dms))
-      DmToHbmViewOp::create(b, loc, dm, tileOf(kb.param(outParams[k]), dag.outTypes[k], outMap(rootRow(k)), true));
+    for (auto [k, dm] : llvm::enumerate(*dms)) {
+      auto [view, map] = tileOf(kb.param(outParams[k]), dag.outTypes[k], outMap(rootRow(k)), true);
+      storeOutput(k, dm, view, map);
+    }
   }
   return SmallVector<Value>();
 }
@@ -1003,15 +1131,28 @@ FailureOr<SmallVector<Value>> Planner::emitTile(func::FuncOp func) {
     auto out = materialize(dag.roots[k], func, dag.outTypes[k]);
     if (failed(out))
       return failure();
-    outs[k] = tiled() ? *out
-                      : ToHbmOp::create(b, loc, kb.hbmType(dag.outTypes[k], outMap(rootRow(k))), *out).getResult();
+    if (tiled()) {
+      outs[k] = *out;
+    } else if (rootRow(k)) {
+      // A fresh dense buffer of row values, through the padded scratch.
+      MapAttr rows = outMap(true);
+      outs[k] = AllocHbmOp::create(b, loc, kb.hbmType(dag.outTypes[k], rows));
+      storeOutput(k, *out, ViewOp::create(b, loc, HbmViewType::get(ctx, dag.outTypes[k], kb.chip(), rows, true), outs[k]),
+                  rows);
+    } else {
+      outs[k] = ToHbmOp::create(b, loc, kb.hbmType(dag.outTypes[k], outMap()), *out);
+    }
   }
   return outs;
 }
 
 bool match(RaisedKernel &kernel) {
   std::string why;
-  return succeeded(fold(kernel.func, kernel.written, why));
+  bool ok = succeeded(fold(kernel.func, kernel.written, why));
+  // FURIOSA_DEBUG=1 says why the class passes on a kernel.
+  if (!ok && getenv("FURIOSA_DEBUG"))
+    llvm::errs() << "row-wise: " << kernel.func.getName() << ": " << why << "\n";
+  return ok;
 }
 
 LogicalResult map(RaisedKernel &kernel) {
@@ -1022,16 +1163,24 @@ LogicalResult map(RaisedKernel &kernel) {
     return func.emitError("row-wise: ") << why;
   Dag dag = *folded;
   rewriteRsqrt(dag);
+  rewriteReversedSub(dag);
   rewriteSigmoid(dag);
-  // Without reductions, row or column values, the DAG is elementwise and its rows are free to regroup:
-  // shorter rows keep a second streamed tensor within the VRF.
-  if (dag.rowExtents.size() == 1 &&
-      llvm::all_of(dag.nodes, [](const Node &n) { return n.shape == Shape::Full || n.kind == Node::Const; })) {
+  // Without reductions, row or column values or broadcast reads, the DAG is elementwise and its elements are
+  // free to regroup into rows: of 16-element multiples, and at most kRow long to keep a second streamed tensor
+  // within the VRF.
+  unsigned allRows = 0;
+  for (auto [i, e] : llvm::enumerate(dag.rowExtents))
+    if (e != 1)
+      allRows |= 1u << i;
+  if (llvm::all_of(dag.nodes, [&](const Node &n) {
+        return n.kind == Node::Const || (n.shape == Shape::Full && (n.kind != Node::Input || n.rows == allRows));
+      })) {
     constexpr int64_t kRow = 1024;
-    for (int64_t q = 1; q <= dag.h && dag.h > kRow; ++q)
-      if (dag.h % q == 0 && dag.h / q <= kRow && (dag.h / q) % 16 == 0) {
-        dag.r *= q;
-        dag.h /= q;
+    int64_t total = dag.r * dag.h;
+    for (int64_t h = std::min(total, kRow); h >= 16 && (dag.h > kRow || dag.h % 16); --h)
+      if (total % h == 0 && h % 16 == 0) {
+        dag.r = total / h;
+        dag.h = h;
         dag.rowExtents = {dag.r};
         for (Node &n : dag.nodes)
           if (n.kind == Node::Input)
@@ -1040,7 +1189,7 @@ LogicalResult map(RaisedKernel &kernel) {
       }
   }
   KernelBuilder kb(kernel);
-  Planner planner(kb, dag);
+  Planner planner(kb, dag, kernel);
   if (failed(planner.declare(func, kernel.written)))
     return failure();
   kb.beginBody();

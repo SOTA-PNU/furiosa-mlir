@@ -1,4 +1,5 @@
 add_triton_library(FuriosaCodegen
+  Contract.cpp
   Dialect.cpp
   EmitRust.cpp
   Hoist.cpp
@@ -23,6 +24,7 @@ add_triton_library(FuriosaCodegen
     MLIRFuncInlinerExtension
     MLIRIR
     MLIRLinalgDialect
+    MLIRLinalgTransforms
     MLIRMathDialect
     MLIRParser
     MLIRPass
