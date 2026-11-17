@@ -166,10 +166,13 @@ with a copy of `compiler/backend`), then `PYTHONPATH=<snap>:compiler compiler/.v
 copy through `HARNESS_TRITON=<snap>`.
 
 Each run writes `harness/out/ops/<stage>.{json,md}`: an operator x dtype table and the failures grouped
-by the compiler's diagnostic. At the raise stage (raised IR on the CPU JIT) 905 of the 907 cases pass (int32
-sort at 256 and 1024 lanes exceeds the 900 s limit in codegen). The npu stage at 0242fc9: 610 of 907 pass, none
-with a wrong result; the rest are kernels codegen does not map yet (int8 and rows that are not a multiple of 16
-were the largest groups: int8 has landed since, row padding is in review).
+by the compiler's diagnostic. At the raise stage (raised IR on the CPU JIT) 905 of the 907 cases pass at 1805f3e;
+the other two, int32 sort at 256 and 1024 lanes, exceeded the 900 s limit in codegen and take seconds since f6ad81a.
+The npu stage at 1.1.0 (c9bd8c6): 801 of 907 pass, none with a wrong result. The rest are kernels codegen does
+not map yet or crates furiosa-opt cannot build: sort (20), reductions at the odd 2x7x33 shape and bf16/int8
+reductions at 1024 lanes (28), flip at 16 bits and at 4x32x128 and 256x256 (14), cumsum and cumprod at 256x256 and
+1024 lanes (10: furiosa-opt's DMA dynamic-index limit, build time), dot at int8, fp8 and fp16 (6), and a few extra
+operators (topk, gather, expand_dims, map_elementwise, umulhi, maximum_nan, histogram, bf16 unary at 2x7x33).
 
 ## Running
 
