@@ -7,4 +7,5 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 # Every core, as far as memory goes: an MLIR translation unit takes up to ~2 GB to compile.
 mem_jobs=$(( $(awk '/MemAvailable/ {print $2}' /proc/meminfo) / 2097152 ))
 jobs=$(( mem_jobs < $(nproc) ? mem_jobs : $(nproc) ))
-exec flock "$root/build/.build.lock" "$root/compiler/.venv/bin/ninja" -C "$root/build/triton" -j "${MAX_JOBS:-$(( jobs > 0 ? jobs : 1 ))}" "$@"
+# Pending first: readers (compiler/with-build-lock.sh) queue behind a waiting build instead of starving it.
+exec flock "$root/build/.build.pending" flock "$root/build/.build.lock" "$root/compiler/.venv/bin/ninja" -C "$root/build/triton" -j "${MAX_JOBS:-$(( jobs > 0 ? jobs : 1 ))}" "$@"

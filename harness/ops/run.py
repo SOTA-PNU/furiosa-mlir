@@ -24,8 +24,7 @@ COLUMNS = FLOATS + ["int32", "int8", "float8_e4m3fn"]
 
 def run_case(key: str, stage: str, timeout: int) -> dict:
     # Shared build lock: never load a libtriton that compiler/build.sh is relinking.
-    cmd = ["flock", "-s", str(ROOT / "build" / ".build.lock"), sys.executable, "-m", "harness.ops.case", key,
-           "--stage", stage]
+    cmd = [str(ROOT / "compiler" / "with-build-lock.sh"), sys.executable, "-m", "harness.ops.case", key, "--stage", stage]
     try:
         proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:

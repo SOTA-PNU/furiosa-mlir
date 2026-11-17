@@ -903,6 +903,21 @@ std::string key(ArrayRef<Axis> env) {
   return s;
 }
 
+/// An env over a parent's dims, in a generic built with `remap` (parent dim -> its dim).
+void remapAxis(Axis &a, ArrayRef<int> remap) {
+  if (a.kind == Axis::Iter)
+    a.dim = remap[a.dim];
+  for (Axis &x : a.of)
+    remapAxis(x, remap);
+}
+
+SmallVector<Axis> remapEnv(ArrayRef<Axis> env, ArrayRef<int> remap) {
+  SmallVector<Axis> out(env.begin(), env.end());
+  for (Axis &a : out)
+    remapAxis(a, remap);
+  return out;
+}
+
 /// The source axes of a row-major reshape to `src`, given the result axes `env` (shape `dst`): each
 /// source axis is a mixed-radix digit of the result's linear index, resolved over the result axes'
 /// ranges, so a source axis that is one result axis stays that axis.
@@ -1037,6 +1052,12 @@ private:
   // (loop, consumer anchor) -> its results and, per result, the consumer dims its state spans.
   std::map<std::pair<Operation *, Operation *>, std::pair<SmallVector<Value>, SmallVector<SmallVector<unsigned>>>>
       keptLoops;
+  // (reduce, result) -> the reduction in its own index space and the dims it keeps (materializeOwn).
+  std::map<std::pair<Operation *, unsigned>, std::pair<Value, SmallVector<unsigned>>> ownReductions;
+  unsigned ownDepth = 0; // > 0 while building one
+  FailureOr<std::pair<Value, SmallVector<unsigned>>> reduceTensor(Gen &g, tt::ReduceOp red, unsigned result,
+                                                                  ArrayRef<Axis> env);
+  FailureOr<Value> materializeOwn(Gen &g, tt::ReduceOp red, unsigned result, ArrayRef<Axis> env);
   /// Erases a placeholder anchor and forgets the loops kept for it (a later op may reuse its address).
   void retire(Operation *anchor) {
     for (auto it = keptLoops.begin(); it != keptLoops.end();)
@@ -1623,8 +1644,9 @@ FailureOr<AffineExpr> Raiser::rewrite(Operation *at, const Gen &g, ArrayRef<Axis
   for (int pos : g.coordPos)
     viewToGen.push_back(pos >= 0 ? getAffineDimExpr(pos, ctx) : getAffineConstantExpr(0, ctx));
   SmallVector<AffineExpr> per;
+  static const Sym none; // v null: `select` reads the env alone
   for (auto [n, ev] : llvm::enumerate(act)) {
-    const Sym *s = ev->get(v);
+    const Sym *s = v ? ev->get(v) : &none;
     if (!s)
       return at->emitError("furiosa: value is not symbolic in every instance"), failure();
     bool outside = false;
@@ -1703,7 +1725,7 @@ FailureOr<AffineExpr> Raiser::rewrite(Operation *at, const Gen &g, ArrayRef<Axis
 /// per-instance values that are not affine in the origins (pid floordiv 2, ...).
 FailureOr<AffineExpr> Raiser::rewriteSymbolic(Operation *at, const Gen &g, ArrayRef<Axis> env,
                                               std::function<AffineExpr(const Sym &)> select, Value v) {
-  if (!symEval)
+  if (!symEval || !v)
     return failure();
   const Sym *s = symEval->get(v), *s0 = act[0]->get(v);
   // Masks fold differently with constant program ids; only use shapes that line up.
@@ -2457,77 +2479,17 @@ FailureOr<Value> Raiser::materialize(Gen &g, Value v, ArrayRef<Axis> env) {
   for (unsigned d = 0; d < g.extent.size(); ++d)
     parentDims.push_back(d);
   // Remaps an env over the parent's dims into a generic built with `remap`.
-  std::function<void(Axis &, ArrayRef<int>)> remapAxis = [&](Axis &a, ArrayRef<int> remap) {
-    if (a.kind == Axis::Iter)
-      a.dim = remap[a.dim];
-    for (Axis &x : a.of)
-      remapAxis(x, remap);
-  };
-  auto remapEnv = [&](ArrayRef<Axis> e, ArrayRef<int> remap) {
-    SmallVector<Axis> out(e.begin(), e.end());
-    for (Axis &a : out)
-      remapAxis(a, remap);
-    return out;
-  };
   FailureOr<std::pair<Value, SmallVector<unsigned>>> built = failure();
 
   if (auto red = dyn_cast<tt::ReduceOp>(def)) {
-    Block &combiner = red.getCombineOp().front();
-    unsigned n = red.getNumOperands();
-    TypedAttr identity = identityOf(combiner);
-    unsigned axis = red.getAxis();
-    int64_t extent = shapeOf(red.getOperand(0).getType())[axis];
-    // Every operand at reduction index `r`.
-    auto operandsAt = [&](Gen &gg, ArrayRef<int> remap, Axis r) -> FailureOr<SmallVector<Value>> {
-      SmallVector<Axis> in = remapEnv(env, remap);
-      in.insert(in.begin() + axis, r);
-      SmallVector<Value> xs;
-      for (Value o : red.getOperands()) {
-        auto x = emit(gg, o, in);
-        if (failed(x))
-          return failure();
-        xs.push_back(*x);
-      }
-      return xs;
-    };
-    // Without a known identity (any other combiner, or several operands), element 0 seeds the
-    // accumulators and the reduction runs over elements 1.. (own dims start at 1).
-    SmallVector<int64_t> own;
-    if (identity || extent > 1)
-      own.push_back(identity ? extent : extent - 1);
-    SmallVector<Type> elems;
-    for (Value o : red.getOperands())
-      elems.push_back(getElementTypeOrSelf(o.getType()));
-    auto multi = buildGenerics(
-        g, parentDims, own, {}, elems,
-        [&](Gen &gi, ArrayRef<int> remap) -> FailureOr<SmallVector<Value>> {
-          if (!identity)
-            return operandsAt(gi, remap, Axis{}); // Unit: index 0
-          return SmallVector<Value>{arith::ConstantOp::create(*gi.ob, loc, cast<TypedAttr>(identity)).getResult()};
-        },
-        [&](Gen &gg, ValueRange accs, ArrayRef<int> remap) -> FailureOr<SmallVector<Value>> {
-          Axis r;
-          r.kind = Axis::Iter;
-          r.dim = gg.extent.size() - 1;
-          auto xs = operandsAt(gg, remap, r);
-          if (failed(xs))
-            return failure();
-          IRMapping map;
-          for (unsigned j = 0; j < n; ++j) {
-            map.map(combiner.getArgument(j), accs[j]);
-            map.map(combiner.getArgument(n + j), (*xs)[j]);
-          }
-          for (Operation &o : combiner.without_terminator())
-            gg.ob->clone(o, map);
-          SmallVector<Value> outs;
-          for (Value y : combiner.getTerminator()->getOperands())
-            outs.push_back(map.lookupOrDefault(y));
-          return outs;
-        },
-        identity ? 0 : 1);
-    if (failed(multi))
-      return failure();
-    built = std::make_pair(multi->first[cast<OpResult>(v).getResultNumber()], multi->second);
+    unsigned result = cast<OpResult>(v).getResultNumber();
+    // Through a data-moving reshape (Expr axes) reductions nest in every context that reads them, and
+    // gather form would rebuild them per context, exponentially in the nesting (tl.sort, tl.flip): build
+    // those, and every reduction they read, once each.
+    if (ownDepth || llvm::any_of(env, [](const Axis &a) { return a.kind == Axis::Expr; }))
+      if (auto own = materializeOwn(g, red, result, env); succeeded(own))
+        return own;
+    built = reduceTensor(g, red, result, env);
   } else if (auto dot = dyn_cast<tt::DotOp>(def)) {
     int64_t k = liveExtent(dot);
     built = buildGeneric(
@@ -2656,6 +2618,108 @@ FailureOr<Value> Raiser::materialize(Gen &g, Value v, ArrayRef<Axis> env) {
     idx.push_back(i);
   }
   return tensor::ExtractOp::create(*g.ob, loc, tensor, idx).getResult();
+}
+
+/// A reduction's result over the dims of `g` it keeps (env: its axes in `g`).
+FailureOr<std::pair<Value, SmallVector<unsigned>>> Raiser::reduceTensor(Gen &g, tt::ReduceOp red, unsigned result,
+                                                                        ArrayRef<Axis> env) {
+  SmallVector<unsigned> parentDims;
+  for (unsigned d = 0; d < g.extent.size(); ++d)
+    parentDims.push_back(d);
+  Block &combiner = red.getCombineOp().front();
+  unsigned n = red.getNumOperands();
+  TypedAttr identity = identityOf(combiner);
+  unsigned axis = red.getAxis();
+  int64_t extent = shapeOf(red.getOperand(0).getType())[axis];
+  // Every operand at reduction index `r`.
+  auto operandsAt = [&](Gen &gg, ArrayRef<int> remap, Axis r) -> FailureOr<SmallVector<Value>> {
+    SmallVector<Axis> in = remapEnv(env, remap);
+    in.insert(in.begin() + axis, r);
+    SmallVector<Value> xs;
+    for (Value o : red.getOperands()) {
+      auto x = emit(gg, o, in);
+      if (failed(x))
+        return failure();
+      xs.push_back(*x);
+    }
+    return xs;
+  };
+  // Without a known identity (any other combiner, or several operands), element 0 seeds the
+  // accumulators and the reduction runs over elements 1.. (own dims start at 1).
+  SmallVector<int64_t> own;
+  if (identity || extent > 1)
+    own.push_back(identity ? extent : extent - 1);
+  SmallVector<Type> elems;
+  for (Value o : red.getOperands())
+    elems.push_back(getElementTypeOrSelf(o.getType()));
+  auto multi = buildGenerics(
+      g, parentDims, own, {}, elems,
+      [&](Gen &gi, ArrayRef<int> remap) -> FailureOr<SmallVector<Value>> {
+        if (!identity)
+          return operandsAt(gi, remap, Axis{}); // Unit: index 0
+        return SmallVector<Value>{arith::ConstantOp::create(*gi.ob, loc, cast<TypedAttr>(identity)).getResult()};
+      },
+      [&](Gen &gg, ValueRange accs, ArrayRef<int> remap) -> FailureOr<SmallVector<Value>> {
+        Axis r;
+        r.kind = Axis::Iter;
+        r.dim = gg.extent.size() - 1;
+        auto xs = operandsAt(gg, remap, r);
+        if (failed(xs))
+          return failure();
+        IRMapping map;
+        for (unsigned j = 0; j < n; ++j) {
+          map.map(combiner.getArgument(j), accs[j]);
+          map.map(combiner.getArgument(n + j), (*xs)[j]);
+        }
+        for (Operation &o : combiner.without_terminator())
+          gg.ob->clone(o, map);
+        SmallVector<Value> outs;
+        for (Value y : combiner.getTerminator()->getOperands())
+          outs.push_back(map.lookupOrDefault(y));
+        return outs;
+      },
+      identity ? 0 : 1);
+  if (failed(multi))
+    return failure();
+  return std::make_pair(multi->first[result], multi->second);
+}
+
+/// A reduction built once in its own index space (dims: its result's axes) before `g`, and read at
+/// `env`. Fails (quietly) where its value depends on more than its own axes: a loop counter, or a
+/// program id that only a store coordinate determines; the caller then builds it in `g`.
+FailureOr<Value> Raiser::materializeOwn(Gen &g, tt::ReduceOp red, unsigned result, ArrayRef<Axis> env) {
+  if (red->getParentOfType<scf::ForOp>())
+    return failure();
+  auto &cached = ownReductions[{red.getOperation(), result}];
+  // Reuse it where it is built ahead of `g` (anchors of nested generics come first).
+  if (!cached.first || !cached.first.getDefiningOp()->isBeforeInBlock(g.anchor)) {
+    SmallVector<int64_t> shape = shapeOf(red->getResult(result).getType());
+    Gen own;
+    own.coordPos.assign(g.coordPos.size(), -1);
+    own.lo.assign(shape.size(), 0);
+    own.extent.assign(shape.begin(), shape.end());
+    own.anchor = g.anchor;
+    SmallVector<Axis> ownEnv(shape.size());
+    for (auto [d, a] : llvm::enumerate(ownEnv)) {
+      a.kind = Axis::Iter;
+      a.dim = d;
+    }
+    ScopedDiagnosticHandler quiet(ctx, [](Diagnostic &) { return success(); });
+    ++ownDepth;
+    auto built = reduceTensor(own, red, result, ownEnv);
+    --ownDepth;
+    if (failed(built))
+      return failure();
+    cached = *built;
+  }
+  SmallVector<Value> idx;
+  for (unsigned d : cached.second) {
+    auto e = rewrite(red, g, env, [&](const Sym &) { return getAffineDimExpr(d, ctx); }, Value());
+    if (failed(e))
+      return failure();
+    idx.push_back(exprValue(g, *e));
+  }
+  return tensor::ExtractOp::create(*g.ob, loc, cached.first, idx).getResult();
 }
 
 /// A tensor over every dim of `parent` (all parallel), computed by `fn` at each point.

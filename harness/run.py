@@ -105,9 +105,7 @@ def compiler_env() -> dict:
 def compiler_cmd(*args, exe: Path = COMPILER_PY) -> list:
     """A compiler-venv command that holds compiler/build.sh's lock shared, so it never loads a
     libtriton that a rebuild is still linking."""
-    lock = ROOT / "build" / ".build.lock"
-    lock.parent.mkdir(exist_ok=True)
-    return ["flock", "-s", str(lock), str(exe), *args]
+    return [str(ROOT / "compiler" / "with-build-lock.sh"), str(exe), *args]
 
 
 _compiled = {}
