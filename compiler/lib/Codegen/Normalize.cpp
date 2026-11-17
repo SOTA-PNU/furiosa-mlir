@@ -1037,6 +1037,64 @@ void relayoutReads(linalg::GenericOp g, function_ref<bool(linalg::GenericOp)> ma
   g.setIndexingMapsAttr(b.getAffineMapArrayAttr(maps));
 }
 
+/// Selects in generic bodies keyed by a boolean combination of conditions become nested selects each keyed by
+/// one condition, as the Vector Engine selects by one tag comparison at a time: select(!c, a, b) =
+/// select(c, b, a) (!c written c ^ true), select(c1 & c2, a, b) = select(c1, select(c2, a, b), b), likewise |, and
+/// c1 ^ c2 (also c1 != c2 on i1; c1 == c2 its negation) selects by c2 between the two orders of c1's select. An
+/// index-only condition stays whole: hoistIndexOnly makes it one table. A reduction's combiner (an argmax's
+/// order | (eq & tie)) stays for selectionReductions.
+void nestSelectKeys(ModuleOp module) {
+  llvm::DenseMap<Value, bool> memo;
+  std::function<bool(Value)> readsData = [&](Value v) {
+    if (isa<BlockArgument>(v))
+      return true;
+    if (auto it = memo.find(v); it != memo.end())
+      return it->second;
+    Operation *op = v.getDefiningOp();
+    return memo[v] = op && llvm::any_of(op->getOperands(), readsData);
+  };
+  SmallVector<arith::SelectOp> work;
+  module.walk([&](arith::SelectOp s) {
+    auto g = s->getParentOfType<linalg::GenericOp>();
+    if (s.getCondition().getType().isInteger(1) && g && !g.getNumReductionLoops())
+      work.push_back(s);
+  });
+  while (!work.empty()) {
+    arith::SelectOp s = work.pop_back_val();
+    Value a = s.getTrueValue(), f = s.getFalseValue();
+    Operation *def = s.getCondition().getDefiningOp();
+    if (!def || def->getNumOperands() != 2 || !def->getOperand(0).getType().isInteger(1) || !readsData(def->getResult(0)))
+      continue;
+    auto cmp = dyn_cast<arith::CmpIOp>(def);
+    bool eq = cmp && cmp.getPredicate() == arith::CmpIPredicate::eq;
+    bool exclusive = isa<arith::XOrIOp>(def) || (cmp && cmp.getPredicate() == arith::CmpIPredicate::ne);
+    if (!eq && !exclusive && !isa<arith::AndIOp, arith::OrIOp>(def))
+      continue;
+    OpBuilder b(s);
+    auto select = [&](Value k, Value x, Value y) {
+      auto n = arith::SelectOp::create(b, s.getLoc(), k, x, y);
+      work.push_back(n);
+      return n.getResult();
+    };
+    Value c1 = def->getOperand(0), c2 = def->getOperand(1), r;
+    if (matchPattern(c1, m_Constant()))
+      std::swap(c1, c2);
+    APInt k;
+    if ((exclusive || eq) && matchPattern(c2, m_ConstantInt(&k)))
+      r = (exclusive == k.isOne()) ? select(c1, f, a) : select(c1, a, f); // c ^ 1 and c == 0 negate c
+    else if (exclusive || eq)
+      r = exclusive ? select(c2, select(c1, f, a), select(c1, a, f)) : select(c2, select(c1, a, f), select(c1, f, a));
+    else if (isa<arith::AndIOp>(def))
+      r = select(c1, select(c2, a, f), f);
+    else
+      r = select(c1, a, select(c2, a, f));
+    s.replaceAllUsesWith(r);
+    s.erase();
+    if (isOpTriviallyDead(def))
+      def->erase();
+  }
+}
+
 /// Math ops the Vector Engine lacks, in ones it has: asin, acos, atan and atan2 by MLIR's polynomial
 /// approximations (whose fma and copysign expand below), copysign(a, b) = b < 0 ? -|a| : |a|, fma(a, b, c) =
 /// a*b + c (rounded twice), log2(x) = ln(x) * log2(e) (within the engine's ln ulp budget, not bit-exact), and
@@ -1128,6 +1186,7 @@ void expandMath(ModuleOp module) {
 
 void mlir::furiosa::normalizeKernels(ModuleOp module, function_ref<bool(linalg::GenericOp)> mapsAlone) {
   expandMath(module);
+  nestSelectKeys(module);
   splitIndexSelects(module, mapsAlone);
   selectionReductions(module);
   treeReductions(module);
