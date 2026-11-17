@@ -465,8 +465,16 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
                              .Case<arith::OrIOp>([](auto) { return "ori"; })
                              .Case<arith::ShLIOp>([](auto) { return "shli"; })
                              .Case<arith::ShRSIOp>([](auto) { return "shrsi"; })
+                             .Case<arith::ShRUIOp>([](auto) { return "shrui"; })
                              .Case<math::AbsIOp>([](auto) { return "absi"; })
                              .Case<arith::IndexCastOp>([](auto) { return "ext"; })
+                             // Streams carry 32-bit values as bits: a bitcast between them moves nothing.
+                             .Case<arith::BitcastOp>([](arith::BitcastOp c) {
+                               return c.getIn().getType().getIntOrFloatBitWidth() == 32 &&
+                                              c.getType().getIntOrFloatBitWidth() == 32
+                                          ? "bitcast"
+                                          : "";
+                             })
                              .Case<math::RoundOp>([](math::RoundOp r) { return r.getType().isF32() ? "round" : ""; })
                              .Case<arith::SIToFPOp>([](arith::SIToFPOp c) {
                                return c.getIn().getType().isInteger(32) && c.getType().isF32() ? "itof" : "";
@@ -491,7 +499,7 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
       }
       // Casts: an extension of an input is the f32 fetch; the final truncation is the output cast; an index cast
       // keeps an i32's value.
-      if (name == "ext" || name == "trunc")
+      if (name == "ext" || name == "trunc" || (name == "bitcast" && dag.nodes[args[0]].kind == Node::Const))
         return scalar[v] = args[0];
       // round(x) = the integer nearest x (ties away from zero) back in f32: the Vector Engine's conversions.
       if (name == "round") {
@@ -1087,13 +1095,13 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
   // Ends the pass: commits the current value (node `at`) to DM.
   auto commit = [&](int at, Type cast) -> Value {
     toWay8();
-    Type et = f32();
     // An equality key leaves as i32: the tag unit flushes subnormal f32s (verified on npu3), not i32s. So does an
-    // i32 value.
-    if (dag.nodes[at].op == "eqkey" || dag.nodes[at].integer) {
-      et = IntegerType::get(ctx, 32);
+    // i32 value. A value stored as the other 32-bit type (through a bitcast) leaves as its bits.
+    Type et = dag.nodes[at].op == "eqkey" || dag.nodes[at].integer ? Type(IntegerType::get(ctx, 32)) : f32();
+    if (cast && cast != et && cast.getIntOrFloatBitWidth() == 32)
+      et = cast;
+    if (et != f32())
       s = VectorReinterpretOp::create(b, loc, stream(et, time(), packet()), s);
-    }
     s = VectorFinalOp::create(b, loc, stream(et, time(), packet()), s);
     MapAttr trim = row ? rowPacket(8) : fullPacket8;
     if (cast && cast != et) {
@@ -1146,6 +1154,11 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
   for (size_t i = 0; i < path.size(); ++i) {
     const Step &st = path[i];
     Node &n = dag.nodes[st.node];
+    // A bitcast moves nothing: the stream's bits pass on (a VRF of one is committed in its type first).
+    if (n.op == "bitcast") {
+      current = st.node;
+      continue;
+    }
     // What the op needs.
     std::string op = n.op;
     int need;            // stage
@@ -1166,7 +1179,8 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
         {"andi", {Logic, "LogicAnd", "vector_logic", "LogicBinaryOpI32::BitAnd"}},
         {"ori", {Logic, "LogicOr", "vector_logic", "LogicBinaryOpI32::BitOr"}},
         {"shli", {Fxp, "FxpLshift", "vector_fxp", "FxpBinaryOp::LeftShift"}},
-        {"shrsi", {Fxp, "FxpRshift", "vector_fxp", "FxpBinaryOp::ArithRightShift"}}};
+        {"shrsi", {Fxp, "FxpRshift", "vector_fxp", "FxpBinaryOp::ArithRightShift"}},
+        {"shrui", {Fxp, "FxpRshift", "vector_fxp", "FxpBinaryOp::LogicRightShift"}}};
     if (auto it = intOps.find(op); it != intOps.end()) {
       auto [stg, a, m, v] = it->second;
       need = stg, alu = a, method = m, veOp = v, needWay4 = false;

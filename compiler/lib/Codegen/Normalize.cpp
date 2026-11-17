@@ -930,12 +930,84 @@ void splitIndexSelects(ModuleOp module, function_ref<bool(linalg::GenericOp)> ma
   }
 }
 
+/// An elementwise generic that reads its init (an atomic round's out = out + x) reads it as an input instead and
+/// writes a fresh tensor: the same values, and the init is no longer an accumulator outside any reduction.
+linalg::GenericOp initsToInputs(linalg::GenericOp g) {
+  if (g.getNumReductionLoops() || g.getNumDpsInits() != 1 || !g.payloadUsesValueFromOperand(g.getDpsInitOperand(0)))
+    return g;
+  OpBuilder b(g);
+  Value init = g.getDpsInits()[0];
+  auto t = cast<RankedTensorType>(init.getType());
+  SmallVector<Value> ins(g.getDpsInputs());
+  ins.push_back(init);
+  SmallVector<AffineMap> maps = g.getIndexingMapsArray();
+  maps.insert(maps.end() - 1, maps.back());
+  Value empty = tensor::EmptyOp::create(b, g.getLoc(), t.getShape(), t.getElementType());
+  auto fresh = linalg::GenericOp::create(b, g.getLoc(), g.getResultTypes(), ins, ValueRange{empty}, maps,
+                                         g.getIteratorTypesArray());
+  fresh.getRegion().takeBody(g.getRegion());
+  Block &body = fresh.getRegion().front();
+  BlockArgument out = body.getArgument(body.getNumArguments() - 1);
+  out.replaceAllUsesWith(body.insertArgument(out.getArgNumber(), t.getElementType(), g.getLoc()));
+  g.getResult(0).replaceAllUsesWith(fresh.getResult(0));
+  g.erase();
+  return fresh;
+}
+
+/// A read through the loops out of their order (a transposed operand), in an elementwise generic no class maps as
+/// it is, becomes a relayout of the operand into loop order (linalg.transpose: one DMA, the copy class's) read in
+/// order, as the computing classes stream rows and columns. A 0 into a unit dim rides along first. Reductions keep
+/// their reads: a contraction's layout is normalizeContractions'.
+void relayoutReads(linalg::GenericOp g, function_ref<bool(linalg::GenericOp)> mapsAlone) {
+  auto position = [](AffineExpr e) {
+    auto d = dyn_cast<AffineDimExpr>(e);
+    return d ? int64_t(d.getPosition()) : int64_t(-1);
+  };
+  auto outOfOrder = [&](OpOperand *in) {
+    AffineMap m = g.getMatchingIndexingMap(in);
+    ArrayRef<int64_t> shape = cast<RankedTensorType>(in->get().getType()).getShape();
+    SmallVector<int64_t> dims;
+    for (auto [j, e] : llvm::enumerate(m.getResults())) {
+      auto zero = dyn_cast<AffineConstantExpr>(e);
+      if (position(e) >= 0 && !llvm::is_contained(dims, position(e)))
+        dims.push_back(position(e));
+      else if (!zero || zero.getValue() != 0 || shape[j] != 1)
+        return false;
+    }
+    return !llvm::is_sorted(dims);
+  };
+  if (!mapsAlone || g.getNumReductionLoops() || llvm::none_of(g.getDpsInputOperands(), outOfOrder) || mapsAlone(g))
+    return;
+  OpBuilder b(g);
+  SmallVector<AffineMap> maps = g.getIndexingMapsArray();
+  for (OpOperand *in : g.getDpsInputOperands()) {
+    AffineMap m = maps[in->getOperandNumber()];
+    if (!outOfOrder(in))
+      continue;
+    // Result j of the relayout is operand dim perm[j], the operand dims in loop order.
+    SmallVector<int64_t> perm = llvm::to_vector(llvm::seq<int64_t>(0, m.getNumResults()));
+    llvm::stable_sort(perm, [&](int64_t x, int64_t y) { return position(m.getResult(x)) < position(m.getResult(y)); });
+    auto t = cast<RankedTensorType>(in->get().getType());
+    SmallVector<int64_t> shape;
+    SmallVector<AffineExpr> exprs;
+    for (int64_t d : perm) {
+      shape.push_back(t.getDimSize(d));
+      exprs.push_back(m.getResult(d));
+    }
+    Value empty = tensor::EmptyOp::create(b, g.getLoc(), shape, t.getElementType());
+    in->set(linalg::TransposeOp::create(b, g.getLoc(), in->get(), empty, perm).getResult()[0]);
+    maps[in->getOperandNumber()] = AffineMap::get(m.getNumDims(), 0, exprs, g.getContext());
+  }
+  g.setIndexingMapsAttr(b.getAffineMapArrayAttr(maps));
+}
+
 /// Math ops the Vector Engine lacks, in ones it has: asin, acos, atan and atan2 by MLIR's polynomial
 /// approximations (whose fma and copysign expand below), copysign(a, b) = b < 0 ? -|a| : |a|, fma(a, b, c) =
 /// a*b + c (rounded twice), log2(x) = ln(x) * log2(e) (within the engine's ln ulp budget, not bit-exact), and
 /// floor/ceil from the nearest integer t (the engine converts to integers rounding to nearest): floor =
 /// t - (t > x), ceil = t + (t < x), exact for any integer t within 1 of x; values beyond 2^(mantissa bits) are
-/// integers already and pass through (the conversion would saturate).
+/// integers already and pass through (the conversion would saturate). Unsigned i32 min and max compare signed with
+/// the sign bits flipped (which maps unsigned order onto signed order): minui(a, b) = minsi(a ^ s, b ^ s) ^ s.
 void expandMath(ModuleOp module) {
   RewritePatternSet approximations(module.getContext());
   populateMathPolynomialApproximationPatterns(approximations, [](StringRef name) {
@@ -944,6 +1016,17 @@ void expandMath(ModuleOp module) {
                               name);
   });
   (void)applyPatternsGreedily(module, std::move(approximations));
+  module.walk([&](Operation *op) {
+    if (!isa<arith::MinUIOp, arith::MaxUIOp>(op) || !op->getResult(0).getType().isInteger(32))
+      return;
+    OpBuilder b(op);
+    Location loc = op->getLoc();
+    Value sign = arith::ConstantOp::create(b, loc, b.getI32IntegerAttr(int32_t(0x80000000u)));
+    Value l = arith::XOrIOp::create(b, loc, op->getOperand(0), sign), r = arith::XOrIOp::create(b, loc, op->getOperand(1), sign);
+    Value m = isa<arith::MinUIOp>(op) ? arith::MinSIOp::create(b, loc, l, r).getResult() : arith::MaxSIOp::create(b, loc, l, r).getResult();
+    op->getResult(0).replaceAllUsesWith(arith::XOrIOp::create(b, loc, m, sign));
+    op->erase();
+  });
   SmallVector<Operation *> ops;
   module.walk([&](Operation *op) {
     if (isa<math::FmaOp, math::Log2Op, math::FloorOp, math::CeilOp, math::CopySignOp>(op) &&
@@ -999,12 +1082,13 @@ void mlir::furiosa::normalizeKernels(ModuleOp module, function_ref<bool(linalg::
   SmallVector<linalg::GenericOp> generics;
   module.walk([&](linalg::GenericOp g) { generics.push_back(g); });
   for (linalg::GenericOp g : generics) {
-    g = promoteExtracts(g);
+    g = initsToInputs(promoteExtracts(g));
     for (unsigned i = 0; i < g.getNumDpsInputs(); ++i) {
       delinearizeRead(g, i);
       maskToPad(g, i);
     }
     dropCarriers(g);
+    relayoutReads(g, mapsAlone);
   }
   // The slices and carriers the reads no longer use.
   for (auto func : module.getOps<func::FuncOp>())
