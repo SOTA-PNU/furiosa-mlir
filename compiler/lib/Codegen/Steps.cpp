@@ -843,3 +843,23 @@ FailureOr<std::string> mlir::furiosa::stepsPlan(ModuleOp module) {
   os << llvm::json::Value(std::move(plan));
   return text;
 }
+
+namespace {
+
+struct SplitStepsPass : PassWrapper<SplitStepsPass, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SplitStepsPass)
+
+  StringRef getArgument() const override { return "furiosa-split-steps"; }
+  StringRef getDescription() const override {
+    return "Split structured kernels no op class maps whole into steps one class each maps";
+  }
+  void getDependentDialects(DialectRegistry &registry) const override { registerCodegenDialects(registry); }
+  void runOnOperation() override {
+    if (failed(splitSteps(getOperation())))
+      signalPassFailure();
+  }
+};
+
+} // namespace
+
+std::unique_ptr<Pass> mlir::furiosa::createSplitStepsPass() { return std::make_unique<SplitStepsPass>(); }

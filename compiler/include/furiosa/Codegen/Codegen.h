@@ -18,6 +18,9 @@ namespace mlir::furiosa {
 /// dialect, op class by op class (lib/Codegen/Mapping/).
 std::unique_ptr<Pass> createLinalgToFoptPass();
 
+/// furiosa-split-steps: splitSteps as a pass over a module of structured kernels (lib/Codegen/Steps.cpp).
+std::unique_ptr<Pass> createSplitStepsPass();
+
 /// Writes every fopt kernel of `module` as one Rust module (the body of src/kernel/<symbol>.rs).
 LogicalResult translateFoptToRust(ModuleOp module, llvm::raw_ostream &os);
 

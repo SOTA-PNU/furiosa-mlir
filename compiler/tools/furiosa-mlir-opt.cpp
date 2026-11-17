@@ -16,5 +16,6 @@ int main(int argc, char **argv) {
   mlir::registerPass([] { return mlir::furiosa::createRaiseToLinalgPass(); });
   mlir::registerPass([] { return mlir::furiosa::createStructurePass(); });
   mlir::registerPass([] { return mlir::furiosa::createLinalgToFoptPass(); });
+  mlir::registerPass([] { return mlir::furiosa::createSplitStepsPass(); });
   return mlir::asMainReturnCode(mlir::MlirOptMain(argc, argv, "Furiosa passes", registry));
 }
