@@ -940,6 +940,32 @@ std::string key(ArrayRef<Axis> env) {
   return s;
 }
 
+/// The iter args of `loop` that its result `result` depends on: those its yielded value reads,
+/// directly or through ops of the body (nested regions included), and so on through their yields.
+SmallVector<bool> stateClosure(scf::ForOp loop, unsigned result) {
+  auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+  SmallVector<bool> needed(loop.getNumRegionIterArgs(), false);
+  DenseSet<Operation *> seen;
+  SmallVector<Value> work{yield.getOperand(result)};
+  needed[result] = true;
+  while (!work.empty()) {
+    Value v = work.pop_back_val();
+    if (auto arg = dyn_cast<BlockArgument>(v); arg && arg.getOwner() == loop.getBody()) {
+      unsigned j = arg.getArgNumber() - loop.getNumInductionVars();
+      if (arg.getArgNumber() >= loop.getNumInductionVars() && !needed[j]) {
+        needed[j] = true;
+        work.push_back(yield.getOperand(j));
+      }
+      continue;
+    }
+    Operation *def = v.getDefiningOp();
+    if (!def || !loop->isProperAncestor(def) || !seen.insert(def).second)
+      continue;
+    def->walk([&](Operation *inner) { work.append(inner->operand_begin(), inner->operand_end()); });
+  }
+  return needed;
+}
+
 /// An env over a parent's dims, in a generic built with `remap` (parent dim -> its dim).
 void remapAxis(Axis &a, ArrayRef<int> remap) {
   if (a.kind == Axis::Iter)
@@ -1084,7 +1110,8 @@ private:
   FailureOr<Value> materialize(Gen &g, Value v, ArrayRef<Axis> env);
   int64_t liveExtent(tt::DotOp dot);
   FailureOr<Value> materializeState(Gen &g, scf::ForOp loop, unsigned result, ArrayRef<Axis> env);
-  FailureOr<SmallVector<SmallVector<Axis>>> stateEnvs(scf::ForOp loop, unsigned result, ArrayRef<Axis> env);
+  FailureOr<SmallVector<SmallVector<Axis>>> stateEnvs(scf::ForOp loop, unsigned result, ArrayRef<Axis> env,
+                                                     SmallVector<bool> *skipped = nullptr);
   FailureOr<Value> parallelGeneric(Gen &parent, Type elem, std::function<FailureOr<Value>(Gen &)> fn);
   // (loop, consumer anchor) -> its results and, per result, the consumer dims its state spans.
   std::map<std::pair<Operation *, Operation *>, std::pair<SmallVector<Value>, SmallVector<SmallVector<unsigned>>>>
@@ -1868,6 +1895,20 @@ FailureOr<AffineExpr> Raiser::rewriteSymbolic(Operation *at, const Gen &g, Array
 FailureOr<AffineExpr> Raiser::fitOrigins(Operation *at, const Gen &g, ArrayRef<int64_t> consts) {
   unsigned nb = space->origin[0].size();
   auto fit = fitAffine(space->origin, consts);
+  // A value that is an origin over a tile size (a causal trip count, origin / BLOCK_M): fit it times the
+  // origin's step between instances, then divide. Exact, as fitAffine checks every instance and an
+  // origin expression always lands on an instance's origin.
+  int64_t scale = 1;
+  for (unsigned f = 0; f < nb && !fit; ++f) {
+    int64_t step = 0;
+    for (auto &o : space->origin)
+      step = std::gcd(step, std::abs(o[f] - space->origin[0][f]));
+    SmallVector<int64_t> scaled;
+    for (int64_t c : consts)
+      scaled.push_back(c * step);
+    if (step > 1 && (fit = fitAffine(space->origin, scaled)))
+      scale = step;
+  }
   if (!fit) {
     std::string detail;
     llvm::raw_string_ostream os(detail);
@@ -1902,7 +1943,7 @@ FailureOr<AffineExpr> Raiser::fitOrigins(Operation *at, const Gen &g, ArrayRef<i
   for (unsigned k = 0; k < std::min<unsigned>(nb, space->global.size()); ++k)
     if (alpha[k] && !isa<AffineConstantExpr>(originExpr(g, k)))
       originUses.insert(k);
-  return tidy(g, out);
+  return tidy(g, scale > 1 ? out.floorDiv(scale) : out);
 }
 
 Value Raiser::index(Gen &g, unsigned dim) {
@@ -2153,6 +2194,8 @@ FailureOr<Value> Raiser::emitElementwise(Gen &g, Operation *op, ArrayRef<Axis> e
   }
   if (isa<tt::BitcastOp>(op))
     return arith::BitcastOp::create(ob, loc, rt, operands[0]).getResult();
+  if (isa<tt::MulhiUIOp>(op)) // the high half of the unsigned product (math.umulhi)
+    return arith::MulUIExtendedOp::create(ob, loc, operands[0], operands[1]).getHigh();
   if (auto clamp = dyn_cast<tt::ClampFOp>(op)) {
     Value lo = arith::MaximumFOp::create(ob, loc, operands[0], operands[1]);
     return arith::MinimumFOp::create(ob, loc, lo, operands[2]).getResult();
@@ -2167,7 +2210,7 @@ FailureOr<Value> Raiser::emitElementwise(Gen &g, Operation *op, ArrayRef<Axis> e
 static bool isElementwise(Operation *op) {
   if (op->getNumResults() != 1 || op->getNumRegions() != 0)
     return false;
-  if (isa<tt::PreciseDivFOp, tt::PreciseSqrtOp, tt::FpToFpOp, tt::BitcastOp, tt::ClampFOp>(op))
+  if (isa<tt::PreciseDivFOp, tt::PreciseSqrtOp, tt::FpToFpOp, tt::BitcastOp, tt::ClampFOp, tt::MulhiUIOp>(op))
     return true;
   Dialect *d = op->getDialect();
   return d && (isa<arith::ArithDialect>(d) || isa<math::MathDialect>(d)) && !isa<arith::ConstantOp>(op);
@@ -2806,7 +2849,8 @@ FailureOr<Value> Raiser::parallelGeneric(Gen &parent, Type elem, std::function<F
 /// Bindings of every data iter arg of `loop`, from the binding `env` of result `result`: axes are
 /// unified through the body (elementwise, broadcast, expand_dims, trans, reduce, dot) and through
 /// init = iter arg = yield = result.
-FailureOr<SmallVector<SmallVector<Axis>>> Raiser::stateEnvs(scf::ForOp loop, unsigned result, ArrayRef<Axis> env) {
+FailureOr<SmallVector<SmallVector<Axis>>> Raiser::stateEnvs(scf::ForOp loop, unsigned result, ArrayRef<Axis> env,
+                                                             SmallVector<bool> *skipped) {
   std::map<std::pair<void *, unsigned>, int> ids;
   SmallVector<int> parent;
   SmallVector<std::optional<Axis>> bound;
@@ -2888,7 +2932,10 @@ FailureOr<SmallVector<SmallVector<Axis>>> Raiser::stateEnvs(scf::ForOp loop, uns
   if (conflict)
     return loop.emitError("furiosa: loop state axes bind to two different output coordinates"), failure();
   SmallVector<SmallVector<Axis>> envs;
-  for (Value arg : loop.getRegionIterArgs()) {
+  SmallVector<bool> needed = stateClosure(loop, result);
+  if (skipped)
+    skipped->assign(loop.getNumRegionIterArgs(), false);
+  for (auto [j, arg] : llvm::enumerate(loop.getRegionIterArgs())) {
     SmallVector<Axis> e;
     for (unsigned k = 0; k < rank(arg); ++k) {
       if (dim(arg, k) == 1) {
@@ -2896,6 +2943,10 @@ FailureOr<SmallVector<SmallVector<Axis>>> Raiser::stateEnvs(scf::ForOp loop, uns
         continue;
       }
       auto b = bound[find(node(arg, k))];
+      if (!b && !needed[j] && skipped) { // unrelated to this result's coordinates and not read by it
+        (*skipped)[j] = true;
+        b = Axis{};
+      }
       if (!b)
         return loop.emitError("furiosa: a loop state axis does not relate to the output coordinates"), failure();
       e.push_back(*b);
@@ -2916,15 +2967,16 @@ FailureOr<Value> Raiser::materializeState(Gen &g, scf::ForOp loop, unsigned resu
     return tensor::ExtractOp::create(*g.ob, loc, t, idx).getResult();
   };
   auto key = std::make_pair(loop.getOperation(), g.anchor);
-  if (auto it = keptLoops.find(key); it != keptLoops.end())
+  if (auto it = keptLoops.find(key); it != keptLoops.end() && it->second.first[result])
     return extract(it->second.first[result], it->second.second[result]);
-  auto envs = stateEnvs(loop, result, env);
+  SmallVector<bool> skipped; // states this result neither reads nor relates to: left out of the loop
+  auto envs = stateEnvs(loop, result, env, &skipped);
   if (failed(envs))
     return failure();
   unsigned id = loopIds.lookup(loop);
   SmallVector<unsigned> dataArgs;
   for (auto [j, arg] : llvm::enumerate(loop.getRegionIterArgs()))
-    if (!act[0]->get(arg))
+    if (!act[0]->get(arg) && !skipped[j])
       dataArgs.push_back(j);
   if (!llvm::is_contained(dataArgs, result))
     return loop.emitError("furiosa: internal: an index loop result used as data"), failure();
@@ -3098,13 +3150,13 @@ FailureOr<Value> Raiser::materializeState(Gen &g, scf::ForOp loop, unsigned resu
         op->erase();
     keeps = pruned;
   }
-  SmallVector<Value> results(loop.getNumResults());
-  SmallVector<SmallVector<unsigned>> dimsOf(loop.getNumResults());
+  auto &[results, dimsOf] = keptLoops[key]; // other results of the loop may be built already
+  results.resize(loop.getNumResults());
+  dimsOf.resize(loop.getNumResults());
   for (auto [k, j] : llvm::enumerate(dataArgs)) {
     results[j] = forOp->getResult(k);
     dimsOf[j] = keeps[k];
   }
-  keptLoops[key] = {results, dimsOf};
   return extract(results[result], dimsOf[result]);
 }
 

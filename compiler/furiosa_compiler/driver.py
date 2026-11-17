@@ -64,7 +64,8 @@ def specialize(launch):
         if is_buffer(value):
             signature[name] = f"*{value.dtype}"
             attrs[(i,)] = [["tt.divisibility", 16]]
-            buffers.append({"arg": i, "kind": value.kind, "dtype": value.dtype, "shape": list(value.shape)})
+            # TTIR keeps the pointer parameters alone (scalars are constexpr): its position among them.
+            buffers.append({"arg": len(buffers), "kind": value.kind, "dtype": value.dtype, "shape": list(value.shape)})
             names.append(value.name)
             pointer_args.append(name)
         else:

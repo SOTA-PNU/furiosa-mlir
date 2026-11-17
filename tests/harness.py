@@ -41,6 +41,10 @@ def run(graph, tensors: dict, after_launch=None) -> dict:
                 f"{buf.name}: graph wants contiguous cuda {buf.dtype}{list(buf.shape)}, "
                 f"got {tensor.dtype}{list(tensor.shape)} on {tensor.device}, contiguous={tensor.is_contiguous()}"
             )
+    import triton
+
+    # Scratch for what kernels allocate at run time (tensor descriptors made in-kernel).
+    triton.set_allocator(lambda size, alignment, stream: torch.empty(size, dtype=torch.int8, device="cuda"))
     for index, launch in enumerate(graph.launches):
         args = {name: tensors[value.name] if hasattr(value, "kind") else value for name, value in launch.args.items()}
         # As in Triton, a kernel parameter shadows a launch option of the same name (e.g. num_stages).
