@@ -1015,3 +1015,78 @@ struct SplitStepsPass : PassWrapper<SplitStepsPass, OperationPass<ModuleOp>> {
 } // namespace
 
 std::unique_ptr<Pass> mlir::furiosa::createSplitStepsPass() { return std::make_unique<SplitStepsPass>(); }
+
+namespace {
+
+/// One stage of splitSteps as a pass of its own, for the per-pass tests.
+struct StagePass : PassWrapper<StagePass, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(StagePass)
+
+  StagePass(StringRef argument, StringRef description, std::function<LogicalResult(ModuleOp)> stage)
+      : argument(argument), description(description), stage(std::move(stage)) {}
+  StagePass(const StagePass &) = default;
+
+  StringRef getArgument() const override { return argument; }
+  StringRef getDescription() const override { return description; }
+  void getDependentDialects(DialectRegistry &registry) const override { registerCodegenDialects(registry); }
+  void runOnOperation() override {
+    getContext().loadDialect<fopt::FoptDialect>(); // mapsAlone builds fopt kernels
+    if (failed(stage(getOperation())))
+      signalPassFailure();
+  }
+
+  StringRef argument, description;
+  std::function<LogicalResult(ModuleOp)> stage;
+};
+
+} // namespace
+
+std::unique_ptr<Pass> mlir::furiosa::createNormalizeKernelsPass() {
+  return std::make_unique<StagePass>("furiosa-normalize-kernels",
+                                     "Promote affine extracts, delinearize mixed-radix reads, masks to padding",
+                                     [](ModuleOp m) {
+                                       normalizeKernels(m);
+                                       return success();
+                                     });
+}
+
+std::unique_ptr<Pass> mlir::furiosa::createNormalizeContractionsPass() {
+  return std::make_unique<StagePass>("furiosa-normalize-contractions",
+                                     "Take contractions apart into the 2-D form op classes map", [](ModuleOp m) {
+                                       normalizeContractions(m, mapsAlone);
+                                       return success();
+                                     });
+}
+
+std::unique_ptr<Pass> mlir::furiosa::createHoistIndexOnlyPass() {
+  return std::make_unique<StagePass>("furiosa-hoist-index-only",
+                                     "Replace index-only generic body values with constant tables", [](ModuleOp m) {
+                                       hoistIndexOnly(m);
+                                       return success();
+                                     });
+}
+
+std::unique_ptr<Pass> mlir::furiosa::createKeptLoopsPass() {
+  return std::make_unique<StagePass>(
+      "furiosa-kept-loops", "Lift kept loops' generics over their iterations (or unroll), then structure them",
+      [](ModuleOp m) { return unrollKeptLoops(m); });
+}
+
+std::unique_ptr<Pass> mlir::furiosa::createSliceKeptLoopsPass() {
+  return std::make_unique<StagePass>("furiosa-slice-kept-loops",
+                                     "Tile lifted generics back to their iteration's slice", [](ModuleOp m) {
+                                       sliceKeptLoops(m);
+                                       return success();
+                                     });
+}
+
+std::unique_ptr<Pass> mlir::furiosa::createStepsPlanPass() {
+  return std::make_unique<StagePass>("furiosa-steps-plan", "Print a split kernel's launch plan (JSON) to stdout",
+                                     [](ModuleOp m) -> LogicalResult {
+                                       FailureOr<std::string> plan = stepsPlan(m);
+                                       if (failed(plan))
+                                         return failure();
+                                       llvm::outs() << *plan << "\n";
+                                       return success();
+                                     });
+}

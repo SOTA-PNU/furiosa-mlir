@@ -21,6 +21,16 @@ std::unique_ptr<Pass> createLinalgToFoptPass();
 /// furiosa-split-steps: splitSteps as a pass over a module of structured kernels (lib/Codegen/Steps.cpp).
 std::unique_ptr<Pass> createSplitStepsPass();
 
+/// splitSteps' stages one by one, for the per-pass tests (lib/Codegen/Steps.cpp): furiosa-normalize-kernels,
+/// furiosa-normalize-contractions, furiosa-hoist-index-only, furiosa-kept-loops, furiosa-slice-kept-loops,
+/// and furiosa-steps-plan (prints a split kernel's launch plan).
+std::unique_ptr<Pass> createNormalizeKernelsPass();
+std::unique_ptr<Pass> createNormalizeContractionsPass();
+std::unique_ptr<Pass> createHoistIndexOnlyPass();
+std::unique_ptr<Pass> createKeptLoopsPass();
+std::unique_ptr<Pass> createSliceKeptLoopsPass();
+std::unique_ptr<Pass> createStepsPlanPass();
+
 /// furiosa-tile: tiles each kernel's output rows by the tiled lowering's plan into scf.for loops over its root
 /// generic (lib/Codegen/Tile/TilePass.cpp).
 std::unique_ptr<Pass> createTilePass();
