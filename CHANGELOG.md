@@ -6,6 +6,11 @@ npu stage) against GPU goldens.
 
 ## 1.3.0 (unreleased, main)
 
+- tl.sort and tl.topk compile to a verdict in seconds instead of timing out: the row-wise operand weight is memoized
+  over the DAG (it recursed exponentially through sort's stages and hung the mapping oracle) (ae69985), and a split
+  only the oracle asks for stands only when its pieces map (pieces split again down to one per element: sort at 1024
+  lanes made ~62,000 steps, now 681 in 2.1 s) (b8ee106). They still fail to map: a compare-and-swap stage's key
+  XORs two conditions inside a generic that also reduces, over 12 size-2 row dims.
 - Steps are named from a symbol table and a running counter: probing every name from 0 with a module scan was cubic
   in the step count, minutes for tl.sort's thousands of steps (b761d74).
 - The tiled path's NaN-skipping clean value is exact: two logic ops under one tag ((x | m) & m = m where the tag
