@@ -865,6 +865,7 @@ public:
       : module(module), kernel(kernel), ctx(module.getContext()), b(ctx), loc(kernel.getLoc()) {}
 
   LogicalResult run();
+  void lowerScans();
 
 private:
   ModuleOp module;
@@ -939,6 +940,14 @@ private:
                                                                   ArrayRef<int64_t> ownExtents,
                                                                   ArrayRef<std::pair<unsigned, unsigned>> loopDims,
                                                                   Type elem, InitFn init, BodyFn body);
+  /// buildGeneric with one result per `elems` (each body yields one value per accumulator), its own dims
+  /// starting at `ownLo`.
+  using InitsFn = std::function<FailureOr<SmallVector<Value>>(Gen &, ArrayRef<int> remap)>;
+  using BodiesFn = std::function<FailureOr<SmallVector<Value>>(Gen &, ValueRange accs, ArrayRef<int> remap)>;
+  FailureOr<std::pair<SmallVector<Value>, SmallVector<unsigned>>>
+  buildGenerics(Gen &parent, ArrayRef<unsigned> parentDims, ArrayRef<int64_t> ownExtents,
+                ArrayRef<std::pair<unsigned, unsigned>> loopDims, ArrayRef<Type> elems, InitsFn init, BodiesFn body,
+                int64_t ownLo);
   Value reshape(Value t, ArrayRef<int64_t> shape);
   Value constantOf(Type t, Attribute a);
 };
@@ -2040,8 +2049,27 @@ FailureOr<Value> Raiser::emit(Gen &g, Value v, ArrayRef<Axis> env) {
 FailureOr<std::pair<Value, SmallVector<unsigned>>>
 Raiser::buildGeneric(Gen &parent, ArrayRef<unsigned> parentDims, ArrayRef<int64_t> ownExtents,
                      ArrayRef<std::pair<unsigned, unsigned>> loopDims, Type elem, InitFn init, BodyFn body) {
+  auto one = [](FailureOr<Value> v) -> FailureOr<SmallVector<Value>> {
+    if (failed(v))
+      return failure();
+    return SmallVector<Value>{*v};
+  };
+  auto built = buildGenerics(
+      parent, parentDims, ownExtents, loopDims, ArrayRef<Type>(elem),
+      [&](Gen &g, ArrayRef<int> remap) { return one(init(g, remap)); },
+      [&](Gen &g, ValueRange accs, ArrayRef<int> remap) { return one(body(g, accs[0], remap)); }, 0);
+  if (failed(built))
+    return failure();
+  return std::make_pair(built->first[0], built->second);
+}
+
+FailureOr<std::pair<SmallVector<Value>, SmallVector<unsigned>>>
+Raiser::buildGenerics(Gen &parent, ArrayRef<unsigned> parentDims, ArrayRef<int64_t> ownExtents,
+                      ArrayRef<std::pair<unsigned, unsigned>> loopDims, ArrayRef<Type> elems, InitsFn init,
+                      BodiesFn body, int64_t ownLo) {
+  unsigned nr = elems.size();
   auto attempt = [&](ArrayRef<unsigned> keep, bool &pruneable,
-                     SmallVector<unsigned> &used) -> FailureOr<Value> {
+                     SmallVector<unsigned> &used) -> FailureOr<SmallVector<Value>> {
     OpBuilder::InsertionGuard guard(b);
     b.setInsertionPoint(parent.anchor);
     // What the bodies below read gets built before this placeholder, ahead of both generics.
@@ -2058,7 +2086,7 @@ Raiser::buildGeneric(Gen &parent, ArrayRef<unsigned> parentDims, ArrayRef<int64_
     }
     unsigned np = keep.size();
     for (int64_t e : ownExtents) {
-      g.lo.push_back(0);
+      g.lo.push_back(ownLo);
       g.extent.push_back(e);
     }
     g.coordPos.assign(parent.coordPos.size(), -1);
@@ -2086,22 +2114,27 @@ Raiser::buildGeneric(Gen &parent, ArrayRef<unsigned> parentDims, ArrayRef<int64_
     gi.extent.resize(np);
     gi.lo.resize(np);
     SmallVector<int> remapParallel = remap;
-    Value empty = tensor::EmptyOp::create(b, loc, outShape, elem);
-    SmallVector<AffineMap> imaps{AffineMap::getMultiDimIdentityMap(np, ctx)};
+    SmallVector<Value> empties;
+    for (Type elem : elems)
+      empties.push_back(tensor::EmptyOp::create(b, loc, outShape, elem));
+    SmallVector<AffineMap> imaps(nr, AffineMap::getMultiDimIdentityMap(np, ctx));
     SmallVector<utils::IteratorType> iters(np, utils::IteratorType::parallel);
     LogicalResult status = success();
     auto initOp = linalg::GenericOp::create(b, 
-        loc, TypeRange{empty.getType()}, ValueRange{}, ValueRange{empty}, imaps, iters,
+        loc, ValueRange(empties).getTypes(), ValueRange{}, empties, imaps, iters,
         [&](OpBuilder &ob, Location, ValueRange) {
           gi.ob = &ob;
           gi.index.assign(np, Value());
           auto v = init(gi, remapParallel);
           if (failed(v)) {
             status = failure();
-            linalg::YieldOp::create(ob, loc, ValueRange{arith::ConstantOp::create(ob, loc, ob.getZeroAttr(elem))});
+            SmallVector<Value> zeros;
+            for (Type elem : elems)
+              zeros.push_back(arith::ConstantOp::create(ob, loc, ob.getZeroAttr(elem)));
+            linalg::YieldOp::create(ob, loc, zeros);
             return;
           }
-          linalg::YieldOp::create(ob, loc, ValueRange{*v});
+          linalg::YieldOp::create(ob, loc, *v);
         });
     if (failed(status))
       return failure();
@@ -2121,27 +2154,27 @@ Raiser::buildGeneric(Gen &parent, ArrayRef<unsigned> parentDims, ArrayRef<int64_
     SmallVector<AffineExpr> outExprs;
     for (unsigned d = 0; d < np; ++d)
       outExprs.push_back(getAffineDimExpr(d, ctx));
-    maps.push_back(AffineMap::get(nd, 0, outExprs, ctx));
+    maps.append(nr, AffineMap::get(nd, 0, outExprs, ctx));
     SmallVector<utils::IteratorType> its(np, utils::IteratorType::parallel);
     its.append(nd - np, utils::IteratorType::reduction);
-    Value result = initOp.getResult(0);
+    SmallVector<Value> result(initOp.getResults());
     if (!ownExtents.empty()) {
       auto op = linalg::GenericOp::create(b, 
-          loc, TypeRange{result.getType()}, inputs, ValueRange{result}, maps, its,
+          loc, initOp.getResultTypes(), inputs, result, maps, its,
           [&](OpBuilder &ob, Location, ValueRange args) {
             g.ob = &ob;
             g.index.assign(nd, Value());
-            auto v = body(g, args.back(), remap);
+            auto v = body(g, args.take_back(nr), remap);
             if (failed(v)) {
               status = failure();
-              linalg::YieldOp::create(ob, loc, ValueRange{args.back()});
+              linalg::YieldOp::create(ob, loc, args.take_back(nr));
               return;
             }
-            linalg::YieldOp::create(ob, loc, ValueRange{*v});
+            linalg::YieldOp::create(ob, loc, *v);
           });
       if (failed(status))
         return failure();
-      result = op.getResult(0);
+      result.assign(op.getResults().begin(), op.getResults().end());
       // Which kept dims does either generic read?
       std::set<unsigned> readDims;
       for (Operation *o : {initOp.getOperation(), op.getOperation()})
@@ -2176,7 +2209,7 @@ Raiser::buildGeneric(Gen &parent, ArrayRef<unsigned> parentDims, ArrayRef<int64_
     return std::make_pair(*first, SmallVector<unsigned>(parentDims));
   // Rebuild over the dims actually read, then drop the first attempt.
   SmallVector<Operation *> dead;
-  for (Value v = *first; v;) {
+  for (Value v = (*first)[0]; v;) {
     Operation *op = v.getDefiningOp();
     dead.push_back(op);
     auto generic = dyn_cast<linalg::GenericOp>(op);
@@ -2301,13 +2334,14 @@ FailureOr<Value> Raiser::materialize(Gen &g, Value v, ArrayRef<Axis> env) {
   FailureOr<std::pair<Value, SmallVector<unsigned>>> built = failure();
 
   if (auto red = dyn_cast<tt::ReduceOp>(def)) {
-    if (red.getNumOperands() != 1)
-      return red.emitError("furiosa: multi-operand reductions are not raised yet"), failure();
-    Region &combiner = red.getCombineOp();
-    Operation *comb = &combiner.front().front();
+    Block &combiner = red.getCombineOp().front();
+    Operation *comb = &combiner.front();
+    unsigned n = red.getNumOperands();
     Attribute identity;
     Type et = elem;
-    if (isa<arith::AddFOp>(comb))
+    if (n != 1)
+      ;
+    else if (isa<arith::AddFOp>(comb))
       identity = b.getFloatAttr(et, 0.0);
     else if (isa<arith::MulFOp>(comb))
       identity = b.getFloatAttr(et, 1.0);
@@ -2325,29 +2359,59 @@ FailureOr<Value> Raiser::materialize(Gen &g, Value v, ArrayRef<Axis> env) {
       identity = b.getIntegerAttr(et, APInt::getSignedMinValue(et.getIntOrFloatBitWidth()));
     else if (isa<arith::MinSIOp>(comb))
       identity = b.getIntegerAttr(et, APInt::getSignedMaxValue(et.getIntOrFloatBitWidth()));
-    else
-      return red.emitError("furiosa: reduction combiner without a known identity"), failure();
     unsigned axis = red.getAxis();
     int64_t extent = shapeOf(red.getOperand(0).getType())[axis];
-    built = buildGeneric(
-        g, parentDims, {extent}, {}, elem,
-        [&](Gen &gi, ArrayRef<int>) -> FailureOr<Value> { return arith::ConstantOp::create(*gi.ob, loc, cast<TypedAttr>(identity)).getResult(); },
-        [&](Gen &gg, Value acc, ArrayRef<int> remap) -> FailureOr<Value> {
-          SmallVector<Axis> in = remapEnv(env, remap);
+    // Every operand at reduction index `r`.
+    auto operandsAt = [&](Gen &gg, ArrayRef<int> remap, Axis r) -> FailureOr<SmallVector<Value>> {
+      SmallVector<Axis> in = remapEnv(env, remap);
+      in.insert(in.begin() + axis, r);
+      SmallVector<Value> xs;
+      for (Value o : red.getOperands()) {
+        auto x = emit(gg, o, in);
+        if (failed(x))
+          return failure();
+        xs.push_back(*x);
+      }
+      return xs;
+    };
+    // Without a known identity (any other combiner, or several operands), element 0 seeds the
+    // accumulators and the reduction runs over elements 1.. (own dims start at 1).
+    SmallVector<int64_t> own;
+    if (identity || extent > 1)
+      own.push_back(identity ? extent : extent - 1);
+    SmallVector<Type> elems;
+    for (Value o : red.getOperands())
+      elems.push_back(getElementTypeOrSelf(o.getType()));
+    auto multi = buildGenerics(
+        g, parentDims, own, {}, elems,
+        [&](Gen &gi, ArrayRef<int> remap) -> FailureOr<SmallVector<Value>> {
+          if (!identity)
+            return operandsAt(gi, remap, Axis{}); // Unit: index 0
+          return SmallVector<Value>{arith::ConstantOp::create(*gi.ob, loc, cast<TypedAttr>(identity)).getResult()};
+        },
+        [&](Gen &gg, ValueRange accs, ArrayRef<int> remap) -> FailureOr<SmallVector<Value>> {
           Axis r;
           r.kind = Axis::Iter;
           r.dim = gg.extent.size() - 1;
-          in.insert(in.begin() + axis, r);
-          auto x = emit(gg, red.getOperand(0), in);
-          if (failed(x))
+          auto xs = operandsAt(gg, remap, r);
+          if (failed(xs))
             return failure();
           IRMapping map;
-          map.map(combiner.front().getArgument(0), acc);
-          map.map(combiner.front().getArgument(1), *x);
-          for (Operation &o : combiner.front().without_terminator())
+          for (unsigned j = 0; j < n; ++j) {
+            map.map(combiner.getArgument(j), accs[j]);
+            map.map(combiner.getArgument(n + j), (*xs)[j]);
+          }
+          for (Operation &o : combiner.without_terminator())
             gg.ob->clone(o, map);
-          return map.lookup(combiner.front().getTerminator()->getOperand(0));
-        });
+          SmallVector<Value> outs;
+          for (Value y : combiner.getTerminator()->getOperands())
+            outs.push_back(map.lookupOrDefault(y));
+          return outs;
+        },
+        identity ? 0 : 1);
+    if (failed(multi))
+      return failure();
+    built = std::make_pair(multi->first[cast<OpResult>(v).getResultNumber()], multi->second);
   } else if (auto dot = dyn_cast<tt::DotOp>(def)) {
     int64_t k = liveExtent(dot);
     built = buildGeneric(
@@ -2949,7 +3013,67 @@ LogicalResult Raiser::raiseStoreIn(tt::StoreOp store, const StoreSpace &spRef) {
   return success();
 }
 
+/// A scan as a reduction: out[i] combines the elements j <= i (j >= i reversed) of the scanned axis.
+/// The reduction runs over a new j axis next to i, with j's condition as one more operand; the combiner
+/// keeps the accumulator where the condition fails, so no identity is needed.
+void Raiser::lowerScans() {
+  SmallVector<tt::ScanOp> scans;
+  kernel.walk([&](tt::ScanOp s) { scans.push_back(s); });
+  for (tt::ScanOp scan : scans) {
+    OpBuilder ob(scan);
+    unsigned a = scan.getAxis(), n = scan.getNumOperands();
+    SmallVector<int64_t> wide = shapeOf(scan.getOperand(0).getType());
+    int64_t c = wide[a];
+    wide.insert(wide.begin() + a, c); // [..., i, j, ...]
+    auto bcast = [&](Value v) -> Value {
+      return tt::BroadcastOp::create(ob, loc, RankedTensorType::get(wide, getElementTypeOrSelf(v.getType())), v);
+    };
+    auto along = [&](unsigned at) { // the scanned axis' index, running along dim `at` of `wide`
+      Value r = tt::MakeRangeOp::create(ob, loc, RankedTensorType::get({c}, ob.getI32Type()), 0, c);
+      for (unsigned d = 0; d < wide.size(); ++d)
+        if (d != at)
+          r = tt::ExpandDimsOp::create(ob, loc, r, d);
+      return bcast(r);
+    };
+    SmallVector<Value> srcs;
+    for (Value x : scan.getOperands())
+      srcs.push_back(bcast(tt::ExpandDimsOp::create(ob, loc, x, a)));
+    srcs.push_back(arith::CmpIOp::create(ob, loc, scan.getReverse() ? arith::CmpIPredicate::sge : arith::CmpIPredicate::sle,
+                                         along(a + 1), along(a)));
+    auto red = tt::ReduceOp::create(ob, loc, srcs, a + 1);
+    Block &old = scan.getCombineOp().front();
+    Block *blk = new Block();
+    red.getCombineOp().push_back(blk);
+    SmallVector<Value> accs, xs;
+    for (unsigned k = 0; k < n; ++k)
+      accs.push_back(blk->addArgument(old.getArgument(k).getType(), loc));
+    Value accOk = blk->addArgument(ob.getI1Type(), loc);
+    for (unsigned k = 0; k < n; ++k)
+      xs.push_back(blk->addArgument(old.getArgument(n + k).getType(), loc));
+    Value xOk = blk->addArgument(ob.getI1Type(), loc);
+    OpBuilder rb = OpBuilder::atBlockEnd(blk);
+    IRMapping map;
+    for (unsigned k = 0; k < n; ++k) {
+      map.map(old.getArgument(k), accs[k]);
+      map.map(old.getArgument(n + k), xs[k]);
+    }
+    for (Operation &o : old.without_terminator())
+      rb.clone(o, map);
+    SmallVector<Value> outs;
+    for (auto [k, y] : llvm::enumerate(old.getTerminator()->getOperands())) {
+      Value v = arith::SelectOp::create(rb, loc, accOk, map.lookupOrDefault(y), xs[k]);
+      outs.push_back(arith::SelectOp::create(rb, loc, xOk, v, accs[k]));
+    }
+    outs.push_back(arith::OrIOp::create(rb, loc, accOk, xOk));
+    tt::ReduceReturnOp::create(rb, loc, outs);
+    for (unsigned k = 0; k < n; ++k)
+      scan->getResult(k).replaceAllUsesWith(red->getResult(k));
+    scan.erase();
+  }
+}
+
 LogicalResult Raiser::run() {
+  lowerScans();
   if (failed(parseLaunch()) || failed(evaluate()))
     return failure();
   b.setInsertionPointToEnd(module.getBody());

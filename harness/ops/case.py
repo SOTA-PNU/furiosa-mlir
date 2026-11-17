@@ -9,7 +9,7 @@ import argparse
 import json
 import sys
 import tempfile
-import traceback
+from pathlib import Path
 
 from harness.ops.cases import Case, build, check
 
@@ -21,15 +21,14 @@ def run_raised(kernel, grid, args):
     bufs = {n: npu.Buf(n, npu.DTYPES[t.dtype], tuple(t.shape)) for n, t in args.items() if hasattr(t, "dtype")}
     launch = npu.Launch(kernel, tuple(grid), {n: bufs.get(n, v) for n, v in args.items()})
     graph = npu.Graph(kernel.__name__, {b.name: b for b in bufs.values()}, [launch])
-    out = tempfile.mkdtemp(prefix="ops-", dir="/mnt/nvme1n1p2/chacha")
-    from pathlib import Path
-    result = driver.compile_graphs([graph], kernel.__name__, Path(out))
-    symbol = next(iter(result["kernels"]))
-    _, address, written = l1.Kernels(Path(out), result["kernels"]).get(symbol)
-    names = result["graphs"][0]["launches"][0]["args"]
-    arrays = [npu.host(args[n]) for n in names]
-    outs = [np.empty_like(arrays[w]) for w in written]
-    tensors.call(address, arrays + outs)
+    with tempfile.TemporaryDirectory(prefix="ops-", dir="/mnt/nvme1n1p2/chacha") as out:
+        result = driver.compile_graphs([graph], kernel.__name__, Path(out))
+        symbol = next(iter(result["kernels"]))
+        _, address, written = l1.Kernels(Path(out), result["kernels"]).get(symbol)
+        names = result["graphs"][0]["launches"][0]["args"]
+        arrays = [npu.host(args[n]) for n in names]
+        outs = [np.empty_like(arrays[w]) for w in written]
+        tensors.call(address, arrays + outs)
     for w, o in zip(written, outs):
         npu.store(args[names[w]], o)
 
