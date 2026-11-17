@@ -48,6 +48,12 @@ Value reshapeTo(OpBuilder &b, Location loc, Value v, RankedTensorType t);
 /// (lib/Codegen/Loops.cpp).
 LogicalResult unrollKeptLoops(ModuleOp module);
 
+/// A padded tensor only boxes are cut from becomes the source inserted into a constant (lib/Codegen/Normalize.cpp).
+void padsToInserts(ModuleOp module);
+
+/// Tiles the generics unrollKeptLoops lifted back to their iteration's slice (lib/Codegen/Loops.cpp).
+void sliceKeptLoops(ModuleOp module);
+
 /// Evaluates every value of a linalg.generic body that depends only on the iteration indices at compile time,
 /// over the dims it reads, and replaces it with a constant tensor input (lib/Codegen/Hoist.cpp).
 void hoistIndexOnly(ModuleOp module);

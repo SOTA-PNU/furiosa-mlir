@@ -33,6 +33,9 @@ add_triton_library(FuriosaCodegen
     MLIRSCFUtils
     MLIRSupport
     MLIRTensorDialect
+    MLIRTensorInferTypeOpInterfaceImpl
+    MLIRTensorTilingInterfaceImpl
+    MLIRTensorTransforms
     MLIRTransforms
     FuriosaTransforms
 )

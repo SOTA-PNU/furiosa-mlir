@@ -1,12 +1,16 @@
-// RUN: furiosa-mlir-opt --furiosa-split-steps %s | FileCheck %s --implicit-check-not=scf.for --implicit-check-not="tensor.extract "
+// RUN: furiosa-mlir-opt --furiosa-split-steps %s | FileCheck %s --implicit-check-not="tensor.extract "
 
 // A loop the raise kept at the top level (here a running sum over two tiles of x, as in an argmax's running
-// maximum) unrolls into host-launched iterations; furiosa-structure then promotes the reads the induction
-// variable addressed, so no gather-form extract is left.
+// maximum) stays a loop the host runs: its body generic is lifted over the iterations so furiosa-structure
+// promotes the read the induction variable addressed (no gather-form extract is left), then tiled back to one
+// iteration, which reads x's row at the iteration and is split into a step called once per iteration.
 
 // CHECK-LABEL: func.func @k
-// CHECK: tensor.extract_slice %arg0[0] [4] [1]
-// CHECK: tensor.extract_slice %arg0[4] [4] [1]
+// CHECK: %[[X:.*]] = tensor.expand_shape %arg0 {{.*}} into tensor<2x4xf32>
+// CHECK: scf.for %[[I:.*]] = %{{.*}} iter_args
+// CHECK: tensor.extract_slice %[[X]][%[[I]], 0] [1, 4]
+// CHECK: func.call @k__s0
+// CHECK: } {furiosa.steps}
 #id = affine_map<(d0) -> (d0)>
 module {
   func.func @k(%x: tensor<8xf32>, %o: tensor<4xf32>) -> tensor<4xf32> attributes {furiosa.written = [1]} {

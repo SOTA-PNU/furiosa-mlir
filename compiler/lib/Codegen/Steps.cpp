@@ -12,9 +12,11 @@
 #include "furiosa/Codegen/Codegen.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -40,10 +42,35 @@ bool isCheap(Operation *op) {
   return isReshape(op) || isa<tensor::EmptyOp, linalg::FillOp, arith::ConstantOp, tensor::PadOp>(op);
 }
 
-/// Everything else at the top level is part of some step: a step an op class may not map (a kept loop, say)
+/// A box of a buffer at a kept loop's iteration (an offset the body computes from the induction variable): the
+/// view the plan takes of that buffer each iteration, not a step.
+bool isIterationSlice(Operation *op) {
+  auto slice = dyn_cast<tensor::ExtractSliceOp>(op);
+  return slice && !slice.getOffsets().empty() && isa<scf::ForOp>(op->getParentOp());
+}
+
+/// A kept loop whose body is split into steps: the plan runs it.
+bool isSplitLoop(Operation *op) { return isa<scf::ForOp>(op) && op->hasAttr(kStepsAttr); }
+
+/// The values `op` reads from its own block: its operands, and for a split loop what its body reads.
+SmallVector<Value> blockUses(Operation *op) {
+  SmallVector<Value> vs(op->getOperands());
+  if (isSplitLoop(op))
+    op->walk([&](Operation *nested) {
+      for (Value v : nested->getOperands())
+        if (Operation *def = v.getDefiningOp(); def && def->getBlock() == op->getBlock())
+          vs.push_back(v);
+    });
+  return vs;
+}
+
+/// Where values leave a block's steps: its terminator, or a split loop that reads them.
+bool isAnchor(Operation *op) { return isa<func::ReturnOp, scf::YieldOp>(op) || isSplitLoop(op); }
+
+/// Everything else in a block is part of some step: a step an op class may not map (a kept loop, say)
 /// still gives a valid plan, and L2 names it.
 bool isUnit(Operation *op) {
-  return !isCheap(op) && !isa<func::ReturnOp, func::CallOp>(op) && op->getNumResults() > 0;
+  return !isCheap(op) && !isAnchor(op) && !isa<func::CallOp>(op) && !isIterationSlice(op) && op->getNumResults() > 0;
 }
 
 /// The value a reshape chain starts from.
@@ -143,10 +170,12 @@ struct Group {
 
 class Splitter {
 public:
-  Splitter(func::FuncOp kernel) : kernel(kernel), block(kernel.getBody().front()) {
+  /// Splits `block`: the kernel's body, or the body of one of its kept loops.
+  Splitter(func::FuncOp kernel, Block &block) : kernel(kernel), block(block) {
     for (auto [i, op] : llvm::enumerate(block.getOperations()))
       position[&op] = i;
   }
+  Splitter(func::FuncOp kernel) : Splitter(kernel, kernel.getBody().front()) {}
 
   /// `single`: one step of the whole kernel (it maps whole, but its tables must become buffers).
   void run(bool single = false);
@@ -168,7 +197,7 @@ private:
     return all;
   }
   /// The unit ops whose values `g`'s members read (through cheap ops), outside `g`.
-  llvm::SetVector<Operation *> producedFor(const Group &g);
+  llvm::SetVector<Operation *> producedFor(const Group &g, bool throughLoops = false);
   /// The groups (or -1 for the kernel's return) whose owned ops read `v`, looking through cheap ops.
   void consumers(Value v, llvm::SmallSetVector<int, 4> &out);
   /// The values of `g`'s own ops that something outside it reads: the return, or a group that reads it
@@ -185,7 +214,7 @@ private:
   void order();
 };
 
-llvm::SetVector<Operation *> Splitter::producedFor(const Group &g) {
+llvm::SetVector<Operation *> Splitter::producedFor(const Group &g, bool throughLoops) {
   llvm::SetVector<Operation *> producers;
   for (Operation *op : members(g))
     op->walk([&](Operation *nested) {
@@ -196,8 +225,8 @@ llvm::SetVector<Operation *> Splitter::producedFor(const Group &g) {
             return;
           if (groupOf.count(def))
             producers.insert(def);
-          else if (isCheap(def))
-            for (Value o : def->getOperands())
+          else if (isCheap(def) || (throughLoops && isSplitLoop(def))) // for order: after the loop's inputs too
+            for (Value o : blockUses(def))
               trace(o);
         };
         trace(operand);
@@ -211,7 +240,7 @@ void Splitter::consumers(Value v, llvm::SmallSetVector<int, 4> &out) {
     Operation *user = use.getOwner();
     while (user->getBlock() != &block)
       user = user->getParentOp();
-    if (isa<func::ReturnOp>(user))
+    if (isAnchor(user))
       out.insert(-1);
     else if (auto it = groupOf.find(user); it != groupOf.end())
       out.insert(it->second);
@@ -236,7 +265,7 @@ SmallVector<Value> Splitter::outputsOf(int g, bool all) {
             user = user->getParentOp();
           if (group.contains(user))
             continue;
-          if (isa<func::ReturnOp>(user) || all) {
+          if (isAnchor(user) || all) {
             read = true;
           } else if (isCheap(user)) {
             for (Value x : user->getResults())
@@ -307,7 +336,7 @@ void Splitter::order() {
   std::vector<llvm::SmallSetVector<unsigned, 2>> writes(n);
   reads.assign(n, {});
   for (int g = 0; g < n; ++g) {
-    for (Operation *def : producedFor(groups[g]))
+    for (Operation *def : producedFor(groups[g], /*throughLoops=*/true))
       after[g].insert(groupOf.lookup(def));
     for (Operation *op : members(groups[g]))
       op->walk([&](Operation *nested) {
@@ -319,7 +348,8 @@ void Splitter::order() {
       });
   }
   // The buffers a step's results are returned in.
-  auto written = kernel->getAttrOfType<ArrayAttr>("furiosa.written");
+  auto written = isa<func::ReturnOp>(block.getTerminator()) ? kernel->getAttrOfType<ArrayAttr>("furiosa.written")
+                                                             : ArrayAttr();
   for (OpOperand &use : block.getTerminator()->getOpOperands()) {
     Value v = use.get();
     while (v.getDefiningOp() && isCheap(v.getDefiningOp()) && v.getDefiningOp()->getNumOperands())
@@ -385,14 +415,23 @@ func::FuncOp Splitter::outline(const Group &g, StringRef name, ArrayRef<Value> o
   // Cheap producers are cloned in; everything else the members read is an input.
   llvm::SetVector<Operation *> cloned;
   llvm::SetVector<Value> external;
+  // Whether an op lies inside one of the members' own regions (as opposed to around the block).
+  auto nested = [&](Operation *op) { return op && op != block.getParentOp() && block.findAncestorOpInBlock(*op); };
   std::function<void(Value)> need = [&](Value v) {
-    if (auto arg = dyn_cast<BlockArgument>(v); arg && arg.getOwner() != &block)
-      return; // an argument of one of the ops' own regions
+    if (auto arg = dyn_cast<BlockArgument>(v); arg && arg.getOwner() != &block) {
+      if (!nested(arg.getOwner()->getParentOp()))
+        external.insert(v); // an argument around the block (a loop body reads the kernel's buffers)
+      return;
+    }
     Operation *def = v.getDefiningOp();
     if (def && (g.contains(def) || cloned.contains(def)))
       return;
-    if (def && def->getBlock() != &block)
-      return; // defined inside one of the ops' own regions
+    if (def && def->getBlock() != &block && nested(def))
+      return;
+    if (def && isIterationSlice(def)) {
+      external.insert(v); // the plan's view of a buffer at the iteration
+      return;
+    }
     // A reshape of something the step reads stays in the plan (it moves no data): the step reads the
     // reshaped buffer, so op classes see a plain argument.
     Operation *root = throughReshapes(v).getDefiningOp();
@@ -496,7 +535,9 @@ void Splitter::run(bool single) {
       groupOf[&op] = groups.size();
       groups.push_back({{&op}, {}});
     }
-  if (groups.size() < (single ? 1u : 2u))
+  // A loop body outlines even one step; a block around split loops is a plan even with none of its own.
+  if (groups.size() < (single || isa<scf::YieldOp>(block.getTerminator()) ? 1u : 2u) &&
+      !llvm::any_of(block, [](Operation &op) { return isSplitLoop(&op); }))
     return;
 
   // A producer merges into its only consumer, or is recomputed by one of several, while an op class maps
@@ -579,25 +620,30 @@ void Splitter::run(bool single) {
   }
   prune();
   order();
-  if (groups.size() < (single ? 1u : 2u))
+  // A loop body outlines even one step; a block around split loops is a plan even with none of its own.
+  if (groups.size() < (single || isa<scf::YieldOp>(block.getTerminator()) ? 1u : 2u) &&
+      !llvm::any_of(block, [](Operation &op) { return isSplitLoop(&op); }))
     return;
 
   // Outline each step and call it from the kernel, in order.
   ModuleOp module = kernel->getParentOfType<ModuleOp>();
-  auto returnOp = cast<func::ReturnOp>(block.getTerminator());
-  auto written = kernel->getAttrOfType<ArrayAttr>("furiosa.written");
+  Operation *terminator = block.getTerminator();
+  auto returnOp = dyn_cast<func::ReturnOp>(terminator);
+  auto written = returnOp ? kernel->getAttrOfType<ArrayAttr>("furiosa.written") : ArrayAttr();
   OpBuilder b(kernel.getContext());
   SmallVector<Operation *> outlinedOps;
   for (auto [s, group] : llvm::enumerate(groups)) {
     SmallVector<Value> inputs, outputs = outputsOf(s, /*all=*/false);
-    std::string name = (kernel.getName() + "__s" + Twine(s)).str();
+    std::string name;
+    for (int k = 0; name.empty() || module.lookupSymbol(name); ++k)
+      name = (kernel.getName() + "__s" + Twine(k)).str();
     func::FuncOp step = outline(group, name, outputs, inputs);
     step.setPrivate();
     module.push_back(step);
     auto stepWritten = step->getAttrOfType<ArrayAttr>("furiosa.written");
     // Call operands: the inputs (as earlier steps left them), then a destination per fresh output: the buffer
     // the kernel returns it into (through reshapes, which move no data), or a new temporary.
-    b.setInsertionPoint(returnOp); // calls run in step order
+    b.setInsertionPoint(terminator); // calls run in step order
     SmallVector<Value> operands;
     for (Value v : inputs)
       operands.push_back(resultOf.count(v) ? resultOf[v] : v);
@@ -606,7 +652,7 @@ void Splitter::run(bool single) {
       if (w < int64_t(inputs.size()))
         continue;
       Value dest;
-      for (OpOperand &use : returnOp->getOpOperands()) {
+      for (OpOperand &use : terminator->getOpOperands()) {
         Value v = use.get();
         while (v.getDefiningOp() && isReshape(v.getDefiningOp()) && v != out)
           v = v.getDefiningOp()->getOperand(0);
@@ -663,11 +709,13 @@ void Splitter::run(bool single) {
   }
   // The kernel's own cheap ops on step results move right after their operands, before the later steps that
   // read them (those made with the calls are in place already).
+  // A split loop moves likewise, after what it reads.
   llvm::SetVector<Operation *> late;
   for (bool grew = true; grew;) {
     grew = false;
     for (Operation &op : block)
-      if (isCheap(&op) && position.count(&op) && !late.contains(&op) && llvm::any_of(op.getOperands(), [&](Value v) {
+      if (((isCheap(&op) && position.count(&op)) || isSplitLoop(&op)) && !late.contains(&op) &&
+          llvm::any_of(blockUses(&op), [&](Value v) {
             Operation *def = v.getDefiningOp();
             return def && (isa<func::CallOp>(def) || late.contains(def));
           }))
@@ -676,18 +724,18 @@ void Splitter::run(bool single) {
   llvm::SmallPtrSet<Operation *, 8> moved;
   while (moved.size() < late.size())
     for (Operation *op : late)
-      if (!moved.contains(op) && llvm::all_of(op->getOperands(), [&](Value v) {
+      if (!moved.contains(op) && llvm::all_of(blockUses(op), [&](Value v) {
             Operation *def = v.getDefiningOp();
             return !def || !late.contains(def) || moved.contains(def);
           })) {
         Operation *last = nullptr;
-        for (Value v : op->getOperands())
+        for (Value v : blockUses(op))
           if (Operation *def = v.getDefiningOp(); def && def->getBlock() == &block && (!last || last->isBeforeInBlock(def)))
             last = def;
         op->moveAfter(last);
         moved.insert(op);
       }
-  kernel->setAttr(kStepsAttr, b.getUnitAttr());
+  block.getParentOp()->setAttr(kStepsAttr, b.getUnitAttr());
 }
 
 } // namespace
@@ -712,7 +760,22 @@ LogicalResult mlir::furiosa::splitSteps(ModuleOp module) {
   if (failed(pm.run(module)))
     return failure();
   hoistIndexOnly(module);
+  sliceKeptLoops(module);
   for (func::FuncOp kernel : kernels) {
+    // A kept loop's body splits into steps of its own, which the plan runs once per iteration; the fills that
+    // start its carried values become tables.
+    for (auto loop : llvm::to_vector(kernel.getBody().front().getOps<scf::ForOp>())) {
+      for (OpOperand &init : loop.getInitArgsMutable()) {
+        Attribute c;
+        auto fill = init.get().getDefiningOp<linalg::FillOp>();
+        if (fill && matchPattern(fill.getInputs()[0], m_Constant(&c))) {
+          OpBuilder b(loop);
+          init.set(arith::ConstantOp::create(b, loop.getLoc(),
+                                             DenseElementsAttr::get(cast<ShapedType>(init.get().getType()), c)));
+        }
+      }
+      Splitter(kernel, *loop.getBody()).run();
+    }
     if (!mapsWhole(kernel))
       Splitter(kernel).run();
     else if (!tensorConstants(kernel).empty())
@@ -753,87 +816,170 @@ FailureOr<std::string> mlir::furiosa::stepsPlan(ModuleOp module) {
     slot[arg] = llvm::json::Object{{"buffer", int64_t(arg.getArgNumber())}};
     latest[key(slotOf(arg))] = arg;
   }
-  for (Operation &op : kernel.getBody().front()) {
-    if (auto empty = dyn_cast<tensor::EmptyOp>(op)) {
-      auto t = empty.getType();
-      llvm::json::Array shape;
-      for (int64_t d : t.getShape())
-        shape.push_back(d);
-      std::string dtype;
-      llvm::raw_string_ostream(dtype) << t.getElementType();
-      slot[empty] = llvm::json::Object{{"temp", int64_t(temps.size())}};
-      latest[key(slotOf(empty))] = empty;
-      temps.push_back(llvm::json::Object{{"dtype", dtype}, {"shape", std::move(shape)}});
-    } else if (isReshape(&op)) {
-      auto it = slot.find(op.getOperand(0));
-      if (it == slot.end())
-        return op.emitError("a reshape of an unknown slot");
-      slot[op.getResult(0)] = llvm::json::Object(it->second);
-    } else if (auto call = dyn_cast<func::CallOp>(op)) {
-      auto callee = module.lookupSymbol<func::FuncOp>(call.getCallee());
-      auto stepWritten = callee->getAttrOfType<ArrayAttr>("furiosa.written");
-      llvm::json::Array args;
-      for (Value operand : call.getOperands()) {
-        llvm::json::Value s = slotOf(operand);
-        if (s.kind() == llvm::json::Value::Null)
-          return call.emitError("a step operand that is no buffer or temporary");
-        // A slot holds one version at a time: a step reads the latest.
-        if (latest.lookup(key(s)) != root(operand))
-          return call.emitError("a step reads a buffer or temporary that an earlier step overwrote");
-        args.push_back(std::move(s));
-      }
-      for (auto [k, result] : llvm::enumerate(call.getResults())) {
-        auto it = slot.find(call.getOperand(cast<IntegerAttr>(stepWritten[k]).getInt()));
-        slot[result] = llvm::json::Object(it->second);
-        latest[key(slotOf(result))] = result;
-      }
-      // The step on its own, as a module codegen maps.
-      OpBuilder b(module.getContext());
-      auto standalone = ModuleOp::create(b, module.getLoc());
-      for (NamedAttribute attr : module->getAttrs())
-        standalone->setAttr(attr.getName(), attr.getValue());
-      auto copy = cast<func::FuncOp>(callee->clone());
-      copy.setPublic();
-      standalone.push_back(copy);
-      // Its tables become trailing arguments, read from constant buffers the host uploads.
-      for (DenseElementsAttr data : externalize(copy)) {
-        auto t = cast<RankedTensorType>(data.getType());
-        if (!t.getElementType().isIntOrFloat() || t.getElementType().getIntOrFloatBitWidth() % 8)
-          return call.emitError("a table of ") << t.getElementType() << " has no byte layout";
-        std::vector<char> bytes;
-        int64_t width = t.getElementType().getIntOrFloatBitWidth() / 8;
-        ArrayRef<char> raw = data.getRawData();
-        for (int64_t e = 0; e < t.getNumElements(); ++e) {
-          int64_t from = data.isSplat() ? 0 : e * width;
-          bytes.insert(bytes.end(), raw.begin() + from, raw.begin() + from + width);
-        }
+  // A table the host uploads: its slot.
+  auto addConst = [&](DenseElementsAttr data, Operation *op) -> FailureOr<llvm::json::Object> {
+    auto t = cast<RankedTensorType>(data.getType());
+    if (!t.getElementType().isIntOrFloat() || t.getElementType().getIntOrFloatBitWidth() % 8)
+      return op->emitError("a table of ") << t.getElementType() << " has no byte layout";
+    std::vector<char> bytes;
+    int64_t width = t.getElementType().getIntOrFloatBitWidth() / 8;
+    ArrayRef<char> raw = data.getRawData();
+    for (int64_t e = 0; e < t.getNumElements(); ++e) {
+      int64_t from = data.isSplat() ? 0 : e * width;
+      bytes.insert(bytes.end(), raw.begin() + from, raw.begin() + from + width);
+    }
+    llvm::json::Array shape;
+    for (int64_t d : t.getShape())
+      shape.push_back(d);
+    std::string dtype;
+    llvm::raw_string_ostream(dtype) << t.getElementType();
+    llvm::json::Object at{{"const", int64_t(consts.size())}};
+    consts.push_back(llvm::json::Object{{"dtype", dtype}, {"shape", std::move(shape)}, {"data", llvm::encodeBase64(bytes)}});
+    return at;
+  };
+  int64_t carriedCount = 0; // kept loops' carried values, numbered across the plan
+  std::function<LogicalResult(Block &, llvm::json::Array &)> emit = [&](Block &block,
+                                                                       llvm::json::Array &steps) -> LogicalResult {
+    for (Operation &op : block) {
+      if (auto empty = dyn_cast<tensor::EmptyOp>(op)) {
+        auto t = empty.getType();
         llvm::json::Array shape;
         for (int64_t d : t.getShape())
           shape.push_back(d);
         std::string dtype;
         llvm::raw_string_ostream(dtype) << t.getElementType();
-        args.push_back(llvm::json::Object{{"const", int64_t(consts.size())}});
-        consts.push_back(llvm::json::Object{
-            {"dtype", dtype}, {"shape", std::move(shape)}, {"data", llvm::encodeBase64(bytes)}});
+        slot[empty] = llvm::json::Object{{"temp", int64_t(temps.size())}};
+        latest[key(slotOf(empty))] = empty;
+        temps.push_back(llvm::json::Object{{"dtype", dtype}, {"shape", std::move(shape)}});
+      } else if (auto c = dyn_cast<arith::ConstantOp>(op); c && isa<RankedTensorType>(c.getType())) {
+        FailureOr<llvm::json::Object> at = addConst(cast<DenseElementsAttr>(c.getValue()), c);
+        if (failed(at))
+          return failure();
+        slot[c] = std::move(*at);
+      } else if (isa<arith::ConstantOp, arith::AddIOp, arith::SubIOp, arith::MulIOp, arith::DivUIOp>(op)) {
+        // Index arithmetic of a loop iteration: the slices below say what it addresses.
+      } else if (isReshape(&op)) {
+        auto it = slot.find(op.getOperand(0));
+        if (it == slot.end())
+          return op.emitError("a reshape of an unknown slot");
+        slot[op.getResult(0)] = llvm::json::Object(it->second);
+      } else if (isIterationSlice(&op)) {
+        // A contiguous box at the iteration: the source's bytes from offset + iteration * iter_stride.
+        auto slice = cast<tensor::ExtractSliceOp>(op);
+        auto loop = cast<scf::ForOp>(op.getParentOp());
+        auto it = slot.find(slice.getSource());
+        if (it == slot.end() || it->second.get("offset"))
+          return op.emitError("an iteration slice of an unknown slot");
+        RankedTensorType src = slice.getSourceType();
+        int64_t width = src.getElementType().getIntOrFloatBitWidth() / 8, stride = width, offset = 0, perIter = -1;
+        bool inner = true; // the dims inside the box's first partial dim must be whole
+        for (int64_t d = src.getRank() - 1; d >= 0; --d) {
+          int64_t size = slice.getStaticSizes()[d], at = slice.getStaticOffsets()[d];
+          if (ShapedType::isDynamic(at)) {
+            Value v = slice.getDynamicOffset(d);
+            if (v != loop.getInductionVar() || !matchPattern(loop.getLowerBound(), m_Zero()) ||
+                !matchPattern(loop.getStep(), m_One()))
+              return op.emitError("an iteration slice at an offset other than the iteration index");
+            perIter = stride;
+          } else {
+            offset += at * stride;
+          }
+          if (!inner && size != 1)
+            return op.emitError("an iteration slice that is not contiguous");
+          inner &= size == src.getDimSize(d);
+          stride *= src.getDimSize(d);
+        }
+        llvm::json::Object view(it->second);
+        view["offset"] = offset;
+        view["iter_stride"] = perIter;
+        view["bytes"] = slice.getType().getNumElements() * width;
+        slot[slice.getResult()] = std::move(view);
+      } else if (auto loop = dyn_cast<scf::ForOp>(op)) {
+        if (!loop->hasAttr(kStepsAttr) || !loop.getStaticTripCount())
+          return op.emitError("a kept loop the plan cannot run");
+        int64_t first = carriedCount;
+        carriedCount += loop.getNumRegionIterArgs();
+        llvm::json::Array carried, body, yields;
+        for (auto [k, init] : llvm::enumerate(loop.getInitArgs())) {
+          llvm::json::Value s = slotOf(init);
+          if (s.kind() == llvm::json::Value::Null)
+            return op.emitError("a carried value that starts in no buffer");
+          carried.push_back(std::move(s));
+          slot[loop.getRegionIterArgs()[k]] = llvm::json::Object{{"carried", int64_t(first + k)}};
+        }
+        if (failed(emit(*loop.getBody(), body)))
+          return failure();
+        for (Value y : loop.getBody()->getTerminator()->getOperands()) {
+          llvm::json::Value s = slotOf(y);
+          if (s.kind() == llvm::json::Value::Null)
+            return op.emitError("a carried value that leaves an iteration in no buffer");
+          yields.push_back(std::move(s));
+        }
+        for (auto [k, result] : llvm::enumerate(loop.getResults()))
+          slot[result] = llvm::json::Object{{"carried", int64_t(first + k)}};
+        steps.push_back(llvm::json::Object{
+            {"loop", llvm::json::Object{{"count", loop.getStaticTripCount()->getSExtValue()},
+                                        {"carried", std::move(carried)},
+                                        {"steps", std::move(body)},
+                                        {"yields", std::move(yields)}}}});
+      } else if (isa<scf::YieldOp>(op)) {
+        // The loop reads its yields.
+      } else if (auto call = dyn_cast<func::CallOp>(op)) {
+        auto callee = module.lookupSymbol<func::FuncOp>(call.getCallee());
+        auto stepWritten = callee->getAttrOfType<ArrayAttr>("furiosa.written");
+        llvm::json::Array args;
+        for (Value operand : call.getOperands()) {
+          llvm::json::Value s = slotOf(operand);
+          if (s.kind() == llvm::json::Value::Null)
+            return call.emitError("a step operand that is no buffer or temporary");
+          // A slot holds one version at a time: a step reads the latest (loop views name theirs).
+          const llvm::json::Object *o = s.getAsObject();
+          if (!o->get("carried") && !o->get("const") && !o->get("offset") && latest.lookup(key(s)) != root(operand))
+            return call.emitError("a step reads a buffer or temporary that an earlier step overwrote");
+          args.push_back(std::move(s));
+        }
+        for (auto [k, result] : llvm::enumerate(call.getResults())) {
+          auto it = slot.find(call.getOperand(cast<IntegerAttr>(stepWritten[k]).getInt()));
+          slot[result] = llvm::json::Object(it->second);
+          latest[key(slotOf(result))] = result;
+        }
+        // The step on its own, as a module codegen maps.
+        OpBuilder b(module.getContext());
+        auto standalone = ModuleOp::create(b, module.getLoc());
+        for (NamedAttribute attr : module->getAttrs())
+          standalone->setAttr(attr.getName(), attr.getValue());
+        auto copy = cast<func::FuncOp>(callee->clone());
+        copy.setPublic();
+        standalone.push_back(copy);
+        // Its tables become trailing arguments, read from constant buffers the host uploads.
+        for (DenseElementsAttr data : externalize(copy)) {
+          FailureOr<llvm::json::Object> at = addConst(data, call);
+          if (failed(at))
+            return failure();
+          args.push_back(std::move(*at));
+        }
+        std::string text;
+        llvm::raw_string_ostream os(text);
+        standalone.print(os, OpPrintingFlags().enableDebugInfo(true, false));
+        standalone->erase();
+        steps.push_back(llvm::json::Object{{"func", callee.getName().str()}, {"args", std::move(args)},
+                                           {"module", text}});
+      } else if (auto ret = dyn_cast<func::ReturnOp>(op)) {
+        auto written = kernel->getAttrOfType<ArrayAttr>("furiosa.written");
+        for (auto [r, v] : llvm::enumerate(ret.getOperands())) {
+          auto it = slot.find(v);
+          int64_t buffer = cast<IntegerAttr>(written[r]).getInt();
+          if (it == slot.end() || it->second.getInteger("buffer") != buffer)
+            return ret.emitError("result ") << r << " is not left in buffer " << buffer;
+        }
+      } else {
+        return op.emitError("a split kernel holds only temporaries, tables, reshapes, kept loops and step calls");
       }
-      std::string text;
-      llvm::raw_string_ostream os(text);
-      standalone.print(os, OpPrintingFlags().enableDebugInfo(true, false));
-      standalone->erase();
-      steps.push_back(llvm::json::Object{{"func", callee.getName().str()}, {"args", std::move(args)},
-                                         {"module", text}});
-    } else if (auto ret = dyn_cast<func::ReturnOp>(op)) {
-      auto written = kernel->getAttrOfType<ArrayAttr>("furiosa.written");
-      for (auto [r, v] : llvm::enumerate(ret.getOperands())) {
-        auto it = slot.find(v);
-        int64_t buffer = cast<IntegerAttr>(written[r]).getInt();
-        if (it == slot.end() || it->second.getInteger("buffer") != buffer)
-          return ret.emitError("result ") << r << " is not left in buffer " << buffer;
-      }
-    } else {
-      return op.emitError("a split kernel holds only temporaries, reshapes and step calls");
     }
-  }
+    return success();
+  };
+  if (failed(emit(kernel.getBody().front(), steps)))
+    return failure();
   llvm::json::Object plan{{"kernel", kernel.getName().str()},
                           {"temps", std::move(temps)},
                           {"consts", std::move(consts)},

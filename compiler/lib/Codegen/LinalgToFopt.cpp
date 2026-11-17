@@ -5,9 +5,12 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
+#include "mlir/Dialect/Linalg/Transforms/TilingInterfaceImpl.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Tensor/IR/TensorInferTypeOpInterfaceImpl.h"
+#include "mlir/Dialect/Tensor/IR/TensorTilingInterfaceImpl.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Verifier.h"
 
@@ -253,4 +256,8 @@ void mlir::furiosa::registerCodegenDialects(DialectRegistry &registry) {
   registry.insert<arith::ArithDialect, func::FuncDialect, linalg::LinalgDialect, math::MathDialect,
                   scf::SCFDialect, tensor::TensorDialect, fopt::FoptDialect>();
   func::registerInlinerExtension(registry);
+  // Kept loops tile lifted generics back to an iteration (lib/Codegen/Loops.cpp).
+  linalg::registerTilingInterfaceExternalModels(registry);
+  tensor::registerTilingInterfaceExternalModels(registry);
+  tensor::registerInferTypeOpInterfaceExternalModels(registry);
 }

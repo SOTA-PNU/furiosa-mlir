@@ -210,7 +210,11 @@ def codegen(kernel_dir: Path) -> tuple[dict, dict]:
     if plan is None:
         return {symbol: map_kernel(linalg, kernel_dir, "kernel", symbol)}, {"temps": [], "steps": [{"module": symbol, "args": None}]}
     modules, errors = {}, []
-    for k, step in enumerate(plan["steps"]):
+
+    def flat(steps: list) -> list:  # a kept loop's steps run in it
+        return [s for step in steps for s in (flat(step["loop"]["steps"]) if "loop" in step else [step])]
+
+    for k, step in enumerate(flat(plan["steps"])):
         text, step["module"] = step["module"], f"{symbol}__s{k}"
         try:
             modules[step["module"]] = map_kernel(text, kernel_dir, f"s{k}", f"{symbol} step {k} ({step['func']})")
@@ -248,71 +252,98 @@ class RunGraph:
     def kernel_fn(self, symbol: str) -> str:
         """The async fn that runs one kernel's steps on its pointer arguments (the buffers it reads come in as
         aliases; those it writes fresh go back), shared by every launch of the kernel: rustc's time grows with
-        the code it checks, so the glue scales with distinct kernels, not launches."""
+        the code it checks, so the glue scales with distinct kernels, not launches. A kept loop of the plan is a
+        Rust loop: its carried values are variables, and a view at the iteration is an alias of a byte range."""
         info = self.kernel_args[symbol]
         plan, lines, defined = self.plans[symbol], [], set()
-
-        def zeros(name: str, rust_dtype: str, elements: int):
+        # The tables first: a loop body reads them every iteration.
+        for n, const in enumerate(plan.get("consts", [])):
+            if const["dtype"] not in MLIR_DTYPES:
+                raise CrateError(f"{symbol}: table of {const['dtype']} has no furiosa-opt host type")
+            elements = math.prod(const["shape"])
             axis = f"Z{elements}"
             if (axis, elements) not in self.axes:
                 self.axes.append((axis, elements))
             lines.append(
-                f"    let {name} = HostTensor::<{rust_dtype}, m![{axis}]>::zero()"
+                f"    let c{n} = HostTensor::<{MLIR_DTYPES[const['dtype']]}, m![{axis}]>::from_buf("
+                f"include_bytes!(\"consts/{symbol}_{n}.bin\").to_vec())"
+                f".to_hbm::<m![1], m![{axis}]>(&mut device.pdma).await?.into_buffer();"
+            )
+
+        def zeros(pad: str, name: str, rust_dtype: str, elements: int):
+            axis = f"Z{elements}"
+            if (axis, elements) not in self.axes:
+                self.axes.append((axis, elements))
+            lines.append(
+                f"{pad}let {name} = HostTensor::<{rust_dtype}, m![{axis}]>::zero()"
                 f".to_hbm::<m![1], m![{axis}]>(&mut device.pdma).await?.into_buffer();"
             )
             defined.add(name)
 
-        for k, step in enumerate(plan["steps"]):
-            sig = self.signatures[step["module"]]
-            module = f"kernel::{step['module']}"
+        def slot(where: dict) -> tuple[str, str, str, int]:
+            """The variable behind a slot, the alias range it reads, its Rust dtype and element count."""
+            span = ".."
+            if "offset" in where:
+                lo = f"{where['offset']} + it * {where['iter_stride']}"
+                span = f"{lo}..{lo} + {where['bytes']}"
+            if "const" in where:
+                const = plan["consts"][where["const"]]
+                return f"c{where['const']}", span, MLIR_DTYPES[const["dtype"]], math.prod(const["shape"])
+            if "carried" in where:
+                return f"v{where['carried']}", span, "", 0
+            if "buffer" in where:
+                a = where["buffer"]
+                return f"p{a}", span, info["dtypes"][a], info["elements"][a]
+            temp = plan["temps"][where["temp"]]
+            if temp["dtype"] not in MLIR_DTYPES:
+                raise CrateError(f"{symbol}: temporary of {temp['dtype']} has no furiosa-opt host type")
+            return f"t{where['temp']}", span, MLIR_DTYPES[temp["dtype"]], math.prod(temp["shape"])
 
-            def slot(arg: int) -> tuple[str, str, int]:
-                """The variable behind a pointer argument of the step, its Rust dtype and element count."""
-                where = {"buffer": arg} if step["args"] is None else step["args"][arg]
-                if "const" in where:
-                    const = plan["consts"][where["const"]]
-                    if const["dtype"] not in MLIR_DTYPES:
-                        raise CrateError(f"{symbol}: table of {const['dtype']} has no furiosa-opt host type")
-                    name, elements = f"c{where['const']}", math.prod(const["shape"])
-                    if name not in defined:
-                        axis = f"Z{elements}"
-                        if (axis, elements) not in self.axes:
-                            self.axes.append((axis, elements))
-                        lines.append(
-                            f"    let {name} = HostTensor::<{MLIR_DTYPES[const['dtype']]}, m![{axis}]>::from_buf("
-                            f"include_bytes!(\"consts/{symbol}_{where['const']}.bin\").to_vec())"
-                            f".to_hbm::<m![1], m![{axis}]>(&mut device.pdma).await?.into_buffer();"
-                        )
-                        defined.add(name)
-                    return name, MLIR_DTYPES[const["dtype"]], elements
-                if "buffer" in where:
-                    a = where["buffer"]
-                    return f"p{a}", info["dtypes"][a], info["elements"][a]
-                temp = plan["temps"][where["temp"]]
-                if temp["dtype"] not in MLIR_DTYPES:
-                    raise CrateError(f"{symbol}: temporary of {temp['dtype']} has no furiosa-opt host type")
-                return f"t{where['temp']}", MLIR_DTYPES[temp["dtype"]], math.prod(temp["shape"])
+        counter, carried = [0], [0]  # steps emitted; carried values numbered in plan order, as stepsPlan does
 
-            params = []
-            for p, arg in enumerate(sig["inputs"]):
-                name, rust_dtype, elements = slot(arg)
-                mut = p in sig.get("inouts", [])
-                if name not in defined and name.startswith("t"):
-                    zeros(name, rust_dtype, elements)  # a temporary a step first updates in place starts as zeros
-                lines.append(f"    let {'mut ' if mut else ''}a{k}_{p} = {module}::Arg{p}::try_from({name}.alias(..)?)?;")
-                params.append(f"&mut a{k}_{p}" if mut else f"&a{k}_{p}")
-            call = f"launch({module}::{sig['kernel']}, (&mut *device{''.join(', ' + p for p in params)})).await?"
-            outs = [slot(arg)[0] for arg in sig["outputs"]]
-            if len(outs) == 1:
-                lines.append(f"    let {outs[0]} = {call}.into_buffer();")
-            elif outs:
-                results = ", ".join(f"r{k}_{r}" for r in range(len(outs)))
-                lines.append(f"    let ({results}) = {call};")
-                for r, name in enumerate(outs):
-                    lines.append(f"    let {name} = r{k}_{r}.into_buffer();")
-            else:
-                lines.append(f"    {call};")
-            defined.update(outs)
+        def emit(steps: list, pad: str):
+            for step in steps:
+                if "loop" in step:
+                    loop = step["loop"]
+                    first = carried[0]
+                    carried[0] += len(loop["carried"])
+                    for c, init in enumerate(loop["carried"]):
+                        name, span, _, _ = slot(init)
+                        lines.append(f"{pad}let mut v{first + c} = {name}.alias({span})?;")
+                    lines.append(f"{pad}for it in 0..{loop['count']}usize {{")
+                    emit(loop["steps"], pad + "    ")
+                    for c, y in enumerate(loop["yields"]):
+                        name, span, _, _ = slot(y)
+                        lines.append(f"{pad}    v{first + c} = {name}.alias({span})?;")
+                    lines.append(f"{pad}}}")
+                    continue
+                k = counter[0]
+                counter[0] += 1
+                sig = self.signatures[step["module"]]
+                module = f"kernel::{step['module']}"
+                where = lambda arg: {"buffer": arg} if step["args"] is None else step["args"][arg]  # noqa: E731
+                params = []
+                for p, arg in enumerate(sig["inputs"]):
+                    name, span, rust_dtype, elements = slot(where(arg))
+                    mut = p in sig.get("inouts", [])
+                    if name not in defined and name.startswith("t"):
+                        zeros(pad, name, rust_dtype, elements)  # a temporary first updated in place starts as zeros
+                    lines.append(f"{pad}let {'mut ' if mut else ''}a{k}_{p} = {module}::Arg{p}::try_from({name}.alias({span})?)?;")
+                    params.append(f"&mut a{k}_{p}" if mut else f"&a{k}_{p}")
+                call = f"launch({module}::{sig['kernel']}, (&mut *device{''.join(', ' + p for p in params)})).await?"
+                outs = [slot(where(arg))[0] for arg in sig["outputs"]]
+                if len(outs) == 1:
+                    lines.append(f"{pad}let {outs[0]} = {call}.into_buffer();")
+                elif outs:
+                    results = ", ".join(f"r{k}_{r}" for r in range(len(outs)))
+                    lines.append(f"{pad}let ({results}) = {call};")
+                    for r, name in enumerate(outs):
+                        lines.append(f"{pad}let {name} = r{k}_{r}.into_buffer();")
+                else:
+                    lines.append(f"{pad}{call};")
+                defined.update(outs)
+
+        emit(plan["steps"], "    ")
         params = "".join(f", p{a}: HbmBuffer" for a in info["reads"])
         rets = "".join(f"p{a}, " for a in info["writes"])
         return (
@@ -329,7 +360,11 @@ class RunGraph:
             return
         plan = self.plans[symbol]
         reads, writes, mutable = [], [], set()
-        for step in plan["steps"]:
+
+        def flat(steps: list) -> list:
+            return [s for step in steps for s in (flat(step["loop"]["steps"]) if "loop" in step else [step])]
+
+        for step in flat(plan["steps"]):
             sig = self.signatures[step["module"]]
             where = lambda arg: {"buffer": arg} if step["args"] is None else step["args"][arg]  # noqa: E731
             for p, arg in enumerate(sig["inputs"]):

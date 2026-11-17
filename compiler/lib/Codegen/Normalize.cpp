@@ -396,36 +396,6 @@ void splitLongReductions(ModuleOp module) {
   }
 }
 
-/// A padded tensor that only boxes are cut from (structure's masked tiles) is the source inserted into a constant
-/// of the padding value, which the copy steps map: one copy into the padded tensor, whose extent the boxes
-/// then divide (the NPU tiles an axis only in windows that grow into a divisor of it).
-void padsToInserts(ModuleOp module) {
-  SmallVector<tensor::PadOp> pads;
-  module.walk([&](tensor::PadOp pad) {
-    Attribute c;
-    Value padding = pad.getConstantPaddingValue();
-    if (padding && matchPattern(padding, m_Constant(&c)) && !ShapedType::isDynamicShape(pad.getStaticLow()) &&
-        pad.getResultType().hasStaticShape() && !pad.getResult().use_empty() &&
-        llvm::all_of(pad->getUsers(), [](Operation *u) { return isa<tensor::ExtractSliceOp>(u); }))
-      pads.push_back(pad);
-  });
-  for (tensor::PadOp pad : pads) {
-    OpBuilder b(pad);
-    Location loc = pad.getLoc();
-    Attribute c;
-    matchPattern(pad.getConstantPaddingValue(), m_Constant(&c));
-    SmallVector<OpFoldResult> low, sizes, ones;
-    for (auto [d, l] : llvm::enumerate(pad.getStaticLow())) {
-      low.push_back(b.getIndexAttr(l));
-      sizes.push_back(b.getIndexAttr(pad.getSourceType().getDimSize(d)));
-      ones.push_back(b.getIndexAttr(1));
-    }
-    Value filled = arith::ConstantOp::create(b, loc, DenseElementsAttr::get(pad.getResultType(), c));
-    pad.replaceAllUsesWith(tensor::InsertSliceOp::create(b, loc, pad.getSource(), filled, low, sizes, ones).getResult());
-    pad.erase();
-  }
-}
-
 } // namespace
 
 void mlir::furiosa::normalizeKernels(ModuleOp module) {
@@ -477,4 +447,42 @@ Value mlir::furiosa::reshapeTo(OpBuilder &b, Location loc, Value v, RankedTensor
   if (t.getRank() != 1)
     v = tensor::ExpandShapeOp::create(b, loc, t, v, all(t.getRank()));
   return v;
+}
+
+/// A padded tensor that only boxes are cut from (structure's masked tiles) is the source inserted into a constant
+/// of the padding value, which the copy steps map: one copy into the padded tensor, whose extent the boxes
+/// then divide (the NPU tiles an axis only in windows that grow into a divisor of it).
+/// Whether `v` is only cut into boxes (extract_slices, possibly of reshapes of it).
+static bool onlyBoxed(Value v) {
+  return llvm::all_of(v.getUsers(), [](Operation *u) {
+    return isa<tensor::ExtractSliceOp>(u) ||
+           (isa<tensor::CollapseShapeOp, tensor::ExpandShapeOp>(u) && onlyBoxed(u->getResult(0)));
+  });
+}
+
+void mlir::furiosa::padsToInserts(ModuleOp module) {
+  SmallVector<tensor::PadOp> pads;
+  module.walk([&](tensor::PadOp pad) {
+    Attribute c;
+    Value padding = pad.getConstantPaddingValue();
+    if (padding && matchPattern(padding, m_Constant(&c)) && !ShapedType::isDynamicShape(pad.getStaticLow()) &&
+        pad.getResultType().hasStaticShape() && !pad.getResult().use_empty() &&
+        onlyBoxed(pad.getResult()))
+      pads.push_back(pad);
+  });
+  for (tensor::PadOp pad : pads) {
+    OpBuilder b(pad);
+    Location loc = pad.getLoc();
+    Attribute c;
+    matchPattern(pad.getConstantPaddingValue(), m_Constant(&c));
+    SmallVector<OpFoldResult> low, sizes, ones;
+    for (auto [d, l] : llvm::enumerate(pad.getStaticLow())) {
+      low.push_back(b.getIndexAttr(l));
+      sizes.push_back(b.getIndexAttr(pad.getSourceType().getDimSize(d)));
+      ones.push_back(b.getIndexAttr(1));
+    }
+    Value filled = arith::ConstantOp::create(b, loc, DenseElementsAttr::get(pad.getResultType(), c));
+    pad.replaceAllUsesWith(tensor::InsertSliceOp::create(b, loc, pad.getSource(), filled, low, sizes, ones).getResult());
+    pad.erase();
+  }
 }
