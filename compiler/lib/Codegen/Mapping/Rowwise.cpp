@@ -1116,6 +1116,18 @@ LogicalResult Planner::declare(func::FuncOp func, ArrayRef<int64_t> written) {
   inner = dag.r / rowAxes.front().second.size();
   if (kSlices % inner && inner * rowAxes.front().second.size() != kSlices)
     return fail(func, "rows inside the outermost row dim (") << inner << ") do not divide the 256 slices";
+  // The NPU tiles a window of L rows over an extent E only when L grows into a divisor of E within [L, 2L).
+  if (tiled()) {
+    int64_t extent = rowAxes.front().second.size(), step = kSlices / inner;
+    auto windows = [&](int64_t len) {
+      for (int64_t d = len; d < 2 * len && d <= extent; ++d)
+        if (extent % d == 0)
+          return true;
+      return false;
+    };
+    if (!windows(step) || (extent % step && !windows(extent % step)))
+      return fail(func, "row tiles of ") << step << " over " << extent << " rows, which the NPU cannot window";
+  }
   slice = rowsMap(rowAxes.front().second.size());
   for (auto [i, n] : llvm::enumerate(dag.nodes)) {
     if (n.kind != Node::Input)

@@ -107,11 +107,12 @@ private:
   int64_t kTile = 0; // the K extent of one contraction pass (KF when K is not tiled)
   SmallVector<unsigned> rows;
   std::optional<unsigned> col;              // the column axis
-  std::optional<unsigned> unitCol;          // the column is synthetic (no even output axis)
   int64_t colLocalSize = 1, colPad = kLanes; // local columns, and padded to whole packets
   std::optional<Digit> colBlock, colLocalD;
   int64_t colExtent = 0; // the column axis padded to whole column tiles (0: no padding)
   MapAttr cpAxis;         // the padded column as a live axis
+  std::map<unsigned, int64_t> rowExtent; // row axes padded to these extents (rows that split badly)
+  std::map<unsigned, MapAttr> rpAxis;    // the padded rows as live axes
   SmallVector<Digit> tileD, sliceD, localD; // row digits by role, most significant first
   SmallVector<MapAttr> outDims;
 
@@ -140,15 +141,20 @@ private:
   MapAttr ax(unsigned a) { return axisMap[a]; }
   MapAttr pairOf(ArrayRef<MapAttr> parts) { return MapAttr::pair(ctx, parts); }
   MapAttr digit(const Digit &d) {
-    int64_t extent = d.extent ? d.extent : p.axes[d.axis].size;
+    int64_t extent = d.extent ? d.extent : extentOf(d.axis);
     // A column padded to whole tiles is a live axis of the padded extent inside the kernel (digits of a padded
     // axis do not tile); only the final relayout reads it as the column.
-    MapAttr base = extent > p.axes[d.axis].size ? cpAxis : ax(d.axis);
+    MapAttr base = extent <= p.axes[d.axis].size ? ax(d.axis) : col && d.axis == *col ? cpAxis : rpAxis[d.axis];
     MapAttr m = d.place > 1 ? base.stride(d.place) : base;
     return d.place * d.size < extent ? m.modulo(d.size) : m;
   }
   /// The extent the layout pads axis `a` to (its size unless it is the tiled column).
-  int64_t extentOf(unsigned a) { return col && a == *col && colExtent ? colExtent : p.axes[a].size; }
+  int64_t extentOf(unsigned a) {
+    if (col && a == *col)
+      return colExtent ? colExtent : p.axes[a].size;
+    auto it = rowExtent.find(a);
+    return it != rowExtent.end() ? it->second : p.axes[a].size;
+  }
   /// The slice mapping: row slice digits, then the column block. Every digit inside the outermost is padded to a
   /// power of two (the NPU addresses slices by bit fields; a padded pair with a non-power-of-two inner digit
   /// places data on the wrong slices), the whole padded to the 256 slices.
@@ -178,8 +184,11 @@ private:
     for (const Digit &d : localD)
       if (in(d.axis))
         r.push_back(digit(d));
-    if (rf && llvm::any_of(ext, in))
+    if (rf && llvm::any_of(ext, in)) {
+      if (rc)
+        r.push_back(rc);
       r.push_back(rf);
+    }
     if (col && in(*col)) {
       for (const Digit &d : tileD)
         if (d.axis == *col)
@@ -193,6 +202,10 @@ private:
   // The reduction being evaluated on the Vector Engine: its axes, flattened into one axis in time.
   SmallVector<unsigned> ext;
   MapAttr rf;
+  // A reduction longer than one DM tile reduces in chunks: the chunk axis (outside rf) and the chunk at hand.
+  MapAttr rc;
+  int64_t rcIndex = 0;
+  int64_t rfMax = 0; // the longest reduction chunk the plan allows
   int64_t kTiles() { return kTile ? kl.size() / kTile : 1; }
   /// KF in canonical HBM operands: one axis, or tile and local digits when K is tiled.
   SmallVector<MapAttr> kParts() {
@@ -321,10 +334,16 @@ private:
     auto parts = canonical(axes, false);
     auto at = tileAt(axes, tileIndex);
     bool major = tapMajor.count(hbm.getAsOpaquePointer());
-    if (major && !withK) { // the Vector Engine reduction's flat axis leads
+    if (major && !withK) { // the Vector Engine reduction's flat axis (chunk axis first) leads
       parts.erase(llvm::find(parts, rf));
       parts.insert(parts.begin(), rf);
+      if (rc) {
+        parts.erase(llvm::find(parts, rc));
+        parts.insert(parts.begin(), rc);
+      }
     }
+    if (rc && llvm::is_contained(parts, rc))
+      at.push_back({rc, rcIndex});
     if (withK && major) {
       KSplit s = kSplit(kIndex);
       parts.insert(parts.begin(), s.hi.begin(), s.hi.end());
@@ -570,13 +589,6 @@ LogicalResult Lowering::planLayout() {
     for (auto [a, v] : votes)
       if (llvm::is_contained(p.out, a) && !(p.axes[a].size % 2) && (v > votes[best] || p.axes[best].size % 2))
         best = a;
-    if (p.axes[best].size % 2) {
-      // No even output axis (DMA rows are 8-byte units): a synthetic column of two equal lanes that every read
-      // broadcasts over; the store keeps the first.
-      unitCol = p.axes.size();
-      p.axes.push_back({2, false});
-      best = *unitCol;
-    }
     col = best;
     for (unsigned a : p.out)
       if (a != best)
@@ -584,8 +596,9 @@ LogicalResult Lowering::planLayout() {
   }
   int64_t c = p.axes[*col].size;
   colLocalSize = 0;
+  // An odd column pads to whole packets (DMA rows are 8-byte units): cells past it are computed and never stored.
   if (c % 2)
-    return fail("an odd column count " + std::to_string(c) + " (DMA rows are 8-byte units)");
+    c = colExtent = roundUp(c, kLanes);
   if (gemm) {
     // The inner K axis: one the stream operand reads alone in a dim (preferably its contiguous last dim, else the
     // largest), so it moves as a whole in each tap's DMA; every other K axis is a tap.
@@ -710,7 +723,7 @@ LogicalResult Lowering::planLayout() {
     // Column tiles of 256 blocks; the column axis pads to whole tiles.
     int64_t tileCols = colLocalSize * kSlices;
     int64_t tiles = (c + tileCols - 1) / tileCols;
-    colExtent = tiles * tileCols == c ? 0 : tiles * tileCols;
+    colExtent = tiles * tileCols == p.axes[*col].size ? 0 : tiles * tileCols;
     blocks = kSlices;
     tileD.push_back({*col, tileCols, tiles, colExtent});
   } else if (c % colLocalSize) {
@@ -731,9 +744,27 @@ LogicalResult Lowering::planLayout() {
         size *= p.axes[a].size;
       reduced = std::max(reduced, size);
     }
+  // A reduction whose tile row would not fit DM reduces in chunks (at most rfMax long).
+  rfMax = std::max<int64_t>(1, std::min<int64_t>(reduced, kDmBudget / (4 * colPad * 4)));
   SmallVector<Digit> rowTiles;
-  int64_t tiles = assignRows(rowSlices, 4 * colPad * 4 * reduced + (gemm ? 4 * kTile : 0), localD, sliceD, rowTiles);
-  // Each tile is a pass sequence of its own in the kernel.
+  int64_t perRow = 4 * colPad * 4 * rfMax + (gemm ? 4 * kTile : 0);
+  int64_t tiles = assignRows(rowSlices, perRow, localD, sliceD, rowTiles);
+  // Each tile is a pass sequence of its own in the kernel. Rows that split into no slices or local digits that
+  // fit DM (a prime count) pad, the outermost such axis first, to the smallest multiple of a power of two that
+  // splits; the padded rows are computed and never stored.
+  for (int64_t m = 8; tiles > kSlices && m <= kSlices; m *= 2)
+    for (unsigned a : rows) {
+      if (gemm && llvm::is_contained(gemm->b, a))
+        continue;
+      if (roundUp(p.axes[a].size, m) == p.axes[a].size)
+        continue;
+      rowExtent = {{a, roundUp(p.axes[a].size, m)}};
+      tiles = assignRows(rowSlices, perRow, localD, sliceD, rowTiles);
+      if (tiles <= kSlices)
+        break;
+      rowExtent.clear();
+      tiles = assignRows(rowSlices, perRow, localD, sliceD, rowTiles);
+    }
   if (tiles > kSlices)
     return fail(std::to_string(tiles) + " row tiles (rows that split into no slices or local digits that fit DM)");
   llvm::append_range(tileD, rowTiles);
@@ -747,14 +778,14 @@ int64_t Lowering::assignRows(int64_t rowSlices, int64_t perRow, SmallVector<Digi
   int64_t maxLocal = std::max<int64_t>(1, kDmBudget / perRow);
   int64_t total = 1;
   for (unsigned a : rows)
-    total *= p.axes[a].size;
+    total *= extentOf(a);
   struct Cursor {
     unsigned axis;
     int64_t place, left;
   };
   SmallVector<Cursor> cur;
   for (unsigned a : rows)
-    cur.push_back({a, 1, p.axes[a].size});
+    cur.push_back({a, 1, extentOf(a)});
   int64_t have = 1;
   local.clear();
   for (int i = cur.size() - 1; i >= 0; --i) {
@@ -860,6 +891,8 @@ LogicalResult Lowering::declare() {
     kf = kb.axis("KF", kl.size());
   if (colExtent)
     cpAxis = kb.axis("CP", colExtent);
+  for (auto [a, e] : rowExtent)
+    rpAxis[a] = kb.axis("RP" + std::to_string(a), e);
   interleave = kb.axis("I", 2);
   std::set<unsigned> readArgs;
   for (const Read &r : p.reads)
@@ -943,7 +976,7 @@ FailureOr<Value> Lowering::materialize(const Read &r, ArrayRef<unsigned> rowAxes
   };
   if (!k && llvm::any_of(r.index, overlaps)) {
     reduction.taps = ext;
-    reduction.tapPad = rf.size();
+    reduction.tapPad = rc ? rc.size() * rf.size() : rf.size();
     k = &reduction;
   }
   bool veTaps = k == &reduction;
@@ -1299,6 +1332,10 @@ FailureOr<Value> Lowering::materialize(const Read &r, ArrayRef<unsigned> rowAxes
   if (veTaps) {
     canon.erase(llvm::find(canon, rf));
     canon.insert(canon.begin(), rf);
+    if (rc) {
+      canon.erase(llvm::find(canon, rc));
+      canon.insert(canon.begin(), rc);
+    }
   } else if (major) {
     KSplit s = kSplit(0);
     canon.insert(canon.begin(), s.hi.begin(), s.hi.end());
@@ -1411,7 +1448,9 @@ Value Lowering::zip(Value lhs, Value rhs, const AluSpec &spec) {
 FailureOr<Val> Lowering::leaf(unsigned read, ArrayRef<int64_t> tileIndex) {
   const Read &r = p.reads[read];
   SmallVector<unsigned> axes = r.axes();
-  bool colOnly = llvm::all_of(axes, [&](unsigned a) { return a == *col; });
+  // A column-only read is a VRF vector over the rows, or with no rows the whole tile (but not inside a
+  // reduction, whose tiles carry its axis too).
+  bool colOnly = llvm::all_of(axes, [&](unsigned a) { return a == *col; }) && !(rows.empty() && !ext.empty());
   SmallVector<unsigned> layout = colOnly ? SmallVector<unsigned>{*col} : rows;
   if (!colOnly) {
     llvm::append_range(layout, ext);
@@ -1683,46 +1722,67 @@ FailureOr<Val> Lowering::reduce(unsigned node, ArrayRef<int64_t> tileIndex) {
   int64_t size = 1;
   for (unsigned a : axes)
     size *= p.axes[a].size;
-  MapAttr flat = kb.axis("RF" + std::to_string(fresh++), size);
-  ext = axes;
-  rf = flat;
-  auto saved = std::move(vals);
-  vals.clear();
-  FailureOr<Val> x = evaluate(body, tileIndex);
-  vals = std::move(saved);
-  MapAttr element = tileElement();
-  ext.clear();
-  rf = MapAttr();
-  if (failed(x))
-    return failure();
-  if (x->kind != Val::Tile)
-    return fail("a reduction whose body does not vary over its axes");
-  // Fetch [local..., RF, (col / 8)] x packet, narrow to four lanes, reduce RF away, widen back.
-  auto t = cast<DmTensorType>(x->dm.getType());
-  auto [timeParts, packet] = timePacket(element);
-  SmallVector<MapAttr> outParts;
-  for (MapAttr m : timeParts)
-    if (m != flat)
-      outParts.push_back(m);
-  MapAttr time = pairOf(timeParts), outTime = pairOf(outParts);
-  auto st = [&](MapAttr tm, MapAttr pk) { return kb.streamType(f32, t.getSlice(), tm, pk); };
-  Value s = BeginOp::create(b, loc(), st(kb.one(), element), x->dm, ContextKind::Main);
-  s = FetchOp::create(b, loc(), st(time, packet), s);
-  s = CollectOp::create(b, loc(), st(time, packet), s);
-  s = VectorInitOp::create(b, loc(), st(time, packet), s);
-  s = VectorIntraSliceTagOp::create(b, loc(), st(time, packet), s);
-  SmallVector<MapAttr> t4(timeParts), o4(outParts);
-  t4.push_back(packet.stride(4));
-  o4.push_back(packet.stride(4));
-  MapAttr p4 = packet.modulo(4);
-  s = VectorNarrowSplitOp::create(b, loc(), st(pairOf(t4), p4), s);
+  // Chunks: the largest divisor of the reduction that the plan allows per tile.
+  int64_t chunk = std::min(size, rfMax);
+  while (size % chunk)
+    --chunk;
+  std::string n = std::to_string(fresh++);
+  MapAttr flat = kb.axis("RF" + n, chunk);
+  MapAttr chunks = size > chunk ? kb.axis("RC" + n, size / chunk) : MapAttr();
   std::string rop = op == "add" ? "Add" : op == "max" ? "Max" : "Min";
-  s = VectorIntraSliceReduceOp::create(b, loc(), st(pairOf(o4), p4), s, b.getStringAttr(rop),
-                                       b.getStringAttr(flat.getName()));
-  s = VectorWidenConcatOp::create(b, loc(), st(outTime, packet), s);
-  s = VectorFinalOp::create(b, loc(), st(outTime, packet), s);
-  s = CommitTrimOp::create(b, loc(), st(outTime, packet), s);
-  return Val{Val::Tile, CommitOp::create(b, loc(), kb.dmType(f32, t.getSlice(), tileElement()), s).getResult()};
+  std::optional<Val> acc;
+  for (int64_t c = 0; c < size / chunk; ++c) {
+    ext = axes;
+    rf = flat;
+    rc = chunks;
+    rcIndex = c;
+    auto saved = std::move(vals);
+    vals.clear();
+    FailureOr<Val> x = evaluate(body, tileIndex);
+    vals = std::move(saved);
+    MapAttr element = tileElement();
+    ext.clear();
+    rf = rc = MapAttr();
+    if (failed(x))
+      return failure();
+    if (x->kind != Val::Tile)
+      return fail("a reduction whose body does not vary over its axes");
+    // Fetch [local..., RF, (col / 8)] x packet, narrow to four lanes, reduce RF away, widen back.
+    auto t = cast<DmTensorType>(x->dm.getType());
+    auto [timeParts, packet] = timePacket(element);
+    SmallVector<MapAttr> outParts;
+    for (MapAttr m : timeParts)
+      if (m != flat)
+        outParts.push_back(m);
+    MapAttr time = pairOf(timeParts), outTime = pairOf(outParts);
+    auto st = [&](MapAttr tm, MapAttr pk) { return kb.streamType(f32, t.getSlice(), tm, pk); };
+    Value s = BeginOp::create(b, loc(), st(kb.one(), element), x->dm, ContextKind::Main);
+    s = FetchOp::create(b, loc(), st(time, packet), s);
+    s = CollectOp::create(b, loc(), st(time, packet), s);
+    s = VectorInitOp::create(b, loc(), st(time, packet), s);
+    s = VectorIntraSliceTagOp::create(b, loc(), st(time, packet), s);
+    SmallVector<MapAttr> t4(timeParts), o4(outParts);
+    t4.push_back(packet.stride(4));
+    o4.push_back(packet.stride(4));
+    MapAttr p4 = packet.modulo(4);
+    s = VectorNarrowSplitOp::create(b, loc(), st(pairOf(t4), p4), s);
+    s = VectorIntraSliceReduceOp::create(b, loc(), st(pairOf(o4), p4), s, b.getStringAttr(rop),
+                                         b.getStringAttr(flat.getName()));
+    s = VectorWidenConcatOp::create(b, loc(), st(outTime, packet), s);
+    s = VectorFinalOp::create(b, loc(), st(outTime, packet), s);
+    s = CommitTrimOp::create(b, loc(), st(outTime, packet), s);
+    Val part{Val::Tile, CommitOp::create(b, loc(), kb.dmType(f32, t.getSlice(), tileElement()), s).getResult()};
+    if (!acc) {
+      acc = part;
+      continue;
+    }
+    // The chunks' partial results combine with the reduction's own op.
+    AluSpec combine;
+    combine.method = "vector_clip_zip";
+    combine.op = "ClipBinaryOpF32::" + rop;
+    acc = Val{Val::Tile, zip(acc->dm, part.dm, combine)};
+  }
+  return *acc;
 }
 
 //===----------------------------------------------------------------------===//
@@ -1848,20 +1908,31 @@ LogicalResult Lowering::emit() {
     DmToHbmViewOp::create(b, loc(), convert(v->dm, p.outType),
                           tileDigits(view(outCanonical, true), outParts, tileAt(layout, index), true));
   }
-  // The relayout into the written buffer's own layout (a padded column read back as the column; of a synthetic
-  // column, the first lane).
+  // The relayout into the written buffer's own layout: a padded row or column is read back as its axis (the
+  // canonical digits are row-major per axis: tile, slice, local).
   Value out = allocHbm(pairOf(outDims), p.outType);
-  if (colExtent) {
-    SmallVector<MapAttr> asColumn = canonical(rows, true);
-    asColumn.push_back(ax(*col).padTo(colExtent));
-    outCanonical = reshapeHbm(outCanonical, pairOf(asColumn));
+  if (colExtent || !rowExtent.empty()) {
+    SmallVector<MapAttr> asAxes;
+    for (unsigned a : rows) {
+      if (extentOf(a) > p.axes[a].size) {
+        asAxes.push_back(ax(a).padTo(extentOf(a)));
+        continue;
+      }
+      for (const SmallVector<Digit> *role : {&tileD, &sliceD, &localD})
+        for (const Digit &d : *role)
+          if (d.axis == a)
+            asAxes.push_back(digit(d));
+    }
+    if (colExtent) {
+      asAxes.push_back(ax(*col).padTo(colExtent));
+    } else {
+      if (colBlock)
+        asAxes.push_back(digit(*colBlock));
+      asAxes.push_back(colLocal());
+    }
+    outCanonical = reshapeHbm(outCanonical, pairOf(asAxes));
   }
-  SmallVector<MapAttr> lanes(outParts);
-  if (unitCol)
-    lanes.back() = kb.axis("U" + std::to_string(fresh++), colPad);
-  copy(unitCol ? tileDigits(view(reshapeHbm(outCanonical, pairOf(lanes)), false), lanes, {{lanes.back(), 0}}, false)
-               : view(outCanonical, false),
-       view(out, true));
+  copy(view(outCanonical, false), view(out, true));
   kb.finish({out});
   return success();
 }
