@@ -6,6 +6,8 @@ npu stage) against GPU goldens.
 
 ## 1.3.0 (unreleased, main)
 
+- Steps are named from a symbol table and a running counter: probing every name from 0 with a module scan was cubic
+  in the step count, minutes for tl.sort's thousands of steps (b761d74).
 - The tiled path's NaN-skipping clean value is exact: two logic ops under one tag ((x | m) & m = m where the tag
   fails, x where it holds) instead of AbsMax, which propagated NaN. Tiled relus and reductions now skip NaN on
   npu3 as on the GPU (relu, min, row and column max of NaN, +-inf and NaN-payload inputs exact); run time
