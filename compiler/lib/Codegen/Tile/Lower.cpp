@@ -121,6 +121,8 @@ private:
   unsigned fresh = 0;
 
   LogicalResult fail(const Twine &msg) {
+    if (std::getenv("FURIOSA_TILED_DEBUG")) // diagnostics of trial mappings are swallowed
+      llvm::errs() << "tiled: " << kernel.func.getName() << ": " << msg << "\n";
     if (!quiet)
       kernel.func.emitError("tiled: ") << msg;
     return failure();
@@ -317,7 +319,12 @@ private:
              int64_t kIndex = 0) {
     auto parts = canonical(axes, false);
     auto at = tileAt(axes, tileIndex);
-    if (withK && tapMajor.count(hbm.getAsOpaquePointer())) {
+    bool major = tapMajor.count(hbm.getAsOpaquePointer());
+    if (major && !withK) { // the Vector Engine reduction's flat axis leads
+      parts.erase(llvm::find(parts, rf));
+      parts.insert(parts.begin(), rf);
+    }
+    if (withK && major) {
       KSplit s = kSplit(kIndex);
       parts.insert(parts.begin(), s.hi.begin(), s.hi.end());
       llvm::append_range(parts, s.lo);
@@ -515,6 +522,8 @@ LogicalResult Lowering::tryGemm(unsigned node) {
     s = 1;
   else
     s = rowsOf(o[0]) >= rowsOf(o[1]) ? 0 : 1;
+  if (o[1 - s].empty())
+    return success(); // no column (one per batch index, as in a depthwise convolution): the Vector Engine reduces it
   if (o[1 - s].size() != 1)
     return fail("a contraction without a column axis");
   if (gemm)
@@ -658,6 +667,12 @@ LogicalResult Lowering::planLayout() {
           colLocalSize = d;
           break;
         }
+    // The intra-slice reduce holds 8 accumulators per slice: a reduced tile's column packets, each split in two
+    // for the float region, must fit them.
+    if (llvm::any_of(p.nodes, [](const Node &n) { return n.kind == Node::Reduce; }))
+      for (int64_t d = std::min<int64_t>(colLocalSize, 4 * kLanes); colLocalSize > 4 * kLanes; d -= kLanes)
+        if (c % d == 0)
+          colLocalSize = d;
   }
   // A column count that is not a multiple of the packet: up to 8 columns is one padded packet; beyond, one packet
   // per slice block of the largest power of two dividing it (a padded packet digit cannot be split for the float
@@ -887,6 +902,24 @@ Value Lowering::convert(Value dm, Type to) {
 /// destination names its rows by the same expressions, and a whole-tensor reshape renames it canonically.
 FailureOr<Value> Lowering::materialize(const Read &r, ArrayRef<unsigned> rowAxes, const KLayout *k) {
   unsigned nd = r.shape.size();
+  // A read windowed by the reduction the Vector Engine evaluates (one of its axes spans past the step of a
+  // coarser term of the same dim, so the two are no digits of the dim) copies one tap of that reduction per DMA,
+  // like a contraction operand, into a buffer whose flat reduction axis leads.
+  KLayout reduction;
+  auto overlaps = [&](const Lin &l) {
+    for (auto [a, c] : l.terms)
+      if (llvm::is_contained(ext, a))
+        for (auto [b2, c2] : l.terms)
+          if (b2 != a && c2 >= c && c * p.axes[a].size > c2)
+            return true;
+    return false;
+  };
+  if (!k && llvm::any_of(r.index, overlaps)) {
+    reduction.taps = ext;
+    reduction.tapPad = rf.size();
+    k = &reduction;
+  }
+  bool veTaps = k == &reduction;
   SmallVector<unsigned> taps;
   if (k)
     taps = k->taps;
@@ -896,10 +929,10 @@ FailureOr<Value> Lowering::materialize(const Read &r, ArrayRef<unsigned> rowAxes
   // Taps that are each alone in a buffer dim (no window: a weight's kernel position) move in one DMA as axes of
   // their own, then into the padded K layout in a second one, instead of one DMA per tap.
   SmallVector<unsigned> peeled;
-  bool windowFree = k && this->windowFree(r);
+  bool windowFree = k && !veTaps && this->windowFree(r);
   if (windowFree)
     std::swap(peeled, taps);
-  bool major = k && tapMajorRead(r);
+  bool major = veTaps || (k && tapMajorRead(r));
   // A tap-major operand's padded inner digit is read from a copy of the buffer padded with zeros in that dim
   // (one more DMA, at most as many runs), so each tap's destination stays one block with no holes.
   std::optional<unsigned> innerDim;
@@ -1017,6 +1050,8 @@ FailureOr<Value> Lowering::materialize(const Read &r, ArrayRef<unsigned> rowAxes
       }
   SmallVector<MapAttr> dstParts;
   for (unsigned a : rowAxes) {
+    if (isTap(a))
+      continue;
     auto it = named.find(a);
     MapAttr m = it != named.end() ? it->second : kb.axis(tag + "R" + std::to_string(a), p.axes[a].size);
     // The tiled column pads to whole column tiles (cells the DMAs never write).
@@ -1234,7 +1269,10 @@ FailureOr<Value> Lowering::materialize(const Read &r, ArrayRef<unsigned> rowAxes
   }
 
   SmallVector<MapAttr> canon = canonical(rowAxes, false);
-  if (major) {
+  if (veTaps) {
+    canon.erase(llvm::find(canon, rf));
+    canon.insert(canon.begin(), rf);
+  } else if (major) {
     KSplit s = kSplit(0);
     canon.insert(canon.begin(), s.hi.begin(), s.hi.end());
     llvm::append_range(canon, s.lo);
