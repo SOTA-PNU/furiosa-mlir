@@ -548,6 +548,11 @@ LogicalResult Lowering::tryGemm(unsigned node) {
     return fail("a contraction without a column axis");
   if (gemm)
     return fail("more than one contraction");
+  // Its rows and columns are the tile's: an output axis that an enclosing reduction reduces (a softmax max over
+  // attention scores in the same kernel) would need the contraction's rows in that reduction's time.
+  for (unsigned a : llvm::concat<unsigned>(o[0], o[1], batch))
+    if (!llvm::is_contained(p.out, a))
+      return fail("a contraction whose output axis an enclosing reduction reduces");
   Gemm g;
   g.node = node;
   g.stream = factors[mainOf[s]];
