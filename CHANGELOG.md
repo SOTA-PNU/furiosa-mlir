@@ -17,6 +17,10 @@ npu stage) against GPU goldens.
   by a rotated index on npu3 (0af780b; 3c04413 fixes a dangling operand list in it).
 - In a generic no class maps, a select one loop decides splits even when its sides are computed: `tl.maximum`'s
   NaN-propagating mode exact on npu3 (ab5dce9).
+- Row-wise: reductions over masked (padded) loads keep the pad value; i32 reductions over padded rows fill with their
+  identity; bf16 row values; one-column rows; a reduction to a scalar stored through a cast is one step. Every
+  reduction (sum, max, min, argmax, argmin, xor_sum) and bf16 abs/cos/sin/rsqrt pass on npu3 for all dtypes and
+  shapes, 32 more matrix cases (0e97b8c).
 
 ## 1.1.0 (2026-11-17, release/1.1.0)
 
