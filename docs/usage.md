@@ -95,7 +95,7 @@ Each kernel's stages, in pipeline order (compiler/README.md describes the passes
 
 ```
 scripts/package.sh
-docker build -f docker/Dockerfile --build-arg PACKAGE=dist/furiosa-mlir-1.0.0-linux-x86_64.tar.gz -t furiosa-mlir:1.0.0 .
+docker build -f docker/Dockerfile --build-arg PACKAGE="$(ls dist/furiosa-mlir-*.tar.gz)" -t furiosa-mlir .
 docker/run.sh                 # JupyterLab on http://localhost:8888 (PORT=...), npu3 only
 docker/run.sh bash            # a shell with the furiosa CLI
 ```

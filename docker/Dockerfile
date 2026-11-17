@@ -2,7 +2,7 @@
 # with (cargo registry and dependencies warmed), JupyterLab, the example models and the playground.
 #
 #   scripts/package.sh
-#   docker build -f docker/Dockerfile --build-arg PACKAGE=dist/furiosa-mlir-1.0.0-linux-x86_64.tar.gz -t furiosa-mlir:1.0.0 .
+#   docker build -f docker/Dockerfile --build-arg PACKAGE="$(ls dist/furiosa-mlir-*.tar.gz)" -t furiosa-mlir .
 #   docker/run.sh                    # JupyterLab on :8888, npu3 only;  docker/run.sh bash  for a shell
 FROM ubuntu:24.04
 
@@ -13,7 +13,7 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
 # The toolchain the generated crates pin (rust-toolchain.toml).
 ENV RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust PATH=/opt/rust/bin:$PATH LIBCLANG_PATH=/usr/lib/llvm-18/lib
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal \
-        --default-toolchain nightly-2026-05-01 --component rustfmt
+        --default-toolchain nightly-2026-05-01 --component rustfmt --component clippy
 
 ARG PACKAGE
 ADD ${PACKAGE} /opt/

@@ -136,7 +136,7 @@ def run(kernel, grid: tuple, args: dict):
     tensors.save(inputs, {name: host(args[name]) for name in bufs})
     with npu_lock():
         for _ in range(180):  # npu3 may be busy with another user's run: wait rather than fail
-            if set(OCCUPANCY.read_text().split()) <= {"0"}:
+            if not OCCUPANCY.exists() or set(OCCUPANCY.read_text().split()) <= {"0"}:  # no status file: no wait
                 break
             time.sleep(10)
         proc = subprocess.run([str(exe), "0", str(inputs), str(outputs)], cwd=work / "crate",

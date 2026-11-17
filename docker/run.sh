@@ -8,4 +8,4 @@ for node in /dev/rngd/npu3*; do
     devices+=(--device "$node")
 done
 exec docker run --rm -it "${devices[@]}" -p "${PORT:-8888}:8888" \
-    -v "$(realpath "${WORKSPACE:-playground}"):/workspace/mine" "furiosa-mlir:${TAG:-1.0.0}" "$@"
+    -v "$(realpath "${WORKSPACE:-playground}"):/workspace/mine" "furiosa-mlir:${TAG:-latest}" "$@"
