@@ -95,12 +95,12 @@ def compiler_env() -> dict:
     return dict(os.environ, PYTHONPATH=str(ROOT / "compiler"))
 
 
-def compiler_cmd(*args) -> list:
+def compiler_cmd(*args, exe: Path = COMPILER_PY) -> list:
     """A compiler-venv command that holds compiler/build.sh's lock shared, so it never loads a
     libtriton that a rebuild is still linking."""
     lock = ROOT / "build" / ".build.lock"
     lock.parent.mkdir(exist_ok=True)
-    return ["flock", "-s", str(lock), str(COMPILER_PY), *args]
+    return ["flock", "-s", str(lock), str(exe), *args]
 
 
 _compiled = {}
@@ -278,6 +278,13 @@ def main():
             print("  " + hit)
     else:
         print("generality: PASS")
+    unit_failed = False
+    if args.impl == "compiler" and COMPILER_PY.exists():
+        # Per-pass lit tests (compiler/tests/lit): seconds, and they name the pass that broke.
+        code, log = sh(compiler_cmd("-q", str(ROOT / "compiler" / "tests" / "lit"), exe=COMPILER_PY.parent / "lit"),
+                       ROOT, compiler_env())
+        unit_failed = code != 0
+        print("unit: " + ("FAIL\n" + log.strip() if unit_failed else "PASS"))
 
     report = {}
     width = max(len(n) for n in names)
@@ -310,7 +317,7 @@ def main():
         if members:
             rates = [f"{lv} {sum(report[n][lv]['status'] == 'PASS' for n in members)}/{len(members)}" for lv in levels]
             print(f"{group:<8}  " + "  ".join(rates))
-    failed = bool(hits) or any(r["status"] == "FAIL" for levels_ in report.values() for r in levels_.values())
+    failed = bool(hits) or unit_failed or any(r["status"] == "FAIL" for levels_ in report.values() for r in levels_.values())
     sys.exit(1 if failed else 0)
 
 

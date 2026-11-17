@@ -31,6 +31,21 @@ compiler/build.sh          # incremental rebuild of libtriton after C++ changes 
 | `lib/Runtime/` | L1: JIT-compiling raised linalg on the CPU |
 | `lib/Codegen/` | the furiosa-opt dialect (fopt), linalg → fopt mapping, fopt → Rust |
 | `bindings/` | one nanobind file per area, called from `triton_furiosa.cc` |
+| `tools/` | `furiosa-mlir-opt`: mlir-opt with the Furiosa passes and dialects, for the lit tests |
+| `tests/lit/` | per-pass tests: one small input, one or more passes, FileCheck on the output |
+
+## Per-pass tests
+
+```
+compiler/build.sh                        # builds libtriton and furiosa-mlir-opt
+compiler/.venv/bin/lit compiler/tests/lit -v
+```
+
+Each test names one contract of one pass in a comment (a raise rule, a structure promotion, a diagnostic)
+and checks it with FileCheck; absences are checked over the whole output with `--implicit-check-not`.
+Inputs are TTIR of small Triton kernels with their `furiosa.launch` attribute, the kernel source quoted on
+top. A change to a pass comes with a test for the behavior it adds or fixes; the harness runs these before
+the cases (`unit:` line) and fails the run on a broken one.
 
 ## Contract: raised linalg (stage `linalg`)
 

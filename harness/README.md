@@ -123,6 +123,9 @@ uv run python -m harness.run --impl reference         # all cases, all levels
 uv run python -m harness.run --impl reference --cases rmsnorm --levels L2,L3
 ```
 
+With `--impl compiler` the run first executes the compiler's per-pass lit tests (`unit:` line,
+compiler/README.md); a failure there fails the run, like a generality hit.
+
 The report is a case × level table (PASS / FAIL / SKIP with the reason and the worst error), also
 written to `harness/out/report.json`. L4 is skipped unless every PE of npu3 is idle; the harness never
 opens another NPU (`FURIOSA_VISIBLE_CHIPS=3`).

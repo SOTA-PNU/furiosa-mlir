@@ -1,0 +1,6 @@
+1.091313e-02 raise/atomics.mlir
+1.345682e-02 raise/digit-split.mlir
+2.443385e-02 raise/kept-loop.mlir
+1.148248e-02 raise/live-k.mlir
+1.478028e-02 raise/pixels.mlir
+1.340747e-02 structure/transpose.mlir
