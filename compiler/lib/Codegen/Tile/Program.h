@@ -71,6 +71,15 @@ struct Program {
   SmallVector<int64_t> outShape;
   SmallVector<Lin> outIndex;
 
+  /// Where each axis comes from: (dim, place), the axis being (dim / place) % size; the dims' extents, the
+  /// first of them the output dims, which are the root generic's loops `outLoop` (for the tiling pass).
+  SmallVector<std::pair<unsigned, int64_t>> axisDim;
+  SmallVector<int64_t> dimExtent;
+  SmallVector<unsigned> outLoop;
+  Operation *rootOp = nullptr;
+  /// Tile loops the kernel already has (furiosa-tile): axis `first` tiled by `second`, its loop's step.
+  SmallVector<std::pair<unsigned, int64_t>> loopTiles;
+
   /// The axes a node depends on (reduction axes it reduces excluded).
   SmallVector<unsigned> axesOf(unsigned node) const;
   void print(llvm::raw_ostream &os) const;

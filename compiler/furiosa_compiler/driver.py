@@ -87,6 +87,18 @@ def steps(structured: str) -> str:
         return "// furiosa codegen failed: steps\n" + "".join(f"// {line}\n" for line in str(e).splitlines())
 
 
+def tiled(steps_text: str) -> str:
+    """The steps stage with each kernel tiled by its plan into scf.for loops (furiosa-tile), what codegen maps."""
+    from triton._C.libtriton import furiosa
+
+    if steps_text.startswith("// furiosa codegen failed:"):
+        return steps_text
+    try:
+        return furiosa.codegen.tile(steps_text)
+    except RuntimeError as e:
+        return "// furiosa codegen failed: tile\n" + "".join(f"// {line}\n" for line in str(e).splitlines())
+
+
 def compile_model(model_path: Path, out: Path, keep_going: bool = False) -> dict:
     """Compiles every launch specialization of the model's graphs into ``out`` and writes graph.json."""
     return compile_graphs(load_model(model_path).graphs(), str(model_path), out, keep_going)
@@ -126,7 +138,9 @@ def compile_graphs(model_graphs, model: str, out: Path, keep_going: bool = False
             directory.mkdir(parents=True, exist_ok=True)
             for stage in ("ttir", "linalg", "structured"):
                 (directory / f"{stage}.mlir").write_text(kernel.stage(stage))
-            (directory / "steps.mlir").write_text(steps(kernel.stage("structured")))
+            steps_text = steps(kernel.stage("structured"))
+            (directory / "steps.mlir").write_text(steps_text)
+            (directory / "tiled.mlir").write_text(tiled(steps_text))
             entry["written"] = kernel.written()
             entry["linalg"] = f"kernels/{symbol}/linalg.mlir"
         summary[symbol] = entry

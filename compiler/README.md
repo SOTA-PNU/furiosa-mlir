@@ -94,7 +94,7 @@ Running the function on the buffers must give exactly what the Triton grid gives
 
 ```
 <dir>/graph.json                     every graph: buffers and launches (kernel symbol, buffer per pointer arg, grid)
-<dir>/kernels/<symbol>/{ttir,linalg,structured,steps}.mlir
+<dir>/kernels/<symbol>/{ttir,linalg,structured,steps,tiled}.mlir
 ```
 
 `structured.mlir` is the raised kernel after `furiosa-structure` (affine reads as indexing-map inputs).
@@ -102,7 +102,13 @@ Running the function on the buffers must give exactly what the Triton grid gives
 index-only value evaluated into a constant table, and, where no op class maps the kernel whole, split into
 steps: private functions in the raised-kernel contract that one op class maps each, called in order by the
 kernel on its buffers and `tensor.empty` temporaries. The crate launches the steps in call order and uploads
-the tables. L1 runs `linalg.mlir`, `structured.mlir` and `steps.mlir`.
+the tables.
+`tiled.mlir` is `steps.mlir` after `furiosa-tile` (lib/Codegen/Tile/TilePass.cpp), the first level of codegen's
+progressive lowering: each kernel the tiled class maps is tiled by that class's plan (Tile/Plan.h, the cost
+model holding the NPU's capacities: TRF lanes, the DM budget, intra-slice accumulators, slices, lanes) into
+`scf.for` loops over its output rows (upstream TilingInterface tile and fuse; pads and buffers stay whole and
+are sliced), and mapping to fopt folds the loops back into the plan's tile digits. Codegen maps this stage. L1
+runs `linalg.mlir`, `structured.mlir`, `steps.mlir` and `tiled.mlir`.
 fp16 buffers live as f32 on the device (furiosa-opt has no f16): mapping a kernel to fopt widens its `f16` to
 `f32` and drops the conversions between them, and the crate converts F16 at the graph boundary (exactly in,
 round-to-nearest-even out); `steps.mlir` and the stages before it keep `f16`.

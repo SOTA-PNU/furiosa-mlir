@@ -3,9 +3,11 @@
 
 #include "Program.h"
 
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/Matchers.h"
@@ -407,6 +409,31 @@ public:
   std::vector<RawRead> reads;
   std::vector<RawNode> nodes;
   std::map<std::string, unsigned> memo;
+  /// Index values with a known expression over the dims (tile loops' induction variables).
+  llvm::DenseMap<Value, AffineExpr> bound;
+
+  /// An index operand (a constant, a bound value, or an affine.apply of those) as an expression over the dims.
+  FailureOr<AffineExpr> indexExpr(OpFoldResult ofr) {
+    if (std::optional<int64_t> c = getConstantIntValue(ofr))
+      return getAffineConstantExpr(*c, ctx);
+    Value v = cast<Value>(ofr);
+    if (auto it = bound.find(v); it != bound.end())
+      return it->second;
+    if (auto apply = v.getDefiningOp<affine::AffineApplyOp>()) {
+      SmallVector<AffineExpr> operands;
+      for (Value o : apply.getMapOperands()) {
+        auto e = indexExpr(o);
+        if (failed(e))
+          return failure();
+        operands.push_back(*e);
+      }
+      AffineMap m = apply.getAffineMap();
+      return m.getResult(0).replaceDimsAndSymbols(ArrayRef(operands).take_front(m.getNumDims()),
+                                                  ArrayRef(operands).drop_front(m.getNumDims()));
+    }
+    why = "an index that is neither constant nor a tile loop's";
+    return failure();
+  }
 
   unsigned dim(int64_t extent, bool reduction) {
     extents.push_back(extent);
@@ -488,8 +515,8 @@ public:
       return valueAt(pad.getSource(), idx, v);
     }
     if (auto slice = dyn_cast<tensor::ExtractSliceOp>(op)) {
-      SmallVector<int64_t> offsets(slice.getStaticOffsets()), strides(slice.getStaticStrides());
-      if (llvm::is_contained(offsets, ShapedType::kDynamic) || llvm::is_contained(strides, ShapedType::kDynamic)) {
+      SmallVector<int64_t> strides(slice.getStaticStrides());
+      if (llvm::is_contained(strides, ShapedType::kDynamic) || llvm::is_contained(slice.getStaticSizes(), ShapedType::kDynamic)) {
         why = "a dynamic tensor.extract_slice";
         return failure();
       }
@@ -497,9 +524,12 @@ public:
       llvm::SmallBitVector dropped = slice.getDroppedDims();
       SmallVector<AffineExpr> src;
       unsigned k = 0;
-      for (unsigned j = 0; j < srcType.getRank(); ++j) {
+      for (auto [j, offset] : llvm::enumerate(slice.getMixedOffsets())) {
+        auto off = indexExpr(offset);
+        if (failed(off))
+          return failure();
         AffineExpr inner = dropped.test(j) ? getAffineConstantExpr(0, ctx) : idx[k++];
-        src.push_back(inner * strides[j] + offsets[j]);
+        src.push_back(inner * strides[j] + *off);
       }
       return valueAt(slice.getSource(), src, fill);
     }
@@ -746,6 +776,78 @@ FailureOr<Program> mlir::furiosa::tile::analyze(func::FuncOp func, ArrayRef<int6
     reshapes.push_back(v.getDefiningOp());
     v = v.getDefiningOp()->getOperand(0);
   }
+  // Tile loops (furiosa-tile): a nest of static scf.for whose innermost body inserts one tile of the stored value
+  // at the loops' offsets. Each tiled dim gets two dims, the tile index (with the output dims) and the index in
+  // the tile (after them); the axes merge back into one once the Program is built (mergeTiles).
+  SmallVector<AffineExpr> rootIdx, outIdx;
+  SmallVector<std::tuple<unsigned, unsigned, int64_t>> tiled; // (tile dim, inner dim, tile size)
+  if (auto loop = v.getDefiningOp<scf::ForOp>()) {
+    SmallVector<scf::ForOp> loops;
+    tensor::InsertSliceOp insert;
+    while (loop) {
+      std::optional<int64_t> lb = getConstantIntValue(loop.getLowerBound()),
+                             ub = getConstantIntValue(loop.getUpperBound()),
+                             step = getConstantIntValue(loop.getStep());
+      if (!lb || !ub || !step || *lb != 0 || *ub % *step || loop.getNumRegionIterArgs() != 1 ||
+          (!loops.empty() && loop.getInitArgs()[0] != loops.back().getRegionIterArgs()[0])) {
+        why = "a tile loop that is not a static nest over its stored value";
+        return failure();
+      }
+      loops.push_back(loop);
+      Value y = loop.getBody()->getTerminator()->getOperand(0);
+      loop = y.getDefiningOp<scf::ForOp>();
+      if (!loop) {
+        insert = y.getDefiningOp<tensor::InsertSliceOp>();
+        if (!insert || insert.getDest() != loops.back().getRegionIterArgs()[0]) {
+          why = "a tile loop that does not insert a tile of its stored value";
+          return failure();
+        }
+      }
+    }
+    if (llvm::is_contained(insert.getStaticSizes(), ShapedType::kDynamic) ||
+        llvm::any_of(insert.getStaticStrides(), [](int64_t x) { return x != 1; }) ||
+        insert.getSourceType().getRank() != insert.getDestType().getRank()) {
+      why = "a tile insert that is not a static box at the tile loops' offsets";
+      return failure();
+    }
+    auto shape = insert.getDestType().getShape();
+    SmallVector<std::optional<unsigned>> loopOf(shape.size());
+    for (auto [j, offset] : llvm::enumerate(insert.getMixedOffsets())) {
+      if (std::optional<int64_t> c = getConstantIntValue(offset)) {
+        if (*c != 0 || insert.getStaticSizes()[j] != shape[j]) {
+          why = "a tile insert at a fixed offset";
+          return failure();
+        }
+        continue;
+      }
+      for (auto [i, l] : llvm::enumerate(loops))
+        if (cast<Value>(offset) == l.getInductionVar())
+          loopOf[j] = i;
+      if (!loopOf[j] || insert.getStaticSizes()[j] != *getConstantIntValue(loops[*loopOf[j]].getStep()) ||
+          *getConstantIntValue(loops[*loopOf[j]].getUpperBound()) != shape[j]) {
+        why = "a tile insert whose offset is not a whole tile of a loop";
+        return failure();
+      }
+    }
+    SmallVector<unsigned> outer(shape.size());
+    for (auto [j, extent] : llvm::enumerate(shape))
+      outer[j] = folder.dim(loopOf[j] ? extent / insert.getStaticSizes()[j] : extent, false);
+    for (auto [j, extent] : llvm::enumerate(shape)) {
+      AffineExpr d = getAffineDimExpr(outer[j], ctx);
+      if (!loopOf[j]) {
+        rootIdx.push_back(d);
+        outIdx.push_back(d);
+        continue;
+      }
+      int64_t t = insert.getStaticSizes()[j];
+      unsigned in = folder.dim(t, false);
+      folder.bound[loops[*loopOf[j]].getInductionVar()] = d * t;
+      rootIdx.push_back(getAffineDimExpr(in, ctx));
+      outIdx.push_back(d * t + getAffineDimExpr(in, ctx));
+      tiled.push_back({outer[j], in, t});
+    }
+    v = insert.getSource();
+  }
   auto last = v.getDefiningOp<linalg::GenericOp>();
   if (!last) {
     why = "the stored value is not a generic's result";
@@ -754,11 +856,15 @@ FailureOr<Program> mlir::furiosa::tile::analyze(func::FuncOp func, ArrayRef<int6
   // The output dims: the last generic's dims, or, when it reduces (a contraction stored as it is), the dims its
   // output map projects to (generic() makes the reduction dims fresh reduction axes).
   AffineMap lastOut = last.getMatchingIndexingMap(last.getDpsInitOperand(cast<OpResult>(v).getResultNumber()));
-  SmallVector<AffineExpr> rootIdx;
   SmallVector<int64_t> ranges = last.getStaticLoopRanges();
-  if (llvm::all_of(last.getIteratorTypesArray(), [](auto t) { return t == utils::IteratorType::parallel; })) {
-    for (int64_t e : ranges)
+  SmallVector<unsigned> outLoop;
+  if (!rootIdx.empty()) {
+    // The tile's own dims are bound through its output map (generic() below).
+  } else if (llvm::all_of(last.getIteratorTypesArray(), [](auto t) { return t == utils::IteratorType::parallel; })) {
+    for (auto [i, e] : llvm::enumerate(ranges)) {
       folder.dim(e, false);
+      outLoop.push_back(i);
+    }
     rootIdx = SmallVector<AffineExpr>(lastOut.getResults());
   } else {
     for (AffineExpr e : lastOut.getResults()) {
@@ -768,10 +874,12 @@ FailureOr<Program> mlir::furiosa::tile::analyze(func::FuncOp func, ArrayRef<int6
         return failure();
       }
       rootIdx.push_back(getAffineDimExpr(folder.dim(ranges[d.getPosition()], false), ctx));
+      outLoop.push_back(d.getPosition());
     }
   }
   unsigned numOut = folder.extents.size();
-  SmallVector<AffineExpr> outIdx(rootIdx);
+  if (outIdx.empty())
+    outIdx = rootIdx;
   // Through the reshapes, outermost last: the written buffer's indices over the output dims.
   for (Operation *op : llvm::reverse(reshapes)) {
     SmallVector<AffineExpr> next;
@@ -840,9 +948,13 @@ FailureOr<Program> mlir::furiosa::tile::analyze(func::FuncOp func, ArrayRef<int6
         continue;
       axisOf[g.expr] = p.axes.size();
       p.axes.push_back({g.size, (bool)folder.isReduction[d]});
+      p.axisDim.push_back({d, g.place});
       if (d < numOut)
         p.out.push_back(p.axes.size() - 1);
     }
+  p.dimExtent = folder.extents;
+  p.outLoop = outLoop;
+  p.rootOp = last;
   auto toLin = [&](AffineExpr e) -> FailureOr<Lin> {
     Form f = digits.linear(e);
     Lin l;
@@ -918,6 +1030,67 @@ FailureOr<Program> mlir::furiosa::tile::analyze(func::FuncOp func, ArrayRef<int6
     if (failed(l))
       return failure();
     p.outIndex.push_back(*l);
+  }
+  // Tile loops: the tile index and the index in the tile merge into the one axis they split (every index uses
+  // them as t * size + i), which keeps the loop's tiling as a tile digit of that axis.
+  auto axisOfDim = [&](unsigned d) -> std::optional<unsigned> {
+    std::optional<unsigned> a;
+    for (const Digits::Digit &g : digits.table[d])
+      if (auto it = axisOf.find(g.expr); it != axisOf.end()) {
+        if (a)
+          return std::nullopt; // a tiled dim split into digits: not merged
+        a = it->second;
+      }
+    return a;
+  };
+  for (auto [dt, di, t] : tiled) {
+    std::optional<unsigned> at = axisOfDim(dt), ai = axisOfDim(di);
+    if (!at)
+      continue; // one tile
+    if (!ai) {
+      p.loopTiles.push_back({*at, 1});
+      continue;
+    }
+    SmallVector<Lin *> lins;
+    for (Read &r : p.reads)
+      for (Lin &l : r.index)
+        lins.push_back(&l);
+    for (Lin &l : p.outIndex)
+      lins.push_back(&l);
+    for (Lin *l : lins)
+      if (l->coeff(*at) != t * l->coeff(*ai)) {
+        why = "a tile loop's index used apart from its tile";
+        return failure();
+      }
+    for (Lin *l : lins) {
+      int64_t c = l->coeff(*ai);
+      SmallVector<std::pair<unsigned, int64_t>> terms;
+      for (auto [a, k] : l->terms)
+        if (a != *ai)
+          terms.push_back({a, a == *at ? c : k});
+      l->terms = terms;
+    }
+    p.axes[*at].size *= t;
+    p.axisDim[*at].second = 1;
+    p.dimExtent[dt] *= t;
+    p.loopTiles.push_back({*at, t});
+    // Drop axis ai: every later axis moves down by one.
+    auto shift = [&](unsigned a) { return a > *ai ? a - 1 : a; };
+    for (Lin *l : lins)
+      for (auto &[a, k] : l->terms)
+        a = shift(a);
+    llvm::erase(p.out, *ai);
+    for (unsigned &a : p.out)
+      a = shift(a);
+    for (Node &n : p.nodes)
+      for (unsigned &a : n.axes)
+        a = shift(a);
+    for (auto &[a, k] : p.loopTiles)
+      a = shift(a);
+    p.axes.erase(p.axes.begin() + *ai);
+    p.axisDim.erase(p.axisDim.begin() + *ai);
+    for (auto &[da, ta] : axisOf)
+      ta = shift(ta);
   }
   return p;
 }

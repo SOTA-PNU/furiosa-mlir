@@ -21,6 +21,10 @@ std::unique_ptr<Pass> createLinalgToFoptPass();
 /// furiosa-split-steps: splitSteps as a pass over a module of structured kernels (lib/Codegen/Steps.cpp).
 std::unique_ptr<Pass> createSplitStepsPass();
 
+/// furiosa-tile: tiles each kernel's output rows by the tiled lowering's plan into scf.for loops over its root
+/// generic (lib/Codegen/Tile/TilePass.cpp).
+std::unique_ptr<Pass> createTilePass();
+
 /// Writes every fopt kernel of `module` as one Rust module (the body of src/kernel/<symbol>.rs).
 LogicalResult translateFoptToRust(ModuleOp module, llvm::raw_ostream &os);
 

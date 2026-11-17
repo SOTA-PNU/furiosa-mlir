@@ -13,6 +13,8 @@ add_triton_library(FuriosaCodegen
   Normalize.cpp
   Tile/Analysis.cpp
   Tile/Lower.cpp
+  Tile/Plan.cpp
+  Tile/TilePass.cpp
   Tile/Ops.cpp
   Steps.cpp
 
@@ -20,6 +22,7 @@ add_triton_library(FuriosaCodegen
     FoptTableGen
 
   LINK_LIBS PUBLIC
+    MLIRAffineDialect
     MLIRArithDialect
     MLIRFuncDialect
     MLIRFuncInlinerExtension
@@ -30,6 +33,7 @@ add_triton_library(FuriosaCodegen
     MLIRParser
     MLIRPass
     MLIRSCFDialect
+    MLIRSCFTransforms
     MLIRSCFUtils
     MLIRSupport
     MLIRTensorDialect

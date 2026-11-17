@@ -52,10 +52,22 @@ void init_furiosa_codegen(nb::module_ &m) {
   codegen.def("linalg_to_fopt", [](const std::string &text) {
     return withModule(text, [](mlir::ModuleOp module, llvm::raw_ostream &os) {
       mlir::PassManager pm(module->getContext());
+      pm.addPass(mlir::furiosa::createTilePass());
       pm.addPass(mlir::furiosa::createLinalgToFoptPass());
       if (mlir::failed(pm.run(module)))
         return mlir::failure();
       module.print(os);
+      return mlir::success();
+    });
+  });
+
+  codegen.def("tile", [](const std::string &text) {
+    return withModule(text, [](mlir::ModuleOp module, llvm::raw_ostream &os) {
+      mlir::PassManager pm(module->getContext());
+      pm.addPass(mlir::furiosa::createTilePass());
+      if (mlir::failed(pm.run(module)))
+        return mlir::failure();
+      module.print(os, mlir::OpPrintingFlags().enableDebugInfo(true, false));
       return mlir::success();
     });
   });
