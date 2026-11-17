@@ -58,6 +58,7 @@ def all_cases() -> list[Case]:
     for dtype in FLOATS + ["int8", "float8_e4m3fn"]:
         cases += [Case("dot", "dot", dtype, s) for s in DOTS]
     cases += [Case("memory", "descriptor", dtype, s) for dtype in ALL for s in [(1, 64, 64), (1, 50, 64)]]
+    cases += [Case("memory", "masked_store", dtype, s) for dtype in ALL for s in [(1, 64, 64), (2, 7, 33)]]
     cases += [Case("program", "program_id", "float32", (1, 64, 64))]
     for op in K.ATOMIC:
         cases += [Case("atomic", op, dtype, (1, 8, 64)) for dtype in (["int32"] if op in ("atomic_and", "atomic_or",
@@ -155,6 +156,11 @@ def build(case: Case):
         bound = a.double().abs() @ bb.double().abs()
         out = torch.empty(m, n, dtype=out_dtype)
         return K.dot_kernel, (1,), dict(a_ptr=a, b_ptr=bb, out_ptr=out, M=m, N=n, K=k), {"out_ptr": (ref, bound)}, "dot"
+    if case.group == "memory" and case.op == "masked_store":
+        x = _input((rows, c), dt, generator=g)
+        out = _input((rows, c), dt, generator=g)
+        return (K.masked_store_kernel, (1,), dict(x_ptr=x, out_ptr=out, **blk),
+                {"out_ptr": torch.where(wide(x) > 0, wide(x), wide(out))}, "float")
     if case.group == "memory":
         x = _input((rows, c), dt, generator=g)
         out = torch.empty_like(x)

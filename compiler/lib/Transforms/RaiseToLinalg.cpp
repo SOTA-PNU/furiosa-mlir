@@ -537,6 +537,15 @@ private:
       return setInt(p, cst(grid[p.getAxisAsInt()])), success();
     if (auto r = dyn_cast<tt::MakeRangeOp>(op))
       return setInt(r, getAffineDimExpr(0, ctx) + cst(r.getStart())), success();
+    if (auto bc = dyn_cast<tt::BitcastOp>(op)) { // a pointer to an element type of the same width
+      const Sym *src = get(bc.getSrc());
+      auto from = dyn_cast<tt::PointerType>(getElementTypeOrSelf(bc.getSrc().getType()));
+      auto to = dyn_cast<tt::PointerType>(getElementTypeOrSelf(bc.getType()));
+      if (src && src->kind == Sym::Ptr && from && to &&
+          from.getPointeeType().getIntOrFloatBitWidth() == to.getPointeeType().getIntOrFloatBitWidth())
+        syms[bc.getResult()] = *src;
+      return success();
+    }
     if (isa<tt::SplatOp, tt::BroadcastOp, tt::ExpandDimsOp, tt::TransOp>(op)) {
       const Sym *src = get(op->getOperand(0));
       if (!src)
@@ -878,7 +887,23 @@ struct StoreSpace {
   SmallVector<unsigned> freeDims;              // view dims no axis moves along
   // Per instance: the origin of each stored axis, then the coordinate of each free dim.
   std::vector<SmallVector<int64_t>> origin;
+  SmallVector<Value> dataMask; // mask terms that depend on data: the write keeps the old value where one fails
 };
+
+/// A write mask taken apart over its `and`s: the index predicates (conds, never) decide where it can
+/// write; the terms that depend on data are left in `data` for the write to select on.
+template <typename Get>
+void splitMask(Value mask, Get get, SmallVector<AffineExpr> &conds, bool &never, SmallVector<Value> &data) {
+  if (const Sym *m = get(mask); m && m->kind == Sym::Mask) {
+    conds.append(m->conds.begin(), m->conds.end());
+    never |= m->never;
+  } else if (auto a = mask.getDefiningOp<arith::AndIOp>()) {
+    splitMask(a.getLhs(), get, conds, never, data);
+    splitMask(a.getRhs(), get, conds, never, data);
+  } else {
+    data.push_back(mask);
+  }
+}
 
 /// What an axis of a value means inside the generic being built.
 struct Axis {
@@ -1249,6 +1274,7 @@ FailureOr<StoreSpace> Raiser::storeSpace(Write store, ArrayRef<int64_t> extraStr
     toSyms.push_back(it != encl.end() ? getAffineDimExpr(it - encl.begin(), ctx) : getAffineConstantExpr(0, ctx));
   }
   std::vector<AffineExpr> address(act.size());
+  SmallVector<Value> dataMask;
   std::vector<SmallVector<AffineExpr>> maskConds(act.size());
   std::vector<bool> maskNever(act.size(), false);
   std::vector<SmallVector<int64_t>> extentsOf(act.size());
@@ -1258,12 +1284,15 @@ FailureOr<StoreSpace> Raiser::storeSpace(Write store, ArrayRef<int64_t> extraStr
       return store.emitError("furiosa: store base differs between program instances"), failure();
     address[n] = simplify(p->expr.replaceDimsAndSymbols(toDims, toSyms), rank, 0);
     if (store.getMask()) {
-      const Sym *m = ev->get(store.getMask());
-      if (!m || m->kind != Sym::Mask)
-        return store.emitError("furiosa: store mask is not an index predicate"), failure();
-      for (AffineExpr c : m->conds)
+      SmallVector<AffineExpr> conds;
+      bool never = false;
+      SmallVector<Value> data;
+      splitMask(store.getMask(), [&](Value v) { return ev->get(v); }, conds, never, data);
+      for (AffineExpr c : conds)
         maskConds[n].push_back(simplify(c.replaceDimsAndSymbols(toDims, toSyms), rank, 0));
-      maskNever[n] = m->never;
+      maskNever[n] = never;
+      if (n == 0)
+        dataMask = data;
     }
     for (unsigned id : encl)
       extentsOf[n].push_back(ev->trips.lookup(id));
@@ -1373,6 +1402,7 @@ FailureOr<StoreSpace> Raiser::storeSpace(Write store, ArrayRef<int64_t> extraStr
     unsigned nd = st.size();
     StoreSpace sp;
     sp.arg = arg;
+    sp.dataMask = dataMask;
     sp.viewStrides.assign(st.begin(), st.end());
     sp.viewShape.push_back(numel / st[0]);
     for (unsigned j = 1; j < nd; ++j)
@@ -2082,6 +2112,8 @@ FailureOr<Value> Raiser::emitLoad(Gen &g, tt::LoadOp load, ArrayRef<Axis> env) {
   }
   Value src = flatOf(versionAt(load, arg), arg);
   Value elem = tensor::ExtractOp::create(ob, loc, src, ValueRange{i});
+  if (Type t = getElementTypeOrSelf(load.getType()); t != elem.getType()) // through a pointer bitcast
+    elem = arith::BitcastOp::create(ob, loc, t, elem);
   if (on) {
     Value other;
     if (Value o = load.getOther(); o && !o.getDefiningOp<arith::ConstantOp>()) {
@@ -3170,8 +3202,9 @@ LogicalResult Raiser::raiseStoreIn(Write store, const StoreSpace &spRef) {
   b.setInsertionPoint(anchor);
   SmallVector<int64_t> box(root.extent);
   auto rmw = dyn_cast<tt::AtomicRMWOp>(store.getOperation());
-  // An atomic starts from what the box holds and combines into it.
-  Value init = !rmw ? tensor::EmptyOp::create(b, loc, box, elem).getResult()
+  // An atomic, or a write whose mask depends on data, starts from what the box holds.
+  bool keepsOld = rmw || !sp->dataMask.empty();
+  Value init = !keepsOld ? tensor::EmptyOp::create(b, loc, box, elem).getResult()
                : sp->full ? reshape(current[arg], sp->viewShape)
                           : tensor::ExtractSliceOp::create(b, loc, reshape(current[arg], sp->viewShape),
                                                            getAsIndexOpFoldResult(ctx, sp->boxLo),
@@ -3193,9 +3226,12 @@ LogicalResult Raiser::raiseStoreIn(Write store, const StoreSpace &spRef) {
           return;
         }
         Value out = *v;
+        Type vt = out.getType(); // the buffer's type, or one of its width through a pointer bitcast
+        Value old = args[0];
+        if (vt != elem)
+          old = arith::BitcastOp::create(ob, loc, vt, old);
         if (rmw) {
-          Value old = args[0];
-          bool fp = isa<FloatType>(elem);
+          bool fp = isa<FloatType>(vt);
           switch (rmw.getAtomicRmwOp()) {
           case tt::RMWOp::ADD:
           case tt::RMWOp::FADD:
@@ -3226,6 +3262,16 @@ LogicalResult Raiser::raiseStoreIn(Write store, const StoreSpace &spRef) {
             break;
           }
         }
+        for (Value term : sp->dataMask) {
+          auto on = emit(g, term, env);
+          if (failed(on)) {
+            status = failure();
+            break;
+          }
+          out = arith::SelectOp::create(ob, loc, *on, out, old);
+        }
+        if (vt != elem)
+          out = arith::BitcastOp::create(ob, loc, elem, out);
         linalg::YieldOp::create(ob, loc, ValueRange{out});
       });
   g.anchor = op;
@@ -3377,13 +3423,18 @@ LogicalResult Raiser::run() {
       std::vector<SmallVector<Evaluator *>> rounds;
       SmallVector<int64_t> shape = shapeOf(st.getValue().getType());
       for (Evaluator *ev : instances) {
-        const Sym *p = ev->get(st.getPtr()), *m = st.getMask() ? ev->get(st.getMask()) : nullptr;
-        if (!p->data.empty() || (st.getMask() && (!m || m->kind != Sym::Mask)))
-          return st.emitError("furiosa: an atomic address or mask depends on data");
+        const Sym *p = ev->get(st.getPtr());
+        if (!p->data.empty())
+          return st.emitError("furiosa: an atomic address depends on data");
+        SmallVector<AffineExpr> conds; // where it may write: the data terms of its mask only narrow that
+        bool never = false;
+        SmallVector<Value> data;
+        if (st.getMask())
+          splitMask(st.getMask(), [&](Value v) { return ev->get(v); }, conds, never, data);
         std::set<int64_t> addrs;
         SmallVector<int64_t> at(shape.size(), 0);
-        for (bool more = !(m && m->never); more;) {
-          if (!m || llvm::all_of(m->conds, [&](AffineExpr c) { return evalAt(c, at) >= 0; }))
+        for (bool more = !never; more;) {
+          if (llvm::all_of(conds, [&](AffineExpr c) { return evalAt(c, at) >= 0; }))
             addrs.insert(evalAt(p->expr, at));
           more = false;
           for (int k = shape.size() - 1; k >= 0 && !more; --k)

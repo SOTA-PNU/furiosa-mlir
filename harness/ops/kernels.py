@@ -205,6 +205,16 @@ def descriptor_kernel(x_ptr, out_ptr, R: tl.constexpr, C: tl.constexpr, BR: tl.c
 
 
 @triton.jit
+def masked_store_kernel(x_ptr, out_ptr, R: tl.constexpr, C: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr):
+    """A store whose mask depends on the data: out keeps its old value where x <= 0."""
+    r = tl.arange(0, BR)[:, None]
+    c = tl.arange(0, BC)[None, :]
+    m = (r < R) & (c < C)
+    x = tl.load(x_ptr + r * C + c, mask=m, other=0)
+    tl.store(out_ptr + r * C + c, x, mask=m & (x > 0))
+
+
+@triton.jit
 def program_kernel(x_ptr, out_ptr, R: tl.constexpr, C: tl.constexpr):
     """One program per row: program_id and num_programs."""
     row = tl.program_id(0)
