@@ -42,6 +42,9 @@ npu stage) against GPU goldens.
   the matrix at 8f7ce01 plus this change: 879 of 907 (5a5c85f).
 - Row-wise: a reduction of a computed term pads its input with the reduction's identity when the term keeps it
   (MLIR's folders evaluate it): bf16 max at 2x7x33 maps again under the NaN guard (d15e419).
+- A data-dependent element gather the 8-byte DMA rule blocks gathers 8-byte rows at the even-aligned address and
+  selects the half by the address's parity (exact for any bits); a signed remainder by a power of two expands to
+  shifts and masks: `extra.gather_data` on npu3 (832a9e3).
 
 ## 1.1.0 (2026-11-17, release/1.1.0)
 
