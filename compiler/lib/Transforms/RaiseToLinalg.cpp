@@ -2416,6 +2416,12 @@ Raiser::buildGenerics(Gen &parent, ArrayRef<unsigned> parentDims, ArrayRef<int64
     Gen gi = g;
     gi.extent.resize(np);
     gi.lo.resize(np);
+    SmallVector<unsigned> ownLoops; // the init has no own dims: their loops are not its dims
+    for (auto [l, pos] : gi.loopPos)
+      if (pos >= (int)np)
+        ownLoops.push_back(l);
+    for (unsigned l : ownLoops)
+      gi.loopPos.erase(l);
     SmallVector<int> remapParallel = remap;
     SmallVector<Value> empties;
     for (Type elem : elems)
