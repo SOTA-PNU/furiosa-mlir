@@ -928,13 +928,21 @@ private:
 };
 
 int Planner::weight(int node) {
-  Node &n = dag.nodes[node];
-  if (n.kind == Node::Input || n.kind == Node::Const || materialized.count(node))
-    return 0;
-  int w = 1;
-  for (int a : n.args)
-    w += weight(a);
-  return w;
+  // Memoized and saturated: values the DAG shares (tl.sort's stages read the previous one twice) would make the
+  // plain recursion exponential.
+  std::map<int, int> memo;
+  std::function<int(int)> tree = [&](int k) {
+    Node &n = dag.nodes[k];
+    if (n.kind == Node::Input || n.kind == Node::Const || materialized.count(k))
+      return 0;
+    if (auto it = memo.find(k); it != memo.end())
+      return it->second;
+    int64_t w = 1;
+    for (int a : n.args)
+      w = std::min<int64_t>(w + tree(a), INT32_MAX);
+    return memo[k] = int(w);
+  };
+  return tree(node);
 }
 
 /// The node as a VRF tensor: a Col input or a Full value (a row per slice) loaded through a sub pass, or a
