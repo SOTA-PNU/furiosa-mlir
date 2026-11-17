@@ -16,7 +16,7 @@ ATOMIC = ["atomic_add", "atomic_max", "atomic_min", "atomic_and", "atomic_or", "
 # The rest of lowlevel-api-test's operator list (cpu_gpu.py), one kernel per group as above.
 EXTRA = ["reduce_or", "topk", "map_elementwise", "squeeze_ravel", "broadcast", "rand", "randn", "randint", "rand4x",
          "randn4x", "randint4x", "associative_scan", "reduce_keep_dims", "join", "split", "interleave", "cat",
-         "swizzle2d", "umulhi", "gather", "histogram", "maximum_nan", "atomic_xchg_old", "atomic_add_old",
+         "swizzle2d", "umulhi", "gather", "histogram", "maximum_nan", "atomic_xchg_old", "atomic_add_old", "atomic_cas_old",
          "device_print", "device_assert", "range_loop"]
 
 
@@ -335,10 +335,12 @@ def extra_kernel(x_ptr, y_ptr, out_ptr, R: tl.constexpr, C: tl.constexpr, OP: tl
         out = tl.atomic_xchg(x_ptr + offs, y)
     elif OP == 23:
         out = tl.atomic_add(x_ptr + offs, y)
-    elif OP == 24:
+    elif OP == 24:  # y where x is 0 (every other element), x elsewhere; out the old values
+        out = tl.atomic_cas(x_ptr + offs, x * 0 + (offs % 2 == 0).to(x.dtype) * x, y)
+    elif OP == 25:
         tl.device_print("x", x)
         out = x
-    elif OP == 25:
+    elif OP == 26:
         tl.device_assert(x == x, "x is not NaN")
         out = x
     else:

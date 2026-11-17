@@ -673,7 +673,8 @@ private:
       return success();
     }
     if (isa<arith::ExtSIOp, arith::ExtUIOp, arith::TruncIOp, arith::IndexCastOp>(op)) {
-      if (const Sym *s = get(op->getOperand(0))) {
+      // A mask cast to an integer is 0 or 1: data, not a predicate.
+      if (const Sym *s = get(op->getOperand(0)); s && s->kind != Sym::Mask) {
         Sym out = *s;
         out.shape = shapeOf(op->getResult(0).getType());
         syms[op->getResult(0)] = out;
@@ -752,7 +753,7 @@ private:
       return evalFor(f);
     if (auto i = dyn_cast<scf::IfOp>(op))
       return evalIf(i);
-    if (isa<tt::StoreOp, tt::AtomicRMWOp>(op))
+    if (isa<tt::StoreOp, tt::AtomicRMWOp, tt::AtomicCASOp>(op))
       executed.insert(op);
     return success();
   }
@@ -894,13 +895,25 @@ struct BufferInfo {
 /// The coordinate space a store defines. Each stored axis has a global index (the axis plus its tile
 /// origin in that instance) that is an expression of the view dims: one view dim for a linear axis, or
 /// the mixed-radix recombination of the view dims of its digits for an address built with div/mod.
-/// What writes a buffer: a store, or an atomic read-modify-write whose old value is unused (it then
-/// stores old (op) val).
+/// What writes a buffer: a store, an atomic read-modify-write (it stores old (op) val), or a compare
+/// and swap (val where old == cmp).
 struct Write {
   Operation *op;
-  Value getPtr() const { return isa<tt::StoreOp>(op) ? cast<tt::StoreOp>(op).getPtr() : cast<tt::AtomicRMWOp>(op).getPtr(); }
-  Value getValue() const { return isa<tt::StoreOp>(op) ? cast<tt::StoreOp>(op).getValue() : cast<tt::AtomicRMWOp>(op).getVal(); }
-  Value getMask() const { return isa<tt::StoreOp>(op) ? cast<tt::StoreOp>(op).getMask() : cast<tt::AtomicRMWOp>(op).getMask(); }
+  Value getPtr() const {
+    if (auto cas = dyn_cast<tt::AtomicCASOp>(op))
+      return cas.getPtr();
+    return isa<tt::StoreOp>(op) ? cast<tt::StoreOp>(op).getPtr() : cast<tt::AtomicRMWOp>(op).getPtr();
+  }
+  Value getValue() const {
+    if (auto cas = dyn_cast<tt::AtomicCASOp>(op))
+      return cas.getVal();
+    return isa<tt::StoreOp>(op) ? cast<tt::StoreOp>(op).getValue() : cast<tt::AtomicRMWOp>(op).getVal();
+  }
+  Value getMask() const {
+    if (isa<tt::AtomicCASOp>(op))
+      return Value();
+    return isa<tt::StoreOp>(op) ? cast<tt::StoreOp>(op).getMask() : cast<tt::AtomicRMWOp>(op).getMask();
+  }
   InFlightDiagnostic emitError(const Twine &message) const { return op->emitError(message); }
   Operation *getOperation() const { return op; }
   Operation *operator->() const { return op; }
@@ -909,8 +922,16 @@ struct Write {
 /// What reads a buffer: a load, or the old value an atomic read-modify-write returns.
 struct Read {
   Operation *op;
-  Value getPtr() const { return isa<tt::LoadOp>(op) ? cast<tt::LoadOp>(op).getPtr() : cast<tt::AtomicRMWOp>(op).getPtr(); }
-  Value getMask() const { return isa<tt::LoadOp>(op) ? cast<tt::LoadOp>(op).getMask() : cast<tt::AtomicRMWOp>(op).getMask(); }
+  Value getPtr() const {
+    if (auto cas = dyn_cast<tt::AtomicCASOp>(op))
+      return cas.getPtr();
+    return isa<tt::LoadOp>(op) ? cast<tt::LoadOp>(op).getPtr() : cast<tt::AtomicRMWOp>(op).getPtr();
+  }
+  Value getMask() const {
+    if (isa<tt::AtomicCASOp>(op))
+      return Value();
+    return isa<tt::LoadOp>(op) ? cast<tt::LoadOp>(op).getMask() : cast<tt::AtomicRMWOp>(op).getMask();
+  }
   Value getOther() const { return isa<tt::LoadOp>(op) ? cast<tt::LoadOp>(op).getOther() : Value(); }
   Type getType() const { return op->getResult(0).getType(); }
   InFlightDiagnostic emitError(const Twine &message) const { return op->emitError(message); }
@@ -2458,8 +2479,8 @@ FailureOr<Value> Raiser::emit(Gen &g, Value v, ArrayRef<Axis> env) {
     out = emit(g, t.getSrc(), senv);
   } else if (auto load = dyn_cast<tt::LoadOp>(def)) {
     out = emitLoad(g, Read{load}, env);
-  } else if (auto rmw = dyn_cast<tt::AtomicRMWOp>(def)) { // its old value: the buffer before it writes
-    out = emitLoad(g, Read{rmw}, env);
+  } else if (isa<tt::AtomicRMWOp, tt::AtomicCASOp>(def)) { // its old value: the buffer before it writes
+    out = emitLoad(g, Read{def}, env);
   } else if (auto j = dyn_cast<tt::JoinOp>(def)) { // a new last axis of 2: lhs at 0, rhs at 1
     SmallVector<Axis> senv(env.begin(), env.end() - 1);
     auto l = emit(g, j.getLhs(), senv), r = emit(g, j.getRhs(), senv);
@@ -3507,8 +3528,9 @@ LogicalResult Raiser::raiseStoreIn(Write store, const StoreSpace &spRef) {
   b.setInsertionPoint(anchor);
   SmallVector<int64_t> box(root.extent);
   auto rmw = dyn_cast<tt::AtomicRMWOp>(store.getOperation());
+  auto cas = dyn_cast<tt::AtomicCASOp>(store.getOperation());
   // An atomic, or a write whose mask depends on data, starts from what the box holds.
-  bool keepsOld = rmw || !sp->dataMask.empty();
+  bool keepsOld = rmw || cas || !sp->dataMask.empty();
   Value init = !keepsOld ? tensor::EmptyOp::create(b, loc, box, elem).getResult()
                : sp->full ? reshape(current[arg], sp->viewShape)
                           : tensor::ExtractSliceOp::create(b, loc, reshape(current[arg], sp->viewShape),
@@ -3565,6 +3587,17 @@ LogicalResult Raiser::raiseStoreIn(Write store, const StoreSpace &spRef) {
             break;
           case tt::RMWOp::XCHG:
             break;
+          }
+        }
+        if (cas) { // val where the old value's bits equal cmp's
+          auto cmp = emit(g, cas.getCmp(), env);
+          if (failed(cmp)) {
+            status = failure();
+          } else {
+            Type bits = ob.getIntegerType(vt.getIntOrFloatBitWidth());
+            auto asBits = [&](Value x) -> Value { return vt.isInteger() ? x : arith::BitcastOp::create(ob, loc, bits, x).getResult(); };
+            Value same = arith::CmpIOp::create(ob, loc, arith::CmpIPredicate::eq, asBits(old), asBits(*cmp));
+            out = arith::SelectOp::create(ob, loc, same, out, old);
           }
         }
         for (Value term : sp->dataMask) {
@@ -3721,7 +3754,7 @@ LogicalResult Raiser::run() {
   WalkResult walked = kernel.walk([&](Operation *op) {
     if (isa<tt::StoreOp>(op))
       stores.push_back({op});
-    if (isa<tt::AtomicRMWOp>(op) && !op->getParentOfType<scf::ForOp>())
+    if (isa<tt::AtomicRMWOp, tt::AtomicCASOp>(op) && !op->getParentOfType<scf::ForOp>())
       stores.push_back({op});
     else if (isa<tt::AtomicRMWOp, tt::AtomicCASOp>(op))
       return op->emitError("furiosa: only an atomic read-modify-write outside loops is raised"), WalkResult::interrupt();
@@ -3748,7 +3781,7 @@ LogicalResult Raiser::run() {
       writtenSet.insert(p->base);
     }
     for (auto &[key, instances] : byKey) {
-      if (!isa<tt::AtomicRMWOp>(st.getOperation())) {
+      if (!isa<tt::AtomicRMWOp, tt::AtomicCASOp>(st.getOperation())) {
         parts.push_back({st, instances});
         continue;
       }

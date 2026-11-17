@@ -21,7 +21,7 @@ DOTS = [(64, 64, 64), (16, 64, 32), (128, 256, 64)]
 EXTRA_DTYPES = {"reduce_or": ["int32"], "squeeze_ravel": ALL, "rand": ["float32"], "randn": ["float32"],
                 "randint": ["int32"], "rand4x": ["float32"], "randn4x": ["float32"], "randint4x": ["int32"],
                 "join": ALL, "split": ALL, "interleave": ALL, "cat": ALL, "swizzle2d": ["int32"],
-                "umulhi": ["int32"], "histogram": ["int32"], "maximum_nan": ["float32"],
+                "umulhi": ["int32"], "histogram": ["int32"], "maximum_nan": ["float32"], "atomic_cas_old": ["int32"],
                 "device_print": ["float32"], "device_assert": ["float32"], "range_loop": ["float32"]}
 
 
@@ -296,8 +296,10 @@ def _build_extra(case: Case, rows: int, c: int, dt: str, g):
         ref = torch.bincount(x.flatten().long(), minlength=c)[None, :].expand(rows, c)
     elif op == "maximum_nan":
         ref = torch.where(torch.arange(c)[None, :] < c // 2, torch.maximum(xs, ys), torch.fmax(xs, ys))
-    elif op in ("atomic_xchg_old", "atomic_add_old"):
-        refs["x_ptr"] = ys if op == "atomic_xchg_old" else xs + ys
+    elif op in ("atomic_xchg_old", "atomic_add_old", "atomic_cas_old"):
+        even = torch.from_numpy(offs % 2 == 0)
+        refs["x_ptr"] = {"atomic_xchg_old": ys, "atomic_add_old": xs + ys,
+                         "atomic_cas_old": torch.where(xs == xs * even, ys, xs)}[op]  # cmp: x on even offsets, else 0
         ref = xs
     else:  # range_loop
         ref = xs * 0 + 6
