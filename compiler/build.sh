@@ -7,5 +7,13 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 # Every core, as far as memory goes: an MLIR translation unit takes up to ~2 GB to compile.
 mem_jobs=$(( $(awk '/MemAvailable/ {print $2}' /proc/meminfo) / 2097152 ))
 jobs=$(( mem_jobs < $(nproc) ? mem_jobs : $(nproc) ))
-# Pending first: readers (compiler/with-build-lock.sh) queue behind a waiting build instead of starving it.
-exec flock "$root/build/.build.pending" flock "$root/build/.build.lock" "$root/compiler/.venv/bin/ninja" -C "$root/build/triton" -j "${MAX_JOBS:-$(( jobs > 0 ? jobs : 1 ))}" "$@"
+ninja=("$root/compiler/.venv/bin/ninja" -C "$root/build/triton" -j "${MAX_JOBS:-$(( jobs > 0 ? jobs : 1 ))}" "$@")
+# Ninja runs take turns in the one build directory (.ninja.lock). Relinking libtriton (target `triton`) also
+# waits for the processes that load it (compiler/with-build-lock.sh, .build.lock); the pending gate first, so
+# new readers queue behind a waiting build instead of starving it. Other targets (the opt tool) leave
+# libtriton.so alone and do not wait for readers.
+lock="$root/build"
+for target in "$@"; do
+  [ "$target" = triton ] && exec flock "$lock/.build.pending" flock "$lock/.build.lock" flock "$lock/.ninja.lock" "${ninja[@]}"
+done
+exec flock "$lock/.ninja.lock" "${ninja[@]}"
