@@ -738,8 +738,13 @@ private:
     }
     if (auto s = dyn_cast<arith::SelectOp>(op)) {
       const Sym *c = get(s.getCondition()), *t = get(s.getTrueValue()), *f = get(s.getFalseValue());
-      if (t && f && c && c->kind == Sym::Mask && c->conds.empty())
-        syms[s] = c->never ? *f : *t;
+      if (!t || !f || !c || c->kind != Sym::Mask)
+        return success();
+      // A condition the ranges decide (tl.where(offs < M, offs, 0) with offs below M in every tile).
+      bool always = !c->never && llvm::all_of(c->conds, [&](AffineExpr e) { return ranged(e, c->shape).second.lo >= 0; });
+      bool never = c->never || llvm::any_of(c->conds, [&](AffineExpr e) { return ranged(e, c->shape).second.hi < 0; });
+      if (always || never)
+        syms[s] = always ? *t : *f;
       return success();
     }
     if (auto f = dyn_cast<scf::ForOp>(op))

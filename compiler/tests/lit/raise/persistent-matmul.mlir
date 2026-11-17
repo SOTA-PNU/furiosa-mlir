@@ -1,15 +1,20 @@
-// RUN: furiosa-mlir-opt --furiosa-raise-to-linalg %s | FileCheck %s
+// RUN: furiosa-mlir-opt --furiosa-raise-to-linalg %s | FileCheck %s --implicit-check-not=arith.maxsi
+// RUN: furiosa-mlir-opt --furiosa-raise-to-linalg --furiosa-structure %s | FileCheck %s --check-prefix=STRUCT --implicit-check-not='tensor.extract %'
 
 // Triton tutorial 09's persistent matmul: 4 programs stride over the 16 output tiles in grouped order
 // (min(num_pid_m - first_pid_m, GROUP_SIZE_M) decided by the ranges of the tile loop; pid_n =
 // (tile_id mod 32) floordiv 4 resolved to the loop counter over its range), each tile a K loop of
 // masked dots, the store inside the tile loop. Raised, the schedule is gone: one contraction over the
-// 512x512 output (tile columns as their own dim) reducing over the 4 K tiles of 64.
+// 512x512 output (tile columns as their own dim) reducing over the 4 K tiles of 64. Its rows go through
+// tl.where(offs_am < M, offs_am, 0), which the ranges decide (every row is below M): no clamp, so the
+// reads structure into indexing maps of A and B.
 
 // CHECK-LABEL: func.func @matmul_kernel_persistent
 // CHECK: linalg.generic {{.*}}["parallel", "parallel", "parallel", "reduction", "reduction"]{{.*}} ins({{.*}} : tensor<4x64xi8>) outs({{.*}} : tensor<512x4x128xf32>)
 // CHECK: arith.mulf
 // CHECK: return {{.*}} : tensor<512x512xf16>
+
+// STRUCT: linalg.generic {{.*}} ins(%arg0, %arg1 : tensor<512x256xf16>, tensor<256x512xf16>)
 
 // Triton source: harness/cases/tutorial_persistent_matmul.py (M = N = 512, K = 256, 128x128x64 tiles).
 
