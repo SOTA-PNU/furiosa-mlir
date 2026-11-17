@@ -82,3 +82,4 @@ target/
 
 # Compiler build
 compiler/.venv/
+compiler/tests/lit/.lit_test_times.txt

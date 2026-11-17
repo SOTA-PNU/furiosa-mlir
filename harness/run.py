@@ -8,8 +8,10 @@ import argparse
 import fcntl
 import json
 import os
+import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -120,9 +122,9 @@ def compile_case(name: str) -> Result:
 
 
 def shared_target(crate: Path, npu: bool) -> str:
-    """One target dir per crate family and backend: dependencies build once. Binaries are run by the
-    hashed path cargo reports, never target/release/run_graph, so crates sharing it cannot collide
-    (every crate's binary is named run_graph; cargo#6313)."""
+    """One target dir per crate family and backend: dependencies build once. Binaries run from their
+    hashed deps/ path, never the shared target/release/run_graph (every crate's binary is named
+    run_graph; cargo#6313)."""
     return str(crate.parent.parent / "target" / ("npu" if npu else "cpu"))
 
 
@@ -130,13 +132,21 @@ def build_run_graph(crate: Path, npu: bool) -> tuple[str | None, str]:
     """Builds the crate's run_graph and returns its executable (or None and the build log)."""
     cmd = ["cargo", "furiosa-opt", "build"] if npu else ["cargo", "build"]
     cmd += ["--release", "--bin", "run_graph", "--message-format=json-render-diagnostics"]
-    code, log = sh(cmd, crate, cargo_env(shared_target(crate, npu), npu))
-    exe = None
-    for line in log.splitlines():
-        if line.startswith("{") and '"executable"' in line:
-            msg = json.loads(line)
-            if msg.get("executable") and msg.get("target", {}).get("name") == "run_graph":
-                exe = msg["executable"]
+    target = Path(shared_target(crate, npu))
+    target.mkdir(parents=True, exist_ok=True)
+    with open(target / ".harness.lock", "w") as lock:
+        # cargo uplifts every crate's binary to the same target/release/run_graph; resolve the per-crate
+        # deps/ binary it links to before another build relinks it.
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        code, log = sh(cmd, crate, cargo_env(str(target), npu))
+        exe = None
+        for line in log.splitlines():
+            if line.startswith("{") and '"executable"' in line:
+                msg = json.loads(line)
+                if msg.get("executable") and msg.get("target", {}).get("name") == "run_graph":
+                    uplifted = Path(msg["executable"])
+                    exe = str(next(p for p in (uplifted.parent / "deps").glob("run_graph-*")
+                                   if not p.suffix and p.stat().st_ino == uplifted.stat().st_ino))
     return (exe if code == 0 else None), log
 
 
@@ -153,9 +163,18 @@ def run_graphs(name: str, crate: Path, npu: bool, tol) -> Result:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.unlink(missing_ok=True)
         cmd = [exe, str(i), str(GOLDEN / name / str(i) / "inputs.safetensors"), str(out)]
+        trace = out.parent / "openat.trace"
+        if npu:  # record every device the run opens: the proof it ran on npu3
+            cmd = ["strace", "-f", "-qq", "-e", "trace=openat", "-o", str(trace)] + cmd
         code, log = sh(cmd, crate, cargo_env(shared_target(crate, npu), npu))
         if code != 0 or not out.exists():
             return Result("FAIL", f"graph {i}: run_graph exited {code}: {tail(log)}")
+        if npu:
+            text = trace.read_text()
+            opened = set(re.findall(r'"/dev/rngd/(npu\d+)', text))
+            if opened != {f"npu{NPU}"} or '"/dev/nvidia' in text:
+                return Result("FAIL", f"graph {i}: did not run on npu{NPU} alone (opened {sorted(opened) or 'no NPU'}"
+                                      f"{', a GPU' if '/dev/nvidia' in text else ''})")
         result = compare(out, GOLDEN / name / str(i) / "outputs.safetensors", tol)
         top1 = CASES[name].top1
         if result.status == "PASS" and top1:
@@ -226,16 +245,19 @@ def judge(name: str, level: str, impl: str) -> Result:
     if level == "L3":
         return run_graphs(name, crate, npu=False, tol=case.npu)
     if level == "L4":
-        if not npu_idle():
-            return Result("SKIP", f"npu{NPU} busy")
+        # L4 is the verdict: wait for npu3 rather than skip it.
+        for _ in range(180):
+            if npu_idle():
+                break
+            time.sleep(10)
+        else:
+            return Result("FAIL", f"npu{NPU} stayed busy for 30 min")
         return run_graphs(name, crate, npu=True, tol=case.npu)
     raise ValueError(level)
 
 
 def generality_violations() -> list:
     """Corpus kernel and case names that appear in compiler sources (see harness/README.md)."""
-    import re
-
     from tests.harness import load_model
 
     names = set(CASES) | {"resnet", "mobilenet", "qwen", "lenet", "alexnet", "vgg"}
@@ -259,6 +281,30 @@ def generality_violations() -> list:
     return hits
 
 
+# Product code that would run Triton anywhere but the NPU: another Triton target, another driver, CUDA.
+FALLBACK = re.compile(r'GPUTarget\(\s*"(cuda|hip)|TRITON_DEFAULT_BACKEND"\]\s*=\s*"(?!furiosa)|driver\.set_active|'
+                      r'torch\.cuda|\.cuda\(|device\s*=\s*"cuda"')
+
+
+def npu_only_violations() -> list:
+    """Ways the compiler could lower Triton to a CPU or GPU instead of the NPU (harness/README.md)."""
+    hits = []
+    for path in sorted((ROOT / "compiler").rglob("*")):
+        rel = path.relative_to(ROOT)
+        if path.suffix not in {".py", ".cpp", ".cc", ".h"} or rel.parts[1] in ("tests", ".venv") or "__pycache__" in rel.parts:
+            continue
+        for lineno, line in enumerate(path.read_text(errors="replace").splitlines(), 1):
+            if FALLBACK.search(line):
+                hits.append(f"{rel}:{lineno}: {line.strip()[:100]}")
+    if COMPILER_PY.exists():
+        probe = ("import triton; from furiosa_compiler.driver import TARGET; "
+                 "print(triton.runtime.driver.active.get_current_target().backend, TARGET.backend)")
+        code, log = sh(compiler_cmd("-c", probe), ROOT, compiler_env())
+        if log.strip().splitlines()[-1:] != ["furiosa furiosa"]:
+            hits.append(f"compiler venv: Triton's active backend / compile target is not furiosa: {tail(log)}")
+    return hits
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--impl", choices=["reference", "compiler"], default="reference")
@@ -278,6 +324,8 @@ def main():
             print("  " + hit)
     else:
         print("generality: PASS")
+    npu_hits = npu_only_violations() if args.impl == "compiler" else []
+    print("npu-only: " + ("FAIL\n  " + "\n  ".join(npu_hits) if npu_hits else "PASS"))
     unit_failed = False
     if args.impl == "compiler" and COMPILER_PY.exists():
         # Per-pass lit tests (compiler/tests/lit): seconds, and they name the pass that broke.
@@ -317,7 +365,7 @@ def main():
         if members:
             rates = [f"{lv} {sum(report[n][lv]['status'] == 'PASS' for n in members)}/{len(members)}" for lv in levels]
             print(f"{group:<8}  " + "  ".join(rates))
-    failed = bool(hits) or unit_failed or any(r["status"] == "FAIL" for levels_ in report.values() for r in levels_.values())
+    failed = bool(hits) or bool(npu_hits) or unit_failed or any(r["status"] == "FAIL" for levels_ in report.values() for r in levels_.values())
     sys.exit(1 if failed else 0)
 
 

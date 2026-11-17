@@ -99,6 +99,23 @@ The first writes the per-kernel stages, `graph.json` and the crate; the second e
 launches on the CPU with the raised kernels (L1) and prints one JSON line,
 `{"status": "PASS" | "FAIL", "detail": "..."}`.
 
+## NPU-only rule
+
+Triton code compiled by this compiler always lowers to the Furiosa NPU and runs there; the harness
+fails the run on any way around that:
+
+- `npu-only:` before the cases, it scans the compiler's product sources (not `compiler/tests/`) for
+  another Triton target (`GPUTarget("cuda"|"hip")`), another driver (`TRITON_DEFAULT_BACKEND` set to
+  anything but `furiosa`, `driver.set_active`), or CUDA (`torch.cuda`, `.cuda()`), and it checks in
+  the compiler venv that Triton's active backend and the driver's compile target are both `furiosa`.
+  There, `kernel[grid](...)` itself runs on the NPU (`compiler/furiosa_compiler/npu.py`).
+- L4 runs every graph under `strace` and passes only if the run opened `/dev/rngd/npu3*` and no other
+  NPU or GPU device; L4 waits for npu3 when it is busy (up to 30 min) instead of skipping, so a case
+  is judged on the NPU or fails.
+- L1 (raised IR on MLIR's CPU JIT) and L3 (furiosa-opt's CPU emulation of the same crate) are
+  checks of intermediate stages, never results; the GPU runs Triton only to record golden data,
+  in the harness venv, whose Triton has no Furiosa backend.
+
 ## Generality rules
 
 The compiler must handle Triton code it has never seen, so it may not recognise our corpus:
