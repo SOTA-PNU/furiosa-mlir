@@ -1616,72 +1616,24 @@ FailureOr<AffineExpr> Raiser::rewriteSymbolic(Operation *at, const Gen &g, Array
 /// consts[n] (one integer per instance) as beta + sum_k alpha_k * origin_k, with each origin rewritten
 /// in the generic's coordinates (least squares, then checked exactly).
 FailureOr<AffineExpr> Raiser::fitOrigins(Operation *at, const Gen &g, ArrayRef<int64_t> consts) {
-  unsigned nb = space->origin[0].size(), nv = nb + 1;
-  std::vector<std::vector<double>> a(nv, std::vector<double>(nv, 0.0));
-  std::vector<double> rhs(nv, 0.0);
-  // A basis element that is the same in every instance cannot be told from the constant; it stays out
-  // of the fit, so the constant absorbs it instead of a coefficient that only fits that one value.
-  SmallVector<bool> varies(nb, false);
-  for (unsigned k = 0; k < nb; ++k)
-    for (auto &o : space->origin)
-      varies[k] = varies[k] || o[k] != space->origin[0][k];
-  for (unsigned n = 0; n < act.size(); ++n) {
-    SmallVector<double> row;
-    for (auto [k, o] : llvm::enumerate(space->origin[n]))
-      row.push_back(varies[k] ? (double)o : 0.0);
-    row.push_back(1.0);
-    for (unsigned i = 0; i < nv; ++i) {
-      rhs[i] += row[i] * consts[n];
-      for (unsigned j = 0; j < nv; ++j)
-        a[i][j] += row[i] * row[j];
+  unsigned nb = space->origin[0].size();
+  auto fit = fitAffine(space->origin, consts);
+  if (!fit) {
+    std::string detail;
+    llvm::raw_string_ostream os(detail);
+    for (unsigned m = 0; m < std::min<unsigned>(act.size(), 4); ++m) {
+      os << " [" << consts[m] << " @";
+      for (int64_t o : space->origin[m])
+        os << " " << o;
+      os << "]";
     }
+    return at->emitError("furiosa: an address varies between program instances in a way the store "
+                         "tiles do not explain; constant @ origins:")
+               << detail,
+           failure();
   }
-  std::vector<double> x(nv, 0.0);
-  std::vector<int> pivot(nv, -1);
-  for (unsigned col = 0, row = 0; col < nv && row < nv; ++col) {
-    unsigned best = row;
-    for (unsigned r = row; r < nv; ++r)
-      if (std::abs(a[r][col]) > std::abs(a[best][col]))
-        best = r;
-    if (std::abs(a[best][col]) < 1e-9)
-      continue;
-    std::swap(a[best], a[row]);
-    std::swap(rhs[best], rhs[row]);
-    for (unsigned r = 0; r < nv; ++r)
-      if (r != row) {
-        double f = a[r][col] / a[row][col];
-        for (unsigned c = 0; c < nv; ++c)
-          a[r][c] -= f * a[row][c];
-        rhs[r] -= f * rhs[row];
-      }
-    pivot[col] = row++;
-  }
-  for (unsigned col = 0; col < nv; ++col)
-    if (pivot[col] >= 0)
-      x[col] = rhs[pivot[col]] / a[pivot[col]][col];
-  SmallVector<int64_t> alpha;
-  for (unsigned k = 0; k < nb; ++k)
-    alpha.push_back(std::llround(x[k]));
-  int64_t beta = std::llround(x[nb]);
-  for (unsigned n = 0; n < act.size(); ++n) {
-    int64_t val = beta;
-    for (unsigned k = 0; k < nb; ++k)
-      val += alpha[k] * space->origin[n][k];
-    if (val != consts[n]) {
-      std::string detail;
-      llvm::raw_string_ostream os(detail);
-      for (unsigned m = 0; m < std::min<unsigned>(act.size(), 4); ++m) {
-        os << " [" << consts[m] << " @";
-        for (int64_t o : space->origin[m])
-          os << " " << o;
-        os << "]";
-      }
-      return at->emitError("furiosa: an address varies between program instances in a way the store "
-                           "tiles do not explain; constant @ origins:")
-                 << detail,
-             failure();
-    }
-  }
+  ArrayRef<int64_t> alpha(*fit);
+  int64_t beta = alpha[nb];
   AffineExpr out = getAffineConstantExpr(beta, ctx);
   for (unsigned k = 0; k < nb; ++k)
     if (alpha[k]) {
