@@ -8,6 +8,10 @@ npu stage) against GPU goldens.
 
 - Normalization: reduction loops of extent 1 drop; `tl.umulhi` computed from 16-bit limbs (cae9784).
 - Binary package: a kernel launched from a script finds the package's pinned furiosa-opt tools (22f6ab7).
+- Selects keyed by a boolean combination of comparisons nest into selects keyed by one each: `tl.map_elementwise`'s
+  three-way compare on npu3 (0ab16b6).
+- A widened i1 is a select; a reduction no class maps reads its input broadcast over the loops it lacks:
+  `tl.histogram` on npu3 (ccb3f49).
 
 ## 1.1.0 (2026-11-17, release/1.1.0)
 
