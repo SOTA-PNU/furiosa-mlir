@@ -5,6 +5,7 @@
 """
 
 import argparse
+import fcntl
 import json
 import os
 import subprocess
@@ -46,7 +47,10 @@ def cargo_env(target: str, npu: bool) -> dict:
 
 
 def sh(cmd, cwd, env=None, timeout=3600):
-    proc = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
+    try:
+        proc = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return 124, f"timed out after {timeout}s"
     return proc.returncode, (proc.stdout + proc.stderr)
 
 
@@ -189,8 +193,8 @@ def judge(name: str, level: str, impl: str) -> Result:
                                "--rtol", str(tol.rtol), "--atol", str(tol.atol))
             code, log = sh(cmd, ROOT, compiler_env())
             try:
-                verdict = json.loads(log.strip().splitlines()[-1])
-            except (ValueError, IndexError):
+                verdict = json.loads(next(line for line in reversed(log.splitlines()) if line.startswith('{"status"')))
+            except (ValueError, StopIteration):
                 return Result("FAIL", f"{module} exited {code}: {tail(log)}")
             if verdict["status"] != "PASS":
                 kind = "per launch" if module.endswith("l1_launch") else "graph"
@@ -280,10 +284,13 @@ def main():
     print(f"{'case':<{width}}  " + "  ".join(levels))
     for name in names:
         report[name] = {}
-        for level in levels:
-            result = judge(name, level, args.impl)
-            report[name][level] = {"status": result.status, "detail": result.detail}
-            print(f"{name:<{width}}  {level}: {result.cell()}", flush=True)
+        (OUT / name).mkdir(parents=True, exist_ok=True)
+        with open(OUT / name / ".lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)  # concurrent runs of a case share its harness/out folder
+            for level in levels:
+                result = judge(name, level, args.impl)
+                report[name][level] = {"status": result.status, "detail": result.detail}
+                print(f"{name:<{width}}  {level}: {result.cell()}", flush=True)
     OUT.mkdir(parents=True, exist_ok=True)
     (OUT / "report.json").write_text(json.dumps({"impl": args.impl, "generality": hits, "results": report}, indent=2) + "\n")
 

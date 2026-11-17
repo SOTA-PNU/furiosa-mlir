@@ -34,8 +34,8 @@ def run(graph, tensors: dict, after_launch=None) -> dict:
         if tensor is None:
             if buf.kind in ("input", "weight"):
                 raise KeyError(f"missing {buf.kind} {buf.name}")
-            make = torch.zeros if buf.kind == "state" else torch.empty
-            tensors[buf.name] = make(buf.shape, dtype=dtype, device="cuda")
+            # Zeros, as L1 starts them: an element no kernel writes must not be leftover GPU memory.
+            tensors[buf.name] = torch.zeros(buf.shape, dtype=dtype, device="cuda")
         elif tuple(tensor.shape) != buf.shape or tensor.dtype != dtype or not tensor.is_cuda or not tensor.is_contiguous():
             raise ValueError(
                 f"{buf.name}: graph wants contiguous cuda {buf.dtype}{list(buf.shape)}, "
