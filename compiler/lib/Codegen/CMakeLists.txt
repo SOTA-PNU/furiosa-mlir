@@ -33,6 +33,7 @@ add_triton_library(FuriosaCodegen
     MLIRLinalgDialect
     MLIRLinalgTransforms
     MLIRMathDialect
+    MLIRMathTransforms
     MLIRParser
     MLIRPass
     MLIRSCFDialect

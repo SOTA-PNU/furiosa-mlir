@@ -10,6 +10,7 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/Math/Transforms/Passes.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/AffineExprVisitor.h"
 #include "mlir/IR/IRMapping.h"
@@ -17,6 +18,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/RegionUtils.h"
 
 #include <cmath>
@@ -748,15 +750,24 @@ void treeReductions(ModuleOp module) {
   }
 }
 
-/// Math ops the Vector Engine lacks, in ones it has: fma(a, b, c) = a*b + c (rounded twice), log2(x) =
-/// ln(x) * log2(e) (within the engine's ln ulp budget, not bit-exact), and floor/ceil from the nearest integer t
-/// (the engine converts to integers rounding to nearest): floor = t - (t > x), ceil = t + (t < x), exact for any
-/// integer t within 1 of x; values beyond 2^(mantissa bits) are integers already and pass through (the
-/// conversion would saturate).
+/// Math ops the Vector Engine lacks, in ones it has: asin, acos, atan and atan2 by MLIR's polynomial
+/// approximations (whose fma and copysign expand below), copysign(a, b) = b < 0 ? -|a| : |a|, fma(a, b, c) =
+/// a*b + c (rounded twice), log2(x) = ln(x) * log2(e) (within the engine's ln ulp budget, not bit-exact), and
+/// floor/ceil from the nearest integer t (the engine converts to integers rounding to nearest): floor =
+/// t - (t > x), ceil = t + (t < x), exact for any integer t within 1 of x; values beyond 2^(mantissa bits) are
+/// integers already and pass through (the conversion would saturate).
 void expandMath(ModuleOp module) {
+  RewritePatternSet approximations(module.getContext());
+  populateMathPolynomialApproximationPatterns(approximations, [](StringRef name) {
+    return llvm::is_contained({math::AsinOp::getOperationName(), math::AcosOp::getOperationName(),
+                               math::AtanOp::getOperationName(), math::Atan2Op::getOperationName()},
+                              name);
+  });
+  (void)applyPatternsGreedily(module, std::move(approximations));
   SmallVector<Operation *> ops;
   module.walk([&](Operation *op) {
-    if (isa<math::FmaOp, math::Log2Op, math::FloorOp, math::CeilOp>(op) && isa<FloatType>(op->getResult(0).getType()))
+    if (isa<math::FmaOp, math::Log2Op, math::FloorOp, math::CeilOp, math::CopySignOp>(op) &&
+        isa<FloatType>(op->getResult(0).getType()))
       ops.push_back(op);
   });
   for (Operation *op : ops) {
@@ -767,6 +778,12 @@ void expandMath(ModuleOp module) {
     Value v, x = op->getOperand(0);
     if (auto fma = dyn_cast<math::FmaOp>(op)) {
       v = arith::AddFOp::create(b, loc, arith::MulFOp::create(b, loc, fma.getA(), fma.getB()), fma.getC());
+    } else if (auto sign = dyn_cast<math::CopySignOp>(op)) {
+      // shortcut: the sign is b < 0, so b = -0 (or a NaN with its sign bit set) gives +|a|; compare the sign bit
+      // if such b matter.
+      Value mag = math::AbsFOp::create(b, loc, x);
+      Value neg = arith::CmpFOp::create(b, loc, arith::CmpFPredicate::OLT, sign.getRhs(), constant(0.0));
+      v = arith::SelectOp::create(b, loc, neg, arith::NegFOp::create(b, loc, mag), mag);
     } else if (isa<math::Log2Op>(op)) {
       v = arith::MulFOp::create(b, loc, math::LogOp::create(b, loc, x), constant(1.4426950408889634));
     } else {
