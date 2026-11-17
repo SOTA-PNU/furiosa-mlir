@@ -139,11 +139,15 @@ The compiler must handle Triton code it has never seen, so it may not recognise 
 
 The model corpus says whether whole networks run; the operator matrix says which Triton operators,
 dtypes and shapes do, case by case. It follows SOTA-PNU/lowlevel-api-test (default shape [1, 64, 64],
-floats `allclose(rtol=1e-2, atol=1e-2)`, integers exact): 791 cases over
+floats `allclose(rtol=1e-2, atol=1e-2)`, integers exact): 903 cases over
 
 - operators: unary math (abs ... sqrt_rn), binary arithmetic, reductions (sum, max, min, argmax, argmin,
   xor_sum), scans and orderings (cumsum, cumprod, flip, sort, softmax), casts and constructors, shape ops
   (trans, reshape, expand_dims, broadcast_to, permute), tl.dot, tensor descriptors, data-masked stores, program ids, atomics (add/max/min/and/or/xor);
+- and the rest of lowlevel-api-test's list (group `extra`): reduce_or, topk, map_elementwise, squeeze/ravel,
+  broadcast, rand/randn/randint (and 4x; checked against an exact NumPy Philox), associative_scan, join, split,
+  interleave, cat, swizzle2d, umulhi, gather, histogram, NaN-propagating maximum, atomics whose old value is used
+  (add, xchg, cas), device_print/assert, tl.range loops (inline_asm_elementwise is GPU assembly: not applicable);
 - dtypes: float32, float16, bfloat16, int32, int8 (float8_e4m3fn for dot); fp16/bf16 math functions
   compute in fp32, as Triton requires;
 - shapes [B, R, C]: [1, 64, 64], [1, 1, 1024], [4, 32, 128], [2, 7, 33] (masked), [1, 256, 256]; dot
@@ -156,8 +160,7 @@ compiler/.venv/bin/python -m harness.ops.case reduce.argmax.int8.2x7x33 --stage 
 ```
 
 Each run writes `harness/out/ops/<stage>.{json,md}`: an operator x dtype table and the failures grouped
-by the compiler's diagnostic. At the raise stage (raised IR on the CPU JIT) all 791 cases pass; the npu
-stage is the verdict.
+by the compiler's diagnostic. At the raise stage (raised IR on the CPU JIT) the first 791 cases pass; the npu stage is the verdict.
 
 ## Running
 
