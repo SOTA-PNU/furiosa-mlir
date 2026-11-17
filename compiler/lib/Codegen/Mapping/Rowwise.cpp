@@ -4,7 +4,9 @@
 // Vector Engine then evaluates it in passes:
 //
 //  - Layout: one row per slice (padded to 256), a row's H columns in time x packet. More than 256 rows run as
-//    row tiles of up to 256, each read from and written to an HBM tile view of the buffers.
+//    row tiles of up to 256, each read from and written to an HBM tile view of the buffers. A row length that is
+//    not a multiple of 16 pads to one (whole packets): rows cross between HBM and DM through a padded scratch, a
+//    reduction's float input padded with its identity.
 //  - A pass streams one Full (or Row) tensor through a path of ops whose other operands are immediates, VRF
 //    tensors (Col inputs, materialized Row values, or a second Full tensor, a row per slice) or the stream
 //    itself (stash, for x * x).
@@ -732,7 +734,9 @@ private:
   MLIRContext *ctx;
   SmallVector<std::pair<int, MapAttr>> rowAxes; // (row dim, axis), outermost first; dim -1: the single row
   int64_t inner = 1;                             // rows inside the outermost row axis
-  MapAttr H, slice;
+  MapAttr H, slice; // H: the column axis, padded to whole packets
+  MapAttr columns;   // the columns HBM holds (H resized to them)
+  std::map<int, float> padFill; // padded rows: input node -> the identity of the reduction that reads it
   std::map<int, Value> materialized; // node -> DmTensor (Full: [slice, H], Row: [slice, 1 # 8])
   std::map<int, Value> vrfs;         // node -> VrfTensor
   std::map<int, unsigned> params;    // input node -> kernel parameter
@@ -745,12 +749,16 @@ private:
   MapAttr inputMap(const Node &n);
   /// The HBM mapping of an output: every row axis, then the column axis (none for row values, one f32 a row).
   MapAttr outMap(bool row = false);
-  /// A row value's f32 padded to 8 bytes, the unit DM moves: how row values cross between HBM and DM (through a
-  /// padded HBM scratch, byte-granular HBM-to-HBM copies on either side).
-  MapAttr padded(MapAttr rows) { return MapAttr::pair(ctx, {rows, rowPacket(2)}); }
+  /// The HBM scratch a value crosses between HBM and DM through when the DMA, which moves 8-byte units, cannot
+  /// move it as the view holds it: a row value (its f32 padded to 8 bytes) or rows padded to whole packets. The
+  /// view's rows (a tile's padding dropped), then the DM element; byte-granular HBM-to-HBM copies fill and drain
+  /// it. Null when the view moves directly.
+  MapAttr scratchMap(MapAttr viewMap, bool col);
+  /// The columns of a padded scratch's view (of mapping `staged`), the part a copy to or from HBM moves.
+  Value interior(Value scratchView, MapAttr staged, bool mut);
   /// The DM element of an input: the columns, or a row value's padded f32.
   MapAttr inputElement(const Node &n) { return n.col ? H : rowPacket(2); }
-  /// An input's DmTensor from (a view of) its HBM tensor; a row value goes through a padded scratch.
+  /// An input's DmTensor from (a view of) its HBM tensor, through a padded scratch when it needs one.
   Value loadInput(const Node &n, Value hbmView, MapAttr viewMap);
   /// Writes a stored root's DmTensor to (a mutable view of) its HBM tensor; a row value goes through a padded
   /// scratch.
@@ -795,9 +803,9 @@ FailureOr<Value> Planner::vrfOf(int node, func::FuncOp func) {
     if (n.shape == Shape::Col && n.kind != Node::Input)
       return fail(func, "a column value other than an input (computing over columns alone is not mapped)"),
              failure();
-    if (vrfBytes + dag.h * 4 > kVrfBytes)
-      return fail(func, "VRF operands of ") << dag.h << " f32 per slice exceed the 8 KB VRF", failure();
-    vrfBytes += dag.h * 4;
+    if (vrfBytes + H.size() * 4 > kVrfBytes)
+      return fail(func, "VRF operands of ") << H.size() << " f32 per slice exceed the 8 KB VRF", failure();
+    vrfBytes += H.size() * 4;
     FailureOr<Value> dm = n.kind == Node::Input ? FailureOr<Value>(inputDm.at(node)) : materialize(node, func);
     if (failed(dm))
       return failure();
@@ -1340,15 +1348,29 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
 }
 
 LogicalResult Planner::declare(func::FuncOp func, ArrayRef<int64_t> written) {
-  if (dag.h % 16 && dag.h != 1)
-    return fail(func, "a row length that is not a multiple of 16");
+  // Rows move in packets of 8 f32 (16 bf16): a row length that is not a multiple of 16 pads to one. Copies move and
+  // stores write the columns alone, so only a reduction reads the padding: a float input it reduces directly pads
+  // with the reduction's identity.
+  bool pad = dag.h % 16 && dag.h != 1;
+  for (const Node &n : dag.nodes) {
+    if (!pad || n.kind != Node::Reduce)
+      continue;
+    int in = n.args[0];
+    float id = n.op == "Add" ? 0.0f : n.op == "Max" ? -INFINITY : INFINITY;
+    // shortcut: i32 reductions and reductions of computed values over padded rows are refused (an i32 fill needs an
+    // i32 memset; a computed value's padding is not its input's); pad those with a masked stream when a case needs it.
+    if (n.integer || dag.nodes[in].kind != Node::Input || (padFill.count(in) && padFill[in] != id))
+      return fail(func, "a reduction over padded rows of a value other than a float input");
+    padFill[in] = id;
+  }
   // A row axis per row dim of more than one row (a single row keeps one axis of one), and the column axis.
   for (auto [i, extent] : llvm::enumerate(dag.rowExtents))
     if (extent != 1)
       rowAxes.push_back({int(i), kb.axis(rowAxes.empty() ? "R" : "R" + std::to_string(rowAxes.size()), extent)});
   if (rowAxes.empty())
     rowAxes.push_back({-1, kb.axis("R", 1)});
-  H = kb.axis("H", dag.h);
+  H = kb.axis("H", pad ? (dag.h + 15) / 16 * 16 : dag.h);
+  columns = pad ? H.resize(dag.h) : H;
   inner = dag.r / rowAxes.front().second.size();
   if (kSlices % inner && inner * rowAxes.front().second.size() != kSlices)
     return fail(func, "rows inside the outermost row dim (") << inner << ") do not divide the 256 slices";
@@ -1408,7 +1430,7 @@ MapAttr Planner::inputMap(const Node &n) {
     if (d >= 0 && (n.rows >> d) & 1)
       parts.push_back(axis);
   if (n.col)
-    parts.push_back(H);
+    parts.push_back(columns);
   return MapAttr::pair(ctx, parts);
 }
 
@@ -1416,38 +1438,60 @@ Value Planner::loadInput(const Node &n, Value hbmView, MapAttr viewMap) {
   OpBuilder &b = kb.builder();
   Location loc = kb.loc();
   DmTensorType dm = kb.dmType(n.type, slice, inputElement(n));
-  if (n.col)
+  MapAttr staged = scratchMap(viewMap, n.col);
+  if (!staged)
     return ViewToDmOp::create(b, loc, dm, hbmView);
-  // The live rows of the view: its mapping with any padding of a tile dropped.
+  Value scratch = AllocHbmOp::create(b, loc, kb.hbmType(n.type, staged));
+  Value into = ViewOp::create(b, loc, HbmViewType::get(ctx, n.type, kb.chip(), staged, true), scratch);
+  if (auto it = padFill.find(&n - dag.nodes.data()); it != padFill.end()) {
+    // Eight bytes of the fill, broadcast by the DMA over the scratch; the copy then writes the columns.
+    Value fill =
+        AllocDmOp::create(b, loc, kb.dmType(n.type, kb.one().padTo(kSlices), rowPacket(n.type.isBF16() ? 4 : 2)));
+    MemsetOp::create(b, loc, fill, b.getF32FloatAttr(it->second));
+    DmToHbmViewOp::create(b, loc, fill, ViewOp::create(b, loc, into.getType(), scratch));
+  }
+  HbmToHbmViewOp::create(b, loc, hbmView, n.col ? interior(into, staged, true) : into);
+  return ToDmOp::create(b, loc, dm, scratch);
+}
+
+Value Planner::interior(Value scratchView, MapAttr staged, bool mut) {
+  SmallVector<MapAttr> parts;
+  for (Attribute a : staged.getKind() == MapKind::Pair ? staged.getOperands() : ArrayRef<Attribute>(staged))
+    parts.push_back(cast<MapAttr>(a));
+  parts.back() = columns.padTo(H.size(), mut ? PadKind::Bottom : PadKind::Top);
+  auto t = cast<HbmViewType>(scratchView.getType());
+  return TileOp::create(kb.builder(), kb.loc(),
+                        HbmViewType::get(ctx, t.getElementType(), t.getChip(), MapAttr::pair(ctx, parts), mut),
+                        scratchView, H, kb.builder().getI64IntegerAttr(columns.size()),
+                        kb.builder().getI64IntegerAttr(0));
+}
+
+MapAttr Planner::scratchMap(MapAttr viewMap, bool col) {
+  if (col && H == columns)
+    return {};
   SmallVector<MapAttr> live;
   for (Attribute a : viewMap.getKind() == MapKind::Pair ? viewMap.getOperands() : ArrayRef<Attribute>(viewMap)) {
     MapAttr m = cast<MapAttr>(a);
     live.push_back(m.getKind() == MapKind::Pad ? m.operand(0) : m);
   }
-  MapAttr rows = MapAttr::pair(ctx, live);
-  Value scratch = AllocHbmOp::create(b, loc, kb.hbmType(n.type, padded(rows)));
-  Value into = ViewOp::create(b, loc, HbmViewType::get(ctx, n.type, kb.chip(), padded(rows), true), scratch);
-  HbmToHbmViewOp::create(b, loc, hbmView, into);
-  return ToDmOp::create(b, loc, dm, scratch);
+  if (col)
+    live.pop_back(); // the columns, whole packets in the scratch
+  live.push_back(col ? H : rowPacket(2));
+  return MapAttr::pair(ctx, live);
 }
 
 void Planner::storeOutput(size_t k, Value dm, Value hbmView, MapAttr viewMap) {
   OpBuilder &b = kb.builder();
   Location loc = kb.loc();
   Type et = dag.outTypes[k];
-  if (!rootRow(k)) {
+  MapAttr staged = scratchMap(viewMap, !rootRow(k));
+  if (!staged) {
     DmToHbmViewOp::create(b, loc, dm, hbmView);
     return;
   }
-  SmallVector<MapAttr> live;
-  for (Attribute a : viewMap.getKind() == MapKind::Pair ? viewMap.getOperands() : ArrayRef<Attribute>(viewMap)) {
-    MapAttr m = cast<MapAttr>(a);
-    live.push_back(m.getKind() == MapKind::Pad ? m.operand(0) : m);
-  }
-  MapAttr rows = MapAttr::pair(ctx, live);
-  Value scratch = ToHbmOp::create(b, loc, kb.hbmType(et, padded(rows)), dm);
-  Value from = ViewOp::create(b, loc, HbmViewType::get(ctx, et, kb.chip(), padded(rows), false), scratch);
-  HbmToHbmViewOp::create(b, loc, from, hbmView);
+  Value scratch = ToHbmOp::create(b, loc, kb.hbmType(et, staged), dm);
+  Value from = ViewOp::create(b, loc, HbmViewType::get(ctx, et, kb.chip(), staged, false), scratch);
+  HbmToHbmViewOp::create(b, loc, rootRow(k) ? from : interior(from, staged, false), hbmView);
 }
 
 MapAttr Planner::outMap(bool row) {
@@ -1455,7 +1499,7 @@ MapAttr Planner::outMap(bool row) {
   for (auto &[d, axis] : rowAxes)
     parts.push_back(axis);
   if (!row)
-    parts.push_back(H);
+    parts.push_back(columns);
   return MapAttr::pair(ctx, parts);
 }
 
@@ -1547,9 +1591,9 @@ FailureOr<SmallVector<Value>> Planner::emitTile(func::FuncOp func) {
       return failure();
     if (tiled()) {
       outs[k] = *out;
-    } else if (rootRow(k)) {
-      // A fresh dense buffer of row values, through the padded scratch.
-      MapAttr rows = outMap(true);
+    } else if (rootRow(k) || H != columns) {
+      // A fresh dense buffer of row values or padded rows, through the padded scratch.
+      MapAttr rows = outMap(rootRow(k));
       outs[k] = AllocHbmOp::create(b, loc, kb.hbmType(dag.outTypes[k], rows));
       storeOutput(k, *out, ViewOp::create(b, loc, HbmViewType::get(ctx, dag.outTypes[k], kb.chip(), rows, true), outs[k]),
                   rows);
