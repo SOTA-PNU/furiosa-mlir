@@ -156,45 +156,57 @@ void widenF16(func::FuncOp func) {
   func.setType(FunctionType::get(func.getContext(), func.getBody().getArgumentTypes(), results));
 }
 
-/// int8 buffers live as i32 on the device (the Vector Engine computes on 32-bit lanes; I8 converts at the graph
-/// boundary): the kernel's i8 tensors, scalars and constants become i32 holding the same values. An op whose int8
-/// result can leave the int8 range wraps back into it, (v << 24) >> 24; a sign extension from int8 vanishes, a
-/// truncation to int8 is the wrap, and unsigned reads of an int8 (zero extension, unsigned compares and shifts,
-/// uitofp) take its low byte.
-void widenI8(func::FuncOp func) {
+/// int8 and int16 values live as i32 on the device (the Vector Engine computes on 32-bit lanes; I8 converts at the
+/// graph boundary): the kernel's i8 and i16 tensors, scalars and constants become i32 holding the same values. An op
+/// whose w-bit result can leave its range wraps back into it, (v << (32 - w)) >> (32 - w); a sign extension from a
+/// narrow integer vanishes, a truncation to one is the wrap, and unsigned reads (zero extension, unsigned compares
+/// and shifts, uitofp) take its low w bits. A bf16's bits as an i16 (tl.flip's bitcast) are those of the f32 it
+/// widens to, >> 16, and an i16's as a bf16 are << 16: exact, a bf16 being an f32's high half. (An f16 lives as
+/// f32, whose bits are not the f16's: its bitcasts stay unmapped.)
+void widenNarrowInts(func::FuncOp func) {
   MLIRContext *ctx = func.getContext();
   Type i32 = IntegerType::get(ctx, 32);
-  auto isI8 = [](Value v) { return getElementTypeOrSelf(v.getType()).isInteger(8); };
-  auto widen = [&](Type t) -> Type {
-    if (t.isInteger(8))
-      return i32;
-    if (auto rt = dyn_cast<RankedTensorType>(t); rt && rt.getElementType().isInteger(8))
-      return rt.clone(i32);
-    return t;
+  auto width = [](Type t) -> unsigned {
+    t = getElementTypeOrSelf(t);
+    return t.isInteger(8) || t.isInteger(16) ? t.getIntOrFloatBitWidth() : 0;
   };
-  // What to fix once retyped, decided on the int8 types.
-  SmallVector<Operation *> wraps, extends, bytes;
+  auto narrow = [&](Value v) { return width(v.getType()); };
+  auto widen = [&](Type t) -> Type {
+    if (!width(t))
+      return t;
+    if (auto rt = dyn_cast<RankedTensorType>(t))
+      return rt.clone(i32);
+    return i32;
+  };
+  // What to fix once retyped, decided on the narrow types (with each one's width).
+  SmallVector<std::pair<Operation *, unsigned>> wraps, extends, lows;
+  SmallVector<arith::BitcastOp> bitcasts;
   bool any = false;
   func.walk([&](Operation *op) {
     for (Value v : op->getResults())
-      any |= isI8(v);
+      any |= narrow(v) != 0;
     for (Region &r : op->getRegions())
       for (Block &b : r)
         for (BlockArgument a : b.getArguments())
-          any |= isI8(a);
-    bool i8Result = op->getNumResults() == 1 && isI8(op->getResult(0));
-    if (i8Result && isa<arith::AddIOp, arith::SubIOp, arith::MulIOp, arith::ShLIOp, math::AbsIOp, arith::DivSIOp,
-                        arith::CeilDivSIOp, arith::FloorDivSIOp, arith::TruncIOp, arith::FPToSIOp, arith::ShRUIOp>(op))
-      wraps.push_back(op);
-    if (isa<arith::ExtSIOp, arith::ExtUIOp>(op) && isI8(op->getOperand(0)))
-      extends.push_back(op);
+          any |= narrow(a) != 0;
+    unsigned w = op->getNumResults() == 1 ? narrow(op->getResult(0)) : 0;
+    if (w && isa<arith::AddIOp, arith::SubIOp, arith::MulIOp, arith::ShLIOp, math::AbsIOp, arith::DivSIOp,
+                 arith::CeilDivSIOp, arith::FloorDivSIOp, arith::TruncIOp, arith::FPToSIOp, arith::ShRUIOp>(op))
+      wraps.push_back({op, w});
+    if (isa<arith::ExtSIOp, arith::ExtUIOp>(op) && narrow(op->getOperand(0)))
+      extends.push_back({op, narrow(op->getOperand(0))});
     auto cmp = dyn_cast<arith::CmpIOp>(op);
-    bool unsignedCmp = cmp && isI8(cmp.getLhs()) && cmp.getPredicate() >= arith::CmpIPredicate::ult;
-    if (unsignedCmp || (isa<arith::ShRUIOp, arith::UIToFPOp>(op) && isI8(op->getOperand(0))))
-      bytes.push_back(op);
+    if (cmp && narrow(cmp.getLhs()) && cmp.getPredicate() >= arith::CmpIPredicate::ult)
+      lows.push_back({op, narrow(cmp.getLhs())});
+    if (isa<arith::ShRUIOp, arith::UIToFPOp>(op) && narrow(op->getOperand(0)))
+      lows.push_back({op, narrow(op->getOperand(0))});
+    if (auto c = dyn_cast<arith::BitcastOp>(op);
+        c && ((c.getIn().getType().isBF16() && c.getType().isInteger(16)) ||
+              (c.getIn().getType().isInteger(16) && c.getType().isBF16())))
+      bitcasts.push_back(c);
   });
   for (BlockArgument a : func.getArguments())
-    any |= isI8(a);
+    any |= narrow(a) != 0;
   if (!any)
     return;
   func.walk([&](Operation *op) {
@@ -205,25 +217,26 @@ void widenI8(func::FuncOp func) {
     for (Value v : op->getResults())
       v.setType(widen(v.getType()));
     if (auto c = dyn_cast<arith::ConstantOp>(op)) {
-      if (auto ia = dyn_cast<IntegerAttr>(c.getValue()); ia && ia.getType().isInteger(8))
+      if (auto ia = dyn_cast<IntegerAttr>(c.getValue()); ia && width(ia.getType()))
         c.setValueAttr(IntegerAttr::get(i32, ia.getValue().sext(32)));
-      if (auto da = dyn_cast<DenseIntElementsAttr>(c.getValue()); da && da.getElementType().isInteger(8))
+      if (auto da = dyn_cast<DenseIntElementsAttr>(c.getValue()); da && width(da.getElementType()))
         c.setValueAttr(da.mapValues(i32, [](const APInt &v) { return v.sext(32); }));
     }
   });
   auto constant = [&](OpBuilder &b, Location loc, int64_t v) { return arith::ConstantIntOp::create(b, loc, i32, v); };
-  // The low byte of an operand, for the unsigned reads.
-  for (Operation *op : bytes) {
+  // The low w bits of an operand, for the unsigned reads.
+  for (auto [op, w] : lows) {
     OpBuilder b(op);
     unsigned n = isa<arith::CmpIOp>(op) ? 2 : 1;
     for (unsigned i = 0; i < n; ++i)
-      op->setOperand(i, arith::AndIOp::create(b, op->getLoc(), op->getOperand(i), constant(b, op->getLoc(), 255)));
+      op->setOperand(i, arith::AndIOp::create(b, op->getLoc(), op->getOperand(i),
+                                              constant(b, op->getLoc(), (int64_t(1) << w) - 1)));
   }
-  for (Operation *op : extends) {
+  for (auto [op, w] : extends) {
     OpBuilder b(op);
     Value x = op->getOperand(0);
     if (isa<arith::ExtUIOp>(op))
-      x = arith::AndIOp::create(b, op->getLoc(), x, constant(b, op->getLoc(), 255));
+      x = arith::AndIOp::create(b, op->getLoc(), x, constant(b, op->getLoc(), (int64_t(1) << w) - 1));
     Type to = op->getResult(0).getType();
     if (to != i32)
       x = isa<arith::ExtUIOp>(op) ? arith::ExtUIOp::create(b, op->getLoc(), to, x).getResult()
@@ -231,25 +244,40 @@ void widenI8(func::FuncOp func) {
     op->getResult(0).replaceAllUsesWith(x);
     op->erase();
   }
-  for (Operation *op : wraps) {
+  for (auto [op, w] : wraps) {
     OpBuilder b(op);
     Location loc = op->getLoc();
     Value v = op->getResult(0);
     if (auto t = dyn_cast<arith::TruncIOp>(op)) {
-      // From wider than i32: truncate to i32 first; from i32 (an int8 source already widened): just wrap.
+      // From wider than i32: truncate to i32 first; from i32 (a narrow source already widened): just wrap.
       b.setInsertionPoint(op);
       v = t.getIn().getType() == i32 ? t.getIn() : arith::TruncIOp::create(b, loc, i32, t.getIn()).getResult();
     } else {
       b.setInsertionPointAfter(op);
     }
-    Value c24 = constant(b, loc, 24);
-    Value wrapped = arith::ShRSIOp::create(b, loc, arith::ShLIOp::create(b, loc, v, c24), c24);
+    Value shift = constant(b, loc, 32 - w);
+    Value wrapped = arith::ShRSIOp::create(b, loc, arith::ShLIOp::create(b, loc, v, shift), shift);
     if (isa<arith::TruncIOp>(op)) {
       op->getResult(0).replaceAllUsesWith(wrapped);
       op->erase();
     } else {
       v.replaceAllUsesExcept(wrapped, wrapped.getDefiningOp()->getOperand(0).getDefiningOp());
     }
+  }
+  for (arith::BitcastOp c : bitcasts) {
+    OpBuilder b(c);
+    Location loc = c.getLoc();
+    Type f32 = Float32Type::get(ctx);
+    Value sixteen = constant(b, loc, 16), r;
+    if (c.getIn().getType().isBF16()) {
+      Value bits = arith::BitcastOp::create(b, loc, i32, arith::ExtFOp::create(b, loc, f32, c.getIn()));
+      r = arith::ShRSIOp::create(b, loc, bits, sixteen);
+    } else {
+      Value high = arith::BitcastOp::create(b, loc, f32, arith::ShLIOp::create(b, loc, c.getIn(), sixteen));
+      r = arith::TruncFOp::create(b, loc, c.getType(), high);
+    }
+    c.getResult().replaceAllUsesWith(r);
+    c.erase();
   }
   SmallVector<Type> results = llvm::map_to_vector(func.getResultTypes(), widen);
   func.setType(FunctionType::get(ctx, func.getBody().getArgumentTypes(), results));
@@ -284,7 +312,7 @@ bool mapping::mapsOnCopy(func::FuncOp func, const OpClass &c) {
   auto copy = cast<func::FuncOp>(func->clone());
   scratch->push_back(copy);
   widenF16(copy);
-  widenI8(copy);
+  widenNarrowInts(copy);
   ScopedDiagnosticHandler quiet(func.getContext(), [](Diagnostic &) { return success(); });
   RaisedKernel raised = raisedKernel(copy);
   if (!c.match(raised) || failed(c.map(raised)))
@@ -296,7 +324,7 @@ bool mapping::mapsOnCopy(func::FuncOp func, const OpClass &c) {
 
 LogicalResult mapping::mapKernel(func::FuncOp func) {
   widenF16(func);
-  widenI8(func);
+  widenNarrowInts(func);
   RaisedKernel kernel = raisedKernel(func);
   SmallVector<const OpClass *> matching;
   for (const OpClass &c : opClasses())

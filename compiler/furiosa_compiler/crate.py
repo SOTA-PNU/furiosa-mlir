@@ -21,7 +21,7 @@ from triton._C.libtriton import furiosa
 # fp16 buffers live as f32 on the device (furiosa-opt has no f16), int8 ones as i32 (the Vector Engine computes on
 # 32-bit lanes); both convert at the graph boundary.
 RUST_DTYPES = {"fp32": "f32", "bf16": "bf16", "i32": "i32", "fp16": "f32", "i8": "i32"}
-MLIR_DTYPES = {"f32": "f32", "bf16": "bf16", "i32": "i32", "f16": "f32", "i8": "i32"}  # element types of step temporaries
+MLIR_DTYPES = {"f32": "f32", "bf16": "bf16", "i32": "i32", "f16": "f32", "i8": "i32", "i16": "i32"}  # element types of step temporaries
 ELEMENT_BYTES = {"fp32": 4, "bf16": 2, "i32": 4}
 
 CARGO_TOML = """\
