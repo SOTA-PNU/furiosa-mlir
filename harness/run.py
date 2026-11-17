@@ -12,6 +12,8 @@ import re
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,6 +23,9 @@ from safetensors.torch import load_file
 from harness.golden import GOLDEN
 from harness.registry import CASES
 from tests.harness import ROOT
+
+sys.path.insert(0, str(ROOT / "compiler"))
+from furiosa_compiler.locks import SLOTS, npu_lock, target_slot  # noqa: E402 - dependency-free
 
 LEVELS = ["L0", "L1", "L2a", "L2", "L3", "L4"]
 OUT = ROOT / "harness" / "out"
@@ -38,8 +43,8 @@ class Result:
         return self.status if not self.detail else f"{self.status} ({self.detail})"
 
 
-def cargo_env(target: str, npu: bool) -> dict:
-    env = dict(os.environ, CARGO_TARGET_DIR=target)
+def cargo_env(target: str | None, npu: bool) -> dict:
+    env = dict(os.environ, **({"CARGO_TARGET_DIR": target} if target else {}))
     env["PATH"] = f"{TOOLS}:{env['PATH']}"
     if not Path("/usr/lib/x86_64-linux-gnu/libclang.so").exists() and Path("/usr/lib/llvm-18/lib").exists():
         env.setdefault("LIBCLANG_PATH", "/usr/lib/llvm-18/lib")
@@ -121,23 +126,14 @@ def compile_case(name: str) -> Result:
     return _compiled[name]
 
 
-def shared_target(crate: Path, npu: bool) -> str:
-    """One target dir per crate family and backend: dependencies build once. Binaries run from their
-    hashed deps/ path, never the shared target/release/run_graph (every crate's binary is named
-    run_graph; cargo#6313)."""
-    return str(crate.parent.parent / "target" / ("npu" if npu else "cpu"))
-
-
 def build_run_graph(crate: Path, npu: bool) -> tuple[str | None, str]:
     """Builds the crate's run_graph and returns its executable (or None and the build log)."""
     cmd = ["cargo", "furiosa-opt", "build"] if npu else ["cargo", "build"]
     cmd += ["--release", "--bin", "run_graph", "--message-format=json-render-diagnostics"]
-    target = Path(shared_target(crate, npu))
-    target.mkdir(parents=True, exist_ok=True)
-    with open(target / ".harness.lock", "w") as lock:
-        # cargo uplifts every crate's binary to the same target/release/run_graph; resolve the per-crate
-        # deps/ binary it links to before another build relinks it.
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    # A few builds at once, each in a target slot whose dependencies are built (harness/README.md). Binaries
+    # run from their hashed deps/ path, never target/release/run_graph: every crate's binary has that name
+    # (cargo#6313), so resolve it before another build in the slot relinks it.
+    with target_slot(OUT / "target" / ("npu" if npu else "cpu"), crate) as target:
         code, log = sh(cmd, crate, cargo_env(str(target), npu))
         exe = None
         for line in log.splitlines():
@@ -157,34 +153,42 @@ def run_graphs(name: str, crate: Path, npu: bool, tol) -> Result:
     if not exe:
         return Result("FAIL", f"build: {tail(log)}")
     worst = []
-    for graph in meta["graphs"]:
-        i = graph["index"]
-        out = OUT / name / ("npu" if npu else "cpu") / str(i) / "outputs.safetensors"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.unlink(missing_ok=True)
-        cmd = [exe, str(i), str(GOLDEN / name / str(i) / "inputs.safetensors"), str(out)]
-        trace = out.parent / "openat.trace"
-        if npu:  # record every device the run opens: the proof it ran on npu3
-            cmd = ["strace", "-f", "-qq", "-e", "trace=openat", "-o", str(trace)] + cmd
-        code, log = sh(cmd, crate, cargo_env(shared_target(crate, npu), npu))
-        if code != 0 or not out.exists():
-            return Result("FAIL", f"graph {i}: run_graph exited {code}: {tail(log)}")
-        if npu:
-            text = trace.read_text()
-            opened = set(re.findall(r'"/dev/rngd/(npu\d+)', text))
-            if opened != {f"npu{NPU}"} or '"/dev/nvidia' in text:
-                return Result("FAIL", f"graph {i}: did not run on npu{NPU} alone (opened {sorted(opened) or 'no NPU'}"
-                                      f"{', a GPU' if '/dev/nvidia' in text else ''})")
-        result = compare(out, GOLDEN / name / str(i) / "outputs.safetensors", tol)
-        top1 = CASES[name].top1
-        if result.status == "PASS" and top1:
-            got, want = load_file(out)[top1].float(), load_file(GOLDEN / name / str(i) / "outputs.safetensors")[top1].float()
-            if not torch.equal(got.reshape(-1, got.shape[-1]).argmax(-1), want.reshape(-1, want.shape[-1]).argmax(-1)):
-                result = Result("FAIL", f"{top1}: top-1 differs from golden")
-        if result.status != "PASS":
-            result.detail = f"graph {i}: {result.detail}"
-            return result
-        worst.append(result.detail)
+    with npu_lock() if npu else nullcontext():  # builds run side by side, npu3 runs one at a time
+        if npu:  # L4 is the verdict: wait for npu3 rather than skip it.
+            for _ in range(180):
+                if npu_idle():
+                    break
+                time.sleep(10)
+            else:
+                return Result("FAIL", f"npu{NPU} stayed busy for 30 min")
+        for graph in meta["graphs"]:
+            i = graph["index"]
+            out = OUT / name / ("npu" if npu else "cpu") / str(i) / "outputs.safetensors"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.unlink(missing_ok=True)
+            cmd = [exe, str(i), str(GOLDEN / name / str(i) / "inputs.safetensors"), str(out)]
+            trace = out.parent / "openat.trace"
+            if npu:  # record every device the run opens: the proof it ran on npu3
+                cmd = ["strace", "-f", "-qq", "-e", "trace=openat", "-o", str(trace)] + cmd
+            code, log = sh(cmd, crate, cargo_env(None, npu))
+            if code != 0 or not out.exists():
+                return Result("FAIL", f"graph {i}: run_graph exited {code}: {tail(log)}")
+            if npu:
+                text = trace.read_text()
+                opened = set(re.findall(r'"/dev/rngd/(npu\d+)', text))
+                if opened != {f"npu{NPU}"} or '"/dev/nvidia' in text:
+                    return Result("FAIL", f"graph {i}: did not run on npu{NPU} alone (opened {sorted(opened) or 'no NPU'}"
+                                          f"{', a GPU' if '/dev/nvidia' in text else ''})")
+            result = compare(out, GOLDEN / name / str(i) / "outputs.safetensors", tol)
+            top1 = CASES[name].top1
+            if result.status == "PASS" and top1:
+                got, want = load_file(out)[top1].float(), load_file(GOLDEN / name / str(i) / "outputs.safetensors")[top1].float()
+                if not torch.equal(got.reshape(-1, got.shape[-1]).argmax(-1), want.reshape(-1, want.shape[-1]).argmax(-1)):
+                    result = Result("FAIL", f"{top1}: top-1 differs from golden")
+            if result.status != "PASS":
+                result.detail = f"graph {i}: {result.detail}"
+                return result
+            worst.append(result.detail)
     return Result("PASS", "; ".join(d for d in worst if d))
 
 
@@ -247,13 +251,6 @@ def judge(name: str, level: str, impl: str) -> Result:
     if level == "L3":
         return run_graphs(name, crate, npu=False, tol=case.npu)
     if level == "L4":
-        # L4 is the verdict: wait for npu3 rather than skip it.
-        for _ in range(180):
-            if npu_idle():
-                break
-            time.sleep(10)
-        else:
-            return Result("FAIL", f"npu{NPU} stayed busy for 30 min")
         return run_graphs(name, crate, npu=True, tol=case.npu)
     raise ValueError(level)
 
@@ -312,6 +309,7 @@ def main():
     parser.add_argument("--impl", choices=["reference", "compiler"], default="reference")
     parser.add_argument("--cases", default=",".join(CASES))
     parser.add_argument("--levels", default=",".join(LEVELS))
+    parser.add_argument("--jobs", type=int, default=SLOTS, help="cases run at once (npu3 runs stay one at a time)")
     args = parser.parse_args()
     names = args.cases.split(",")
     levels = args.levels.split(",")
@@ -336,11 +334,11 @@ def main():
         unit_failed = code != 0
         print("unit: " + ("FAIL\n" + log.strip() if unit_failed else "PASS"))
 
-    report = {}
+    report = {name: {} for name in names}
     width = max(len(n) for n in names)
     print(f"{'case':<{width}}  " + "  ".join(levels))
-    for name in names:
-        report[name] = {}
+
+    def run_case(name):
         (OUT / name).mkdir(parents=True, exist_ok=True)
         with open(OUT / name / ".lock", "w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)  # concurrent runs of a case share its harness/out folder
@@ -348,6 +346,9 @@ def main():
                 result = judge(name, level, args.impl)
                 report[name][level] = {"status": result.status, "detail": result.detail}
                 print(f"{name:<{width}}  {level}: {result.cell()}", flush=True)
+
+    with ThreadPoolExecutor(max(1, args.jobs)) as pool:
+        list(pool.map(run_case, names))
     OUT.mkdir(parents=True, exist_ok=True)
     (OUT / "report.json").write_text(json.dumps({"impl": args.impl, "generality": hits, "results": report}, indent=2) + "\n")
 

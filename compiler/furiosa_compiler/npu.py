@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -19,10 +20,11 @@ import torch
 
 from furiosa_compiler import driver, tensors
 from furiosa_compiler.crate import build_crate
+from furiosa_compiler.locks import CACHE, npu_lock, target_slot
 
 ROOT = Path(__file__).resolve().parents[2]
-CACHE = Path(os.environ.get("FURIOSA_NPU_CACHE", Path.home() / ".cache" / "furiosa-npu"))
 NPU = os.environ.get("FURIOSA_VISIBLE_CHIPS", "3")  # the only NPU this host may open
+OCCUPANCY = Path(f"/sys/class/rngd_mgmt/rngd!npu{NPU}mgmt/pe_occupancy")
 DTYPES = {torch.float32: "fp32", torch.float16: "fp16", torch.bfloat16: "bf16", torch.int32: "i32", torch.int64: "i64",
           torch.int8: "i8", torch.float8_e4m3fn: "fp8e4nv"}
 # dtypes numpy has no native form of: the integer view torch hands over, and the ml_dtypes type to read it as.
@@ -97,13 +99,12 @@ def executable(launch: Launch) -> tuple[Path, Path]:
         graph = Graph(launch.kernel.__name__, {b.name: b for b in launch.args.values() if isinstance(b, Buf)}, [launch])
         result = driver.compile_graphs([graph], launch.kernel.__name__, work / "out")
         build_crate(result, work / "out", work / "crate")
-        env = dict(os.environ, CARGO_TARGET_DIR=str(CACHE / "target"), FURIOSA_VISIBLE_CHIPS=NPU,
-                   PATH=f"{ROOT / '.tools' / 'bin'}:{os.environ['PATH']}")
+        env = dict(os.environ, FURIOSA_VISIBLE_CHIPS=NPU, PATH=f"{ROOT / '.tools' / 'bin'}:{os.environ['PATH']}")
         env.setdefault("LIBCLANG_PATH", "/usr/lib/llvm-18/lib")
-        with open(CACHE / "target.lock", "w") as target_lock:
+        with target_slot(CACHE / "targets", work) as target:
             # Every crate's binary is uplifted to target/release/run_graph; keep the per-crate deps/ binary
-            # it links to, resolved before another build can relink it.
-            fcntl.flock(target_lock, fcntl.LOCK_EX)
+            # it links to, resolved before another build in this slot can relink it.
+            env["CARGO_TARGET_DIR"] = str(target)
             proc = subprocess.run(["cargo", "furiosa-opt", "build", "--release", "--bin", "run_graph",
                                    "--message-format=json-render-diagnostics"], cwd=work / "crate", env=env,
                                   capture_output=True, text=True)
@@ -123,8 +124,13 @@ def run(kernel, grid: tuple, args: dict):
     exe, work = executable(launch)
     inputs, outputs = work / f"in-{os.getpid()}.safetensors", work / f"out-{os.getpid()}.safetensors"
     tensors.save(inputs, {name: host(args[name]) for name in bufs})
-    proc = subprocess.run([str(exe), "0", str(inputs), str(outputs)], cwd=work / "crate",
-                          env=dict(os.environ, FURIOSA_VISIBLE_CHIPS=NPU), capture_output=True, text=True)
+    with npu_lock():
+        for _ in range(180):  # npu3 may be busy with another user's run: wait rather than fail
+            if set(OCCUPANCY.read_text().split()) <= {"0"}:
+                break
+            time.sleep(10)
+        proc = subprocess.run([str(exe), "0", str(inputs), str(outputs)], cwd=work / "crate",
+                              env=dict(os.environ, FURIOSA_VISIBLE_CHIPS=NPU), capture_output=True, text=True)
     if proc.returncode or not outputs.exists():
         raise RuntimeError(f"{kernel.__name__}: NPU run failed:\n{proc.stderr[-2000:]}")
     for name, array in tensors.load(outputs).items():

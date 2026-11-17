@@ -2,7 +2,8 @@
 harness/out/ops/<stage>.json and <stage>.md: which dtypes, shapes and operators work.
 
     compiler/.venv/bin/python -m harness.ops.run --stage raise --jobs 16   # raised IR on the CPU JIT (triage)
-    compiler/.venv/bin/python -m harness.ops.run --stage npu               # the verdict: npu3, one case at a time
+    compiler/.venv/bin/python -m harness.ops.run --stage npu --jobs 8      # the verdict on npu3: builds in parallel,
+                                                                           # device runs one at a time (npu.py)
     compiler/.venv/bin/python -m harness.ops.run --stage npu --only exp,add --dtypes float32 --shapes 1x64x64
 """
 
@@ -10,7 +11,6 @@ import argparse
 import json
 import subprocess
 import sys
-import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -19,20 +19,10 @@ from harness.ops.cases import FLOATS, all_cases
 
 ROOT = Path(__file__).resolve().parents[2]
 OUT = ROOT / "harness" / "out" / "ops"
-OCCUPANCY = Path("/sys/class/rngd_mgmt/rngd!npu3mgmt/pe_occupancy")
 COLUMNS = FLOATS + ["int32", "int8", "float8_e4m3fn"]
 
 
-def npu_idle() -> bool:
-    return OCCUPANCY.exists() and set(OCCUPANCY.read_text().split()) == {"0"}
-
-
 def run_case(key: str, stage: str, timeout: int) -> dict:
-    if stage == "npu":
-        for _ in range(180):  # wait for npu3 rather than skip, like harness L4
-            if npu_idle():
-                break
-            time.sleep(10)
     # Shared build lock: never load a libtriton that compiler/build.sh is relinking.
     cmd = ["flock", "-s", str(ROOT / "build" / ".build.lock"), sys.executable, "-m", "harness.ops.case", key,
            "--stage", stage]
@@ -84,15 +74,14 @@ def main():
     parser.add_argument("--only", default="", help="operators, e.g. exp,add,dot")
     parser.add_argument("--dtypes", default="")
     parser.add_argument("--shapes", default="", help="e.g. 1x64x64,2x7x33")
-    parser.add_argument("--jobs", type=int, default=1, help="parallel cases (raise stage only)")
+    parser.add_argument("--jobs", type=int, default=8, help="cases at once (npu3 runs stay one at a time)")
     parser.add_argument("--timeout", type=int, default=900)
     args = parser.parse_args()
     pick = lambda value, allowed: not allowed or value in allowed.split(",")  # noqa: E731
     cases = [c for c in all_cases() if pick(c.op, args.only) and pick(c.dtype, args.dtypes)
              and pick("x".join(map(str, c.shape)), args.shapes)]
-    jobs = args.jobs if args.stage == "raise" else 1  # one NPU
     results = []
-    with ThreadPoolExecutor(jobs) as pool:
+    with ThreadPoolExecutor(args.jobs) as pool:
         for i, r in enumerate(pool.map(lambda c: run_case(c.key, args.stage, args.timeout), cases), 1):
             results.append(r)
             print(f"[{i}/{len(cases)}] {r['status']:5} {r['key']}  {r['detail'][:120]}", flush=True)

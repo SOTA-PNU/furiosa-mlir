@@ -29,7 +29,7 @@ def main():
     out = torch.zeros(n)
     scale_add[(triton.cdiv(n, 1024),)](x, y, out, n, 2.0, BLOCK=1024)
     assert torch.equal(out, 2.0 * x + y), (out - (2.0 * x + y)).abs().max()
-    relu[(triton.cdiv(n, 1024),)](x, out, n, BLOCK=1024)  # another crate in the same target dir
+    relu[(triton.cdiv(n, 1024),)](x, out, n, BLOCK=1024)  # another crate: it may share a target slot
     assert torch.equal(out, torch.relu(x))
     out.zero_()
     scale_add[(triton.cdiv(n, 1024),)](x, y, out, n, 2.0, BLOCK=1024)  # cached: still its own binary

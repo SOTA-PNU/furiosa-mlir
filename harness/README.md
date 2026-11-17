@@ -145,6 +145,11 @@ uv run python -m harness.run --impl reference --cases rmsnorm --levels L2,L3
 With `--impl compiler` the run first executes the compiler's per-pass lit tests (`unit:` line,
 compiler/README.md); a failure there fails the run, like a generality hit.
 
+Cases run `--jobs` at a time (default: one per 16 cores, `FURIOSA_BUILD_SLOTS`). Cargo builds use that
+many target dirs under `harness/out/target/{cpu,npu}/slot<i>` (each builds the dependencies once; a crate
+returns to its own slot), and runs on npu3 take one lock (`~/.cache/furiosa-npu/npu.lock`, shared with
+`kernel[grid]` launches): builds run side by side, the device runs one at a time.
+
 The report is a case × level table (PASS / FAIL / SKIP with the reason and the worst error), also
-written to `harness/out/report.json`. L4 is skipped unless every PE of npu3 is idle; the harness never
+written to `harness/out/report.json`. L4 waits (up to 30 min) until every PE of npu3 is idle; the harness never
 opens another NPU (`FURIOSA_VISIBLE_CHIPS=3`).
