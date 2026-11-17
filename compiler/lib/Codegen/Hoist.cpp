@@ -160,6 +160,11 @@ private:
             .Case([&](arith::XOrIOp) { return I(in[0].i ^ in[1].i); })
             .Case([&](arith::ShLIOp) { return I(int64_t(uint64_t(in[0].i) << in[1].i)); })
             .Case([&](arith::ShRSIOp) { return I(in[0].i >> in[1].i); })
+            .Case([&](arith::ShRUIOp) {
+              unsigned w = ty(0).isIndex() ? 64 : ty(0).getIntOrFloatBitWidth();
+              uint64_t bits = w >= 64 ? uint64_t(in[0].i) : uint64_t(in[0].i) & ((uint64_t(1) << w) - 1);
+              return I(int64_t(bits >> in[1].i));
+            })
             .Case([&](arith::MaxSIOp) { return I(std::max(in[0].i, in[1].i)); })
             .Case([&](arith::MinSIOp) { return I(std::min(in[0].i, in[1].i)); })
             .Case<arith::IndexCastOp, arith::ExtSIOp, arith::TruncIOp>([&](Operation *) { return I(in[0].i); })

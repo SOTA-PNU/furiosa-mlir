@@ -930,6 +930,42 @@ void splitIndexSelects(ModuleOp module, function_ref<bool(linalg::GenericOp)> ma
   }
 }
 
+/// A reduction loop of extent 1 (tl.sum over an axis tl.expand_dims made) reduces nothing: the generic drops it,
+/// reading that loop's index as 0, and is elementwise over the rest.
+linalg::GenericOp dropUnitReductions(linalg::GenericOp g) {
+  MLIRContext *ctx = g.getContext();
+  for (unsigned k = 0; k < g.getNumLoops();) {
+    if (g.getIteratorTypesArray()[k] != utils::IteratorType::reduction || g.getStaticLoopRanges()[k] != 1) {
+      ++k;
+      continue;
+    }
+    unsigned n = g.getNumLoops();
+    SmallVector<AffineExpr> dims;
+    for (unsigned d = 0; d < n; ++d)
+      dims.push_back(d == k ? getAffineConstantExpr(0, ctx) : getAffineDimExpr(d < k ? d : d - 1, ctx));
+    SmallVector<AffineMap> maps;
+    for (AffineMap m : g.getIndexingMapsArray())
+      maps.push_back(m.replaceDimsAndSymbols(dims, {}, n - 1, 0));
+    SmallVector<Attribute> iters;
+    for (auto [d, t] : llvm::enumerate(g.getIteratorTypesArray()))
+      if (d != k)
+        iters.push_back(linalg::IteratorTypeAttr::get(ctx, t));
+    OpBuilder b(g);
+    g.setIndexingMapsAttr(b.getAffineMapArrayAttr(maps));
+    g.setIteratorTypesAttr(b.getArrayAttr(iters));
+    for (auto index : llvm::to_vector(g.getRegion().front().getOps<linalg::IndexOp>())) {
+      if (index.getDim() > k) {
+        index.setDim(index.getDim() - 1);
+      } else if (index.getDim() == k) {
+        OpBuilder ib(index);
+        index.getResult().replaceAllUsesWith(arith::ConstantIndexOp::create(ib, index.getLoc(), 0));
+        index.erase();
+      }
+    }
+  }
+  return g;
+}
+
 /// An elementwise generic that reads its init (an atomic round's out = out + x) reads it as an input instead and
 /// writes a fresh tensor: the same values, and the init is no longer an accumulator outside any reduction.
 linalg::GenericOp initsToInputs(linalg::GenericOp g) {
@@ -1007,7 +1043,9 @@ void relayoutReads(linalg::GenericOp g, function_ref<bool(linalg::GenericOp)> ma
 /// floor/ceil from the nearest integer t (the engine converts to integers rounding to nearest): floor =
 /// t - (t > x), ceil = t + (t < x), exact for any integer t within 1 of x; values beyond 2^(mantissa bits) are
 /// integers already and pass through (the conversion would saturate). Unsigned i32 min and max compare signed with
-/// the sign bits flipped (which maps unsigned order onto signed order): minui(a, b) = minsi(a ^ s, b ^ s) ^ s.
+/// the sign bits flipped (which maps unsigned order onto signed order): minui(a, b) = minsi(a ^ s, b ^ s) ^ s. An
+/// i32 mului_extended (tl.umulhi) is the wrapping product and its high half from 16-bit limbs (the engine's
+/// integer multiply wraps).
 void expandMath(ModuleOp module) {
   RewritePatternSet approximations(module.getContext());
   populateMathPolynomialApproximationPatterns(approximations, [](StringRef name) {
@@ -1026,6 +1064,23 @@ void expandMath(ModuleOp module) {
     Value m = isa<arith::MinUIOp>(op) ? arith::MinSIOp::create(b, loc, l, r).getResult() : arith::MaxSIOp::create(b, loc, l, r).getResult();
     op->getResult(0).replaceAllUsesWith(arith::XOrIOp::create(b, loc, m, sign));
     op->erase();
+  });
+  module.walk([&](arith::MulUIExtendedOp op) {
+    if (!op.getType(0).isInteger(32))
+      return;
+    OpBuilder b(op);
+    Location loc = op.getLoc();
+    auto c = [&](int32_t v) { return arith::ConstantOp::create(b, loc, b.getI32IntegerAttr(v)).getResult(); };
+    auto lo = [&](Value x) { return arith::AndIOp::create(b, loc, x, c(0xFFFF)).getResult(); };
+    auto hi = [&](Value x) { return arith::ShRUIOp::create(b, loc, x, c(16)).getResult(); };
+    auto mul = [&](Value x, Value y) { return arith::MulIOp::create(b, loc, x, y).getResult(); };
+    auto add = [&](Value x, Value y) { return arith::AddIOp::create(b, loc, x, y).getResult(); };
+    Value x = op.getLhs(), y = op.getRhs();
+    Value ll = mul(lo(x), lo(y)), lh = mul(lo(x), hi(y)), hl = mul(hi(x), lo(y)), hh = mul(hi(x), hi(y));
+    Value mid = add(add(hi(ll), lo(lh)), lo(hl));
+    op.getHigh().replaceAllUsesWith(add(add(add(hh, hi(lh)), hi(hl)), hi(mid)));
+    op.getLow().replaceAllUsesWith(mul(x, y));
+    op.erase();
   });
   SmallVector<Operation *> ops;
   module.walk([&](Operation *op) {
@@ -1082,7 +1137,7 @@ void mlir::furiosa::normalizeKernels(ModuleOp module, function_ref<bool(linalg::
   SmallVector<linalg::GenericOp> generics;
   module.walk([&](linalg::GenericOp g) { generics.push_back(g); });
   for (linalg::GenericOp g : generics) {
-    g = initsToInputs(promoteExtracts(g));
+    g = initsToInputs(dropUnitReductions(promoteExtracts(g)));
     for (unsigned i = 0; i < g.getNumDpsInputs(); ++i) {
       delinearizeRead(g, i);
       maskToPad(g, i);

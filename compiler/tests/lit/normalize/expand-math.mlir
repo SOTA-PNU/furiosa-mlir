@@ -1,9 +1,9 @@
-// RUN: furiosa-mlir-opt --furiosa-normalize-kernels %s | FileCheck %s --implicit-check-not=math.fma --implicit-check-not=math.log2 --implicit-check-not=math.floor --implicit-check-not=math.asin --implicit-check-not=math.acos --implicit-check-not=math.atan --implicit-check-not=math.copysign --implicit-check-not=arith.minui
+// RUN: furiosa-mlir-opt --furiosa-normalize-kernels %s | FileCheck %s --implicit-check-not=math.fma --implicit-check-not=math.log2 --implicit-check-not=math.floor --implicit-check-not=math.asin --implicit-check-not=math.acos --implicit-check-not=math.atan --implicit-check-not=math.copysign --implicit-check-not=arith.minui --implicit-check-not=arith.mului_extended
 
 // Math ops the Vector Engine lacks become ones it has: fma(a, b, c) = a*b + c, log2(x) = ln(x) * log2(e), and
 // floor(x) = t - (t > x) from the nearest integer t, x itself beyond 2^23 (already an integer); asin, acos,
 // atan and atan2 by MLIR's polynomial approximations, copysign(a, b) = b < 0 ? -|a| : |a|; an unsigned min compares
-// signed with the sign bits flipped.
+// signed with the sign bits flipped; tl.umulhi's high half comes from 16-bit limbs (four wrapping i32 products).
 
 // CHECK-LABEL: func.func @fma_log2
 // CHECK: ^bb0(%[[A:.*]]: f32, %[[B:.*]]: f32, %[[C:.*]]: f32, %{{.*}}: f32):
@@ -31,6 +31,9 @@
 // CHECK: %[[B:.*]] = arith.xori %{{.*}}, %[[S]] : i32
 // CHECK: %[[M:.*]] = arith.minsi %[[A]], %[[B]] : i32
 // CHECK: arith.xori %[[M]], %[[S]] : i32
+// CHECK-LABEL: func.func @mulhi
+// CHECK-COUNT-4: arith.muli
+// CHECK: arith.shrui
 #id = affine_map<(d0) -> (d0)>
 module {
   func.func @fma_log2(%a: tensor<64xf32>, %b: tensor<64xf32>, %c: tensor<64xf32>, %o: tensor<64xf32>) -> tensor<64xf32> attributes {furiosa.written = [3]} {
@@ -73,6 +76,15 @@ module {
     ^bb0(%x: i32, %y: i32, %out: i32):
       %m = arith.minui %x, %y : i32
       linalg.yield %m : i32
+    } -> tensor<64xi32>
+    return %r : tensor<64xi32>
+  }
+  func.func @mulhi(%a: tensor<64xi32>, %b: tensor<64xi32>, %o: tensor<64xi32>) -> tensor<64xi32> attributes {furiosa.written = [2]} {
+    %e = tensor.empty() : tensor<64xi32>
+    %r = linalg.generic {indexing_maps = [#id, #id, #id], iterator_types = ["parallel"]} ins(%a, %b : tensor<64xi32>, tensor<64xi32>) outs(%e : tensor<64xi32>) {
+    ^bb0(%x: i32, %y: i32, %out: i32):
+      %l, %h = arith.mului_extended %x, %y : i32
+      linalg.yield %h : i32
     } -> tensor<64xi32>
     return %r : tensor<64xi32>
   }
