@@ -4,7 +4,18 @@ main carries the next version as `X.Y.Z.dev0`. A release is a `release/X.Y.Z` br
 with the commit "Release X.Y.Z" and the tag `vX.Y.Z`. "On npu3" means harness level L4 (or the operator matrix's
 npu stage) against GPU goldens.
 
-## 1.2.0 (unreleased, main)
+## 1.3.0 (unreleased, main)
+
+- A data-dependent element gather the 8-byte DMA rule blocks gathers 8-byte rows at the even-aligned address and
+  selects the half by the address's parity (exact for any bits); a signed remainder by a power of two expands to
+  shifts and masks: `extra.gather_data` on npu3 (832a9e3).
+
+## 1.2.0 (2026-11-18, release/1.2.0)
+
+Milestone: every corpus case on npu3. All 25 corpus cases pass L0 to L4 (the attention backward tutorial was the
+last), and 879 of the 907 operator matrix cases pass (801 in 1.1.0). Of the rest, 2 differ on NaN inputs
+(`extra.maximum_nan`: the engine's max propagates NaN where the GPU's skips it, see the known issues below) and 26 do
+not compile: sort (20) and topk (4) exceed the step splitter's time, and `gather_data` (2) waits for 1.3.0.
 
 - Normalization: reduction loops of extent 1 drop (`tl.expand_dims` with a reduction, int32 and int8); `tl.umulhi`
   computed from 16-bit limbs, exact under the engine's wrapping multiply (cae9784).
@@ -44,9 +55,6 @@ npu stage) against GPU goldens.
   the matrix at 8f7ce01 plus this change: 879 of 907 (5a5c85f).
 - Row-wise: a reduction of a computed term pads its input with the reduction's identity when the term keeps it
   (MLIR's folders evaluate it): bf16 max at 2x7x33 maps again under the NaN guard (d15e419).
-- A data-dependent element gather the 8-byte DMA rule blocks gathers 8-byte rows at the even-aligned address and
-  selects the half by the address's parity (exact for any bits); a signed remainder by a power of two expands to
-  shifts and masks: `extra.gather_data` on npu3 (832a9e3).
 
 ## 1.1.0 (2026-11-17, release/1.1.0)
 
