@@ -12,11 +12,16 @@ npu stage) against GPU goldens.
   three-way compare on npu3 (0ab16b6).
 - A widened i1 is a select; a reduction no class maps reads its input broadcast over the loops it lacks:
   `tl.histogram` on npu3 (ccb3f49).
+- A read whose address wraps (a mod or floordiv one loop decides) splits at the wrap into box copies: `tl.gather`
+  by a rotated index on npu3 (0af780b).
+- In a generic no class maps, a select one loop decides splits even when its sides are computed: `tl.maximum`'s
+  NaN-propagating mode exact on npu3 (ab5dce9).
 
 ## 1.1.0 (2026-11-17, release/1.1.0)
 
 Milestone: Triton's tutorials on npu3 except the attention backward pass; every model; the operator matrix's
-data-movement and atomic operators.
+data-movement and atomic operators. On npu3: 24 of the 25 corpus cases pass L0 to L4, and 801 of the 907 operator
+matrix cases pass (741 at 1805f3e), none with a wrong result.
 
 - Triton tutorials newly on npu3: fused attention (forward), extern functions (libdevice `asin`).
 - Operator matrix newly on npu3: `tl.cat`, `tl.join`, `tl.interleave` (every dtype and shape); `tl.flip` (32-bit
