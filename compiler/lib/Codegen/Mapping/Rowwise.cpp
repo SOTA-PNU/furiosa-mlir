@@ -420,6 +420,8 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
                              .Case<arith::XOrIOp>([](auto) { return "xori"; })
                              .Case<arith::AndIOp>([](auto) { return "andi"; })
                              .Case<arith::OrIOp>([](auto) { return "ori"; })
+                             .Case<arith::ShLIOp>([](auto) { return "shli"; })
+                             .Case<arith::ShRSIOp>([](auto) { return "shrsi"; })
                              .Case<math::AbsIOp>([](auto) { return "absi"; })
                              .Case<arith::IndexCastOp>([](auto) { return "ext"; })
                              .Case<math::RoundOp>([](math::RoundOp r) { return r.getType().isF32() ? "round" : ""; })
@@ -1111,7 +1113,9 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
         {"mini", {Clip, "ClipMin", "vector_clip", "ClipBinaryOpI32::Min"}},
         {"xori", {Logic, "LogicXor", "vector_logic", "LogicBinaryOpI32::BitXor"}},
         {"andi", {Logic, "LogicAnd", "vector_logic", "LogicBinaryOpI32::BitAnd"}},
-        {"ori", {Logic, "LogicOr", "vector_logic", "LogicBinaryOpI32::BitOr"}}};
+        {"ori", {Logic, "LogicOr", "vector_logic", "LogicBinaryOpI32::BitOr"}},
+        {"shli", {Fxp, "FxpLshift", "vector_fxp", "FxpBinaryOp::LeftShift"}},
+        {"shrsi", {Fxp, "FxpRshift", "vector_fxp", "FxpBinaryOp::ArithRightShift"}}};
     if (auto it = intOps.find(op); it != intOps.end()) {
       auto [stg, a, m, v] = it->second;
       need = stg, alu = a, method = m, veOp = v, needWay4 = false;

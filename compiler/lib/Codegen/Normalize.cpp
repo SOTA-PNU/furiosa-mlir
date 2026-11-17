@@ -579,7 +579,10 @@ void selectionReductions(ModuleOp module) {
 
     Type vt = getElementTypeOrSelf(initV.getType()), pt = getElementTypeOrSelf(initP.getType());
     bool fv = isa<FloatType>(vt);
-    if ((!fv && !vt.isInteger(32)) || !pt.isInteger(32))
+    // Narrow integer values (int8) compare as i32: m is computed wide, from the i32 identity.
+    Type wt = !fv && vt.getIntOrFloatBitWidth() < 32 ? Type(IntegerType::get(g.getContext(), 32)) : vt;
+    bool narrow = wt != vt;
+    if ((!fv && !wt.isInteger(32)) || !pt.isInteger(32) || (narrow && !g.getResult(sel->value).use_empty()))
       continue;
     OpBuilder b(g);
     Location loc = g.getLoc();
@@ -595,9 +598,15 @@ void selectionReductions(ModuleOp module) {
     };
     SmallVector<utils::IteratorType> iters = g.getIteratorTypesArray();
     // m: the greatest (least) element, from the least (greatest) value.
+    auto wideType = cast<RankedTensorType>(initV.getType()).clone(wt);
+    Value wideInit = fill(tensor::EmptyOp::create(b, loc, wideType.getShape(), wt), extreme(wt, !sel->max));
+    auto widened = [&](OpBuilder &nb, Location l, Value x) {
+      return narrow ? arith::ExtSIOp::create(nb, l, wt, x).getResult() : x;
+    };
     auto value = linalg::GenericOp::create(
-        b, loc, TypeRange{initV.getType()}, ValueRange{t}, ValueRange{fill(initV, extreme(vt, !sel->max))},
-        ArrayRef<AffineMap>{xMap, outMap}, iters, [&](OpBuilder &nb, Location l, ValueRange args) {
+        b, loc, TypeRange{wideType}, ValueRange{t}, ValueRange{wideInit},
+        ArrayRef<AffineMap>{xMap, outMap}, iters, [&](OpBuilder &nb, Location l, ValueRange a) {
+          SmallVector<Value> args{widened(nb, l, a[0]), a[1]};
           Value m = fv ? (sel->max ? arith::MaximumFOp::create(nb, l, args[1], args[0]).getResult()
                                    : arith::MinimumFOp::create(nb, l, args[1], args[0]).getResult())
                        : (sel->max ? arith::MaxSIOp::create(nb, l, args[1], args[0]).getResult()
@@ -627,14 +636,16 @@ void selectionReductions(ModuleOp module) {
             return nb.clone(*op, map)->getResult(cast<OpResult>(v).getResultNumber());
           };
           Value term = clone(sel->term);
-          Value eq = fv ? arith::CmpFOp::create(nb, l, arith::CmpFPredicate::OEQ, args[0], args[1]).getResult()
-                        : arith::CmpIOp::create(nb, l, arith::CmpIPredicate::eq, args[0], args[1]).getResult();
+          Value x = widened(nb, l, args[0]);
+          Value eq = fv ? arith::CmpFOp::create(nb, l, arith::CmpFPredicate::OEQ, x, args[1]).getResult()
+                        : arith::CmpIOp::create(nb, l, arith::CmpIPredicate::eq, x, args[1]).getResult();
           Value candidate = arith::SelectOp::create(nb, l, eq, term, arith::ConstantOp::create(nb, l, none));
           Value p = sel->leastPayload ? arith::MinSIOp::create(nb, l, args[2], candidate).getResult()
                                       : arith::MaxSIOp::create(nb, l, args[2], candidate).getResult();
           linalg::YieldOp::create(nb, l, p);
         });
-    g.getResult(sel->value).replaceAllUsesWith(value.getResult(0));
+    if (!narrow)
+      g.getResult(sel->value).replaceAllUsesWith(value.getResult(0));
     g.getResult(sel->payload).replaceAllUsesWith(payload.getResult(0));
     g.erase();
   }

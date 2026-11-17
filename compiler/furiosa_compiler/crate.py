@@ -18,9 +18,10 @@ from pathlib import Path
 
 from triton._C.libtriton import furiosa
 
-# fp16 buffers live as f32 on the device (furiosa-opt has no f16); F16 is converted at the graph boundary.
-RUST_DTYPES = {"fp32": "f32", "bf16": "bf16", "i32": "i32", "fp16": "f32"}
-MLIR_DTYPES = {"f32": "f32", "bf16": "bf16", "i32": "i32", "f16": "f32"}  # element types of step temporaries
+# fp16 buffers live as f32 on the device (furiosa-opt has no f16), int8 ones as i32 (the Vector Engine computes on
+# 32-bit lanes); both convert at the graph boundary.
+RUST_DTYPES = {"fp32": "f32", "bf16": "bf16", "i32": "i32", "fp16": "f32", "i8": "i32"}
+MLIR_DTYPES = {"f32": "f32", "bf16": "bf16", "i32": "i32", "f16": "f32", "i8": "i32"}  # element types of step temporaries
 ELEMENT_BYTES = {"fp32": 4, "bf16": 2, "i32": 4}
 
 CARGO_TOML = """\
@@ -128,6 +129,12 @@ impl Inputs {
             let wide = TensorView::new(Dtype::F32, view.shape().to_vec(), &wide)?;
             return HostTensor::from_safetensors(&wide).map_err(|e| eyre!("buffer {name}: {e:?}"));
         }
+        if view.dtype() == Dtype::I8 && D::DTYPE == Dtype::I32 {
+            // An int8 buffer lives as i32 on the device: sign-extended.
+            let wide: Vec<u8> = view.data().iter().flat_map(|&b| i32::from(b as i8).to_le_bytes()).collect();
+            let wide = TensorView::new(Dtype::I32, view.shape().to_vec(), &wide)?;
+            return HostTensor::from_safetensors(&wide).map_err(|e| eyre!("buffer {name}: {e:?}"));
+        }
         ensure!(view.dtype() == D::DTYPE, "buffer {name} is {:?}, expected {:?}", view.dtype(), D::DTYPE);
         HostTensor::from_safetensors(&view).map_err(|e| eyre!("buffer {name}: {e:?}"))
     }
@@ -153,6 +160,14 @@ impl Outputs {
             .flat_map(|f| half::f16::from_f32(f32::from_le_bytes([f[0], f[1], f[2], f[3]])).to_le_bytes())
             .collect();
         self.0.insert(name.to_owned(), (Dtype::F16, shape.to_vec(), narrow));
+    }
+
+    /// Stores an int8 buffer (i32 on the device, its values kept within int8) as I8.
+    pub fn put_i8<E: M>(&mut self, name: &str, shape: &[usize], tensor: HostTensor<i32, E>) {
+        let bytes: Vec<u8> = tensor.into_buffer().into();
+        assert_eq!(bytes.len(), shape.iter().product::<usize>() * 4, "{name}: shape {shape:?}");
+        let narrow = bytes.chunks_exact(4).map(|w| w[0]).collect();
+        self.0.insert(name.to_owned(), (Dtype::I8, shape.to_vec(), narrow));
     }
 
     pub fn save(&self, path: &Path) -> eyre::Result<()> {
@@ -452,7 +467,7 @@ class RunGraph:
                     raise CrateError(f"graph {g}: output {buffer} is never written")
                 mapping = self.host_mapping(g, names, buffer, info["shape"])
                 shape = ", ".join(str(d) for d in info["shape"])
-                put = "put_f16" if info["dtype"] == "fp16" else "put"
+                put = {"fp16": "put_f16", "i8": "put_i8"}.get(info["dtype"], "put")
                 lines.append(
                     f"    files.{put}({json.dumps(buffer)}, &[{shape}], HbmTensor::<{dtype(buffer)}, m![1], {mapping}>"
                     f"::try_from({variable(buffer)}.alias(..)?)?.to_host::<{mapping}>(&mut device.pdma).await?);"
@@ -564,6 +579,8 @@ def build_crate(result: dict, out: Path, crate: Path) -> Path:
             data = base64.b64decode(const["data"])
             if const["dtype"] == "f16":  # an f16 table lives as f32 on the device too
                 data = struct.pack(f"<{len(data) // 2}f", *struct.unpack(f"<{len(data) // 2}e", data))
+            if const["dtype"] == "i8":  # an int8 table lives as i32 on the device too
+                data = struct.pack(f"<{len(data)}i", *struct.unpack(f"<{len(data)}b", data))
             (crate / "src" / "consts" / f"{symbol}_{k}.bin").write_bytes(data)
     (crate / "src" / "run_graph.rs").write_text(run_graph)
     # Formatting is cosmetic: skip it if the toolchain's rustfmt is unavailable.
