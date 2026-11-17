@@ -138,11 +138,18 @@ FailureOr<StageSpec> StageSpec::decode(DictionaryAttr d) {
 
 namespace {
 
+/// A padded copy several stages of one buffer share: the union of their windows, made by the first of them.
+struct SharedCopy {
+  SmallVector<int64_t> low, extent;
+  Value copy;
+};
+
 /// Lowers one stage and its reads (the layout decisions of the data movement).
 class Stager {
 public:
-  Stager(StageOp stage, StageSpec &spec, std::map<std::pair<double, bool>, Value> &fillDm)
-      : stage(stage), spec(spec), fillDm(fillDm), ctx(stage.getContext()), b(stage), source(stage.getSource()) {}
+  Stager(StageOp stage, StageSpec &spec, std::map<std::pair<double, bool>, Value> &fillDm, SharedCopy *shared)
+      : stage(stage), spec(spec), fillDm(fillDm), shared(shared), ctx(stage.getContext()), b(stage),
+        source(stage.getSource()) {}
 
   /// The staged tensor (inserted before the stage), or failure.
   FailureOr<Value> run() {
@@ -159,6 +166,7 @@ private:
   StageOp stage;
   StageSpec &spec;
   std::map<std::pair<double, bool>, Value> &fillDm;
+  SharedCopy *shared;
   MLIRContext *ctx;
   OpBuilder b;
   Value source;
@@ -349,6 +357,11 @@ FailureOr<Value> Stager::materialize(const Read &r, ArrayRef<unsigned> rowAxes, 
     if (!rem[j].empty())
       extent[j] = roundUp(extent[j], rem[j].front().second);
   }
+  // A copy shared with other stages of the buffer: the union of their windows.
+  if (shared) {
+    low = shared->low;
+    extent = shared->extent;
+  }
   bool copyNeeded = r.fill.has_value();
   for (unsigned j = 0; j < nd; ++j)
     copyNeeded |= low[j] || extent[j] != r.shape[j];
@@ -356,7 +369,9 @@ FailureOr<Value> Stager::materialize(const Read &r, ArrayRef<unsigned> rowAxes, 
   Value param = source;
   Value source = param;
   std::string tag = spec.tag;
-  if (copyNeeded) {
+  if (copyNeeded && shared && shared->copy) {
+    source = shared->copy;
+  } else if (copyNeeded) {
     // A copy with the padded extents, filled with the padding value, the buffer in its interior.
     SmallVector<MapAttr> padded, interior;
     for (unsigned j = 0; j < nd; ++j) {
@@ -384,6 +399,8 @@ FailureOr<Value> Stager::materialize(const Read &r, ArrayRef<unsigned> rowAxes, 
     }
     copy(reshapeView(view(param, false), pairOf(srcDims)), d);
     source = xp;
+    if (shared)
+      shared->copy = xp;
   }
 
   // The digits of each dim, most significant first: one per remaining term, then the residual below the
@@ -717,14 +734,74 @@ LogicalResult mlir::furiosa::tile::lowerDataMovement(func::FuncOp func) {
   if (stages.empty())
     return success();
   std::map<std::pair<double, bool>, Value> fillDm;
-  // The staging axes go where the lowering would have declared them: after the kernel axes declared before
-  // the stage, which later stages' axes push further.
-  SmallVector<std::pair<int64_t, SmallVector<std::pair<std::string, int64_t>>>> inserts;
+  // Stages of one buffer that read it alike but for their offsets (unrolled taps of a window, each its own read)
+  // share one padded copy holding all of their windows.
+  std::vector<StageSpec> specs;
   for (StageOp stage : stages) {
     FailureOr<StageSpec> spec = StageSpec::decode(stage.getSpec());
     if (failed(spec))
       return stage.emitError("fopt.stage: a malformed spec");
-    Stager stager(stage, *spec, fillDm);
+    specs.push_back(*spec);
+  }
+  std::map<std::string, SharedCopy> shares;
+  SmallVector<std::string> keyOf(stages.size());
+  std::map<std::string, int> members;
+  for (auto [i, spec] : llvm::enumerate(specs)) {
+    if (spec.k || spec.rf)
+      continue;
+    std::string key;
+    llvm::raw_string_ostream os(key);
+    os << stages[i].getSource().getAsOpaquePointer() << "|" << (spec.read.fill ? *spec.read.fill : 0.0)
+       << (spec.read.fill ? "f" : "-") << "|";
+    for (int64_t x : spec.read.shape)
+      os << x << ",";
+    for (const Lin &l : spec.read.index) {
+      os << "|";
+      for (auto [a, c] : l.terms)
+        os << a << "*" << c << "+";
+    }
+    keyOf[i] = key;
+    ++members[key];
+  }
+  for (auto [i, spec] : llvm::enumerate(specs)) {
+    if (keyOf[i].empty() || members[keyOf[i]] < 2)
+      continue;
+    // The union of the windows: the most low padding any needs, the farthest index any reads.
+    unsigned nd = spec.read.shape.size();
+    SharedCopy &share = shares[keyOf[i]];
+    if (share.low.empty()) {
+      share.low.assign(nd, 0);
+      share.extent.assign(nd, 0);
+    }
+    for (unsigned j = 0; j < nd; ++j) {
+      const Lin &l = spec.read.index[j];
+      int64_t lo = l.offset, hi = l.offset;
+      for (auto [a, c] : l.terms)
+        hi += c * (spec.sizes[a] - 1);
+      share.low[j] = std::max(share.low[j], lo < 0 ? -lo : 0);
+      share.extent[j] = std::max(share.extent[j], std::max(hi + 1, spec.read.shape[j]));
+    }
+  }
+  for (auto &[key, share] : shares)
+    for (auto [i, spec] : llvm::enumerate(specs))
+      if (keyOf[i] == key) {
+        // Extents past the low padding, rounded to the coarsest stride as each read's own would be.
+        for (unsigned j = 0; j < share.extent.size(); ++j) {
+          SmallVector<int64_t> cs;
+          for (auto [a, c] : spec.read.index[j].terms)
+            cs.push_back(c);
+          int64_t e = share.extent[j] + share.low[j];
+          share.extent[j] = cs.empty() ? e : roundUp(e, *llvm::max_element(cs));
+        }
+        break;
+      }
+  // The staging axes go where the lowering would have declared them: after the kernel axes declared before
+  // the stage, which later stages' axes push further.
+  SmallVector<std::pair<int64_t, SmallVector<std::pair<std::string, int64_t>>>> inserts;
+  for (auto [i, stage] : llvm::enumerate(stages)) {
+    StageSpec *spec = &specs[i];
+    auto share = keyOf[i].empty() ? shares.end() : shares.find(keyOf[i]);
+    Stager stager(stage, *spec, fillDm, share == shares.end() ? nullptr : &share->second);
     FailureOr<Value> hbm = stager.run();
     if (failed(hbm))
       return failure();

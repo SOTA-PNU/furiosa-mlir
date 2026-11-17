@@ -116,9 +116,10 @@ runs `linalg.mlir`, `structured.mlir`, `steps.mlir` and `tiled.mlir`.
 Mapping a tiled kernel to fopt is the second level: the tiled class emits its engine stages as fopt, but its data
 movement abstract, as `fopt.stage` (a buffer read at a linear index over the program's axes, with the layout its
 tiles are cut from) and `fopt.read` (one tile of it in DM). `furiosa-dma` (lib/Codegen/Tile/Dma.cpp) makes the
-data-movement decisions and lowers both to HBM staging buffers and DMAs: padded copies and their fills, tap-major
-or row-major K for contraction operands, inner digits zero-padded in the source copy, the taps' DMAs as kept
-loops over affine tap classes. The crate writes each kernel's level before the pass as `<stem>.ftile.mlir`, next
+data-movement decisions and lowers both to HBM staging buffers and DMAs: padded copies and their fills (one copy
+shared by the stages of a buffer that differ only in their windows, such as unrolled taps), tap-major or
+row-major K for contraction operands, inner digits zero-padded in the source copy, the taps' DMAs as kept loops
+over affine tap classes. The crate writes each kernel's level before the pass as `<stem>.ftile.mlir`, next
 to the final `<stem>.fopt.mlir`.
 fp16 buffers live as f32 on the device (furiosa-opt has no f16): mapping a kernel to fopt widens its `f16` to
 `f32` and drops the conversions between them, and the crate converts F16 at the graph boundary (exactly in,
