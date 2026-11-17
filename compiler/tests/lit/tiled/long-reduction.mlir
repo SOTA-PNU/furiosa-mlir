@@ -8,7 +8,7 @@
 // CHECK-SAME: ["CP", 1152]
 // CHECK-SAME: ["RF0", 2048], ["RC0", 4]
 // CHECK-COUNT-4: fopt.vector_intra_slice_reduce
-// CHECK: fopt.begin_interleaved
+// CHECK: fopt.ve "vector_clip_zip" "ClipBinaryOpF32::Add" {{.*}} zip
 
 #x = affine_map<(d0, d1) -> (d0, d1)>
 #y = affine_map<(d0, d1) -> (d0)>

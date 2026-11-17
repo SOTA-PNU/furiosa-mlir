@@ -16,6 +16,7 @@ add_triton_library(FuriosaCodegen
   Tile/Lower.cpp
   Tile/Plan.cpp
   Tile/TileLoops.cpp
+  Tile/VeFuse.cpp
   Tile/TilePass.cpp
   Tile/Ops.cpp
   Steps.cpp

@@ -286,7 +286,6 @@ private:
     std::optional<double> imm;
     Value vrf;
     ArrayAttr branches;
-    bool fp = false; // runs in the 4-way float region
   };
   Value pass(Value in, const AluSpec &spec, ArrayAttr tagCmps = {});
   Value zip(Value lhs, Value rhs, const AluSpec &spec);
@@ -408,69 +407,19 @@ Value Lowering::vrfOf(Value vecDm) {
                          s);
 }
 
-/// One Vector Engine pass: fetch a DM tile or vector, one ALU op, commit.
+/// One Vector Engine op on a DM tile or vector (furiosa-ve-fuse decides the passes).
 Value Lowering::pass(Value in, const AluSpec &spec, ArrayAttr tagCmps) {
-  auto t = cast<DmTensorType>(in.getType());
-  auto [timeParts, packet] = timePacket(t.getElement());
-  MapAttr time = pairOf(timeParts);
-  auto st = [&](MapAttr tm, MapAttr pk) { return kb.streamType(f32, t.getSlice(), tm, pk); };
-  Value s = BeginOp::create(b, loc(), st(kb.one(), t.getElement()), in, ContextKind::Main);
-  s = FetchOp::create(b, loc(), st(time, packet), s);
-  s = CollectOp::create(b, loc(), st(time, packet), s);
-  s = VectorInitOp::create(b, loc(), st(time, packet), s);
-  if (tagCmps)
-    s = VectorTagCmpOp::create(b, loc(), st(time, packet), s, tagCmps);
-  else
-    s = VectorIntraSliceTagOp::create(b, loc(), st(time, packet), s);
-  // The float region is four lanes wide: split the packet's halves into time.
-  SmallVector<MapAttr> t4(timeParts);
-  t4.push_back(packet.stride(4));
-  MapAttr p4 = packet.modulo(4);
-  if (spec.fp)
-    s = VectorNarrowSplitOp::create(b, loc(), st(pairOf(t4), p4), s);
-  StreamType opType = spec.fp ? st(pairOf(t4), p4) : st(time, packet);
-  s = VectorAluOp::create(b, loc(), opType, s, b.getStringAttr(spec.method), b.getStringAttr(spec.op),
-                          spec.mode.empty() ? StringAttr() : b.getStringAttr(spec.mode),
-                          spec.imm ? b.getF32FloatAttr(*spec.imm) : FloatAttr(), spec.vrf, UnitAttr(), spec.branches);
-  // Widening joins the split halves back into the packet (whose digits the column layout keeps unpadded, so
-  // both the CPU check and the NPU lowering see the same packet).
-  MapAttr wide = packet;
-  if (spec.fp)
-    s = VectorWidenConcatOp::create(b, loc(), st(time, wide), s);
-  s = VectorFinalOp::create(b, loc(), st(time, wide), s);
-  s = CommitTrimOp::create(b, loc(), st(time, wide), s);
-  return CommitOp::create(b, loc(), t, s);
+  return VeOp::create(b, loc(), in.getType(), in, Value(), spec.method, spec.op,
+                      spec.mode.empty() ? StringAttr() : b.getStringAttr(spec.mode),
+                      spec.imm ? b.getF32FloatAttr(*spec.imm) : FloatAttr(), spec.vrf, spec.branches, tagCmps,
+                      MapAttr());
 }
 
-/// One pass pairing two DM tensors of one type through an interleaved fetch and a zip op.
+/// One Vector Engine op pairing two DM tensors of one type (an interleaved fetch and a zip op).
 Value Lowering::zip(Value lhs, Value rhs, const AluSpec &spec) {
-  auto t = cast<DmTensorType>(lhs.getType());
-  auto [timeParts, packet] = timePacket(t.getElement());
-  MapAttr time = pairOf(timeParts);
-  auto st = [&](MapAttr tm, MapAttr pk) { return kb.streamType(f32, t.getSlice(), tm, pk); };
-  MapAttr ti = pairOf({time, interleave});
-  Value s = BeginInterleavedOp::create(b, loc(), st(interleave, t.getElement()), lhs, rhs, ContextKind::Main,
-                                       interleave);
-  s = FetchOp::create(b, loc(), st(ti, packet), s);
-  s = CollectOp::create(b, loc(), st(ti, packet), s);
-  s = VectorInitOp::create(b, loc(), st(ti, packet), s);
-  s = VectorIntraSliceUnzipOp::create(b, loc(), st(time, packet), s, interleave);
-  SmallVector<MapAttr> t4(timeParts);
-  t4.push_back(packet.stride(4));
-  MapAttr p4 = packet.modulo(4);
-  if (spec.fp)
-    s = VectorNarrowSplitOp::create(b, loc(), st(pairOf(t4), p4), s);
-  s = VectorAluOp::create(b, loc(), spec.fp ? st(pairOf(t4), p4) : st(time, packet), s, b.getStringAttr(spec.method),
-                          b.getStringAttr(spec.op), spec.mode.empty() ? StringAttr() : b.getStringAttr(spec.mode),
-                          FloatAttr(), Value(), UnitAttr(), ArrayAttr());
-  // Widening joins the split halves back into the packet (whose digits the column layout keeps unpadded, so
-  // both the CPU check and the NPU lowering see the same packet).
-  MapAttr wide = packet;
-  if (spec.fp)
-    s = VectorWidenConcatOp::create(b, loc(), st(time, wide), s);
-  s = VectorFinalOp::create(b, loc(), st(time, wide), s);
-  s = CommitTrimOp::create(b, loc(), st(time, wide), s);
-  return CommitOp::create(b, loc(), t, s);
+  return VeOp::create(b, loc(), lhs.getType(), lhs, rhs, spec.method, spec.op,
+                      spec.mode.empty() ? StringAttr() : b.getStringAttr(spec.mode), FloatAttr(), Value(),
+                      ArrayAttr(), ArrayAttr(), interleave);
 }
 
 FailureOr<Val> Lowering::leaf(unsigned read, ArrayRef<int64_t> tileIndex) {
@@ -526,7 +475,6 @@ FailureOr<Val> Lowering::binary(const std::string &op, Val l, Val r) {
   if (op == "add" || op == "sub" || op == "mul" || op == "div") {
     std::string fpOp = op == "add" ? "FpBinaryOp::AddF" : op == "sub" ? "FpBinaryOp::SubF"
                        : op == "mul" ? "FpBinaryOp::MulF(FpMulAlu::Mul0)" : "FpBinaryOp::DivF";
-    spec.fp = true;
     if (r.kind == l.kind) {
       spec.method = "vector_fp_zip";
       spec.op = fpOp;
@@ -708,8 +656,7 @@ FailureOr<Val> Lowering::evaluate(unsigned node, ArrayRef<int64_t> tileIndex) {
       AluSpec spec;
       spec.method = "vector_fp_binary";
       spec.op = "FpBinaryOp::MulF(FpMulAlu::Mul0)";
-      spec.fp = true;
-      spec.branches = b.getArrayAttr({b.getArrayAttr({b.getStringAttr("1---"), b.getF32FloatAttr(-1)}),
+        spec.branches = b.getArrayAttr({b.getArrayAttr({b.getStringAttr("1---"), b.getF32FloatAttr(-1)}),
                                       b.getArrayAttr({b.getStringAttr("all"), b.getF32FloatAttr(1)})});
       v = Val{x.kind, pass(x.dm, spec, b.getStrArrayAttr({"Less(0.0f32)", "False", "False", "False"}))};
       break;
@@ -718,8 +665,7 @@ FailureOr<Val> Lowering::evaluate(unsigned node, ArrayRef<int64_t> tileIndex) {
       AluSpec sq;
       sq.method = "vector_fp_unary";
       sq.op = "FpUnaryOp::Sqrt";
-      sq.fp = true;
-      v = binary("div", Val{Val::Scalar, Value(), 1.0}, Val{x.kind, pass(x.dm, sq)});
+        v = binary("div", Val{Val::Scalar, Value(), 1.0}, Val{x.kind, pass(x.dm, sq)});
       break;
     }
     static const std::map<std::string, std::string> unary = {
@@ -731,7 +677,6 @@ FailureOr<Val> Lowering::evaluate(unsigned node, ArrayRef<int64_t> tileIndex) {
     AluSpec spec;
     spec.method = "vector_fp_unary";
     spec.op = "FpUnaryOp::" + it->second;
-    spec.fp = true;
     v = Val{x.kind, pass(x.dm, spec)};
     break;
   }
@@ -859,7 +804,6 @@ FailureOr<Value> Lowering::contract(ArrayRef<int64_t> tileIndex) {
       if (failed(h))
         return failure();
       AluSpec mul{"vector_fp_zip", "FpBinaryOp::MulF(FpMulAlu::Mul0)"};
-      mul.fp = true;
       bDm = zip(convert(bDm, f32), convert(toDm(*h, g.trfAxes(), tileIndex, pairOf({cl, k}), true, kt), f32), mul);
     }
     MapAttr tt = pairOf({lane, group, k.stride(16)});
@@ -878,7 +822,6 @@ FailureOr<Value> Lowering::contract(ArrayRef<int64_t> tileIndex) {
       if (failed(h))
         return failure();
       AluSpec mul{"vector_fp_zip", "FpBinaryOp::MulF(FpMulAlu::Mul0)"};
-      mul.fp = true;
       aDm = zip(convert(aDm, f32), convert(toDm(*h, rows, tileIndex, pairOf(ae), true, kt), f32), mul);
     }
     Type at = cast<DmTensorType>(aDm.getType()).getElementType();

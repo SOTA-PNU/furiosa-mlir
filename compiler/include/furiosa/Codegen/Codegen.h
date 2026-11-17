@@ -39,6 +39,10 @@ std::unique_ptr<Pass> createTilePass();
 /// (lib/Codegen/Tile/Dma.cpp).
 std::unique_ptr<Pass> createDmaPass();
 
+/// furiosa-ve-fuse: groups the abstract Vector Engine ops (fopt.ve) into passes in the engine's stage order and
+/// lowers them (lib/Codegen/Tile/VeFuse.cpp).
+std::unique_ptr<Pass> createVeFusePass();
+
 /// Writes every fopt kernel of `module` as one Rust module (the body of src/kernel/<symbol>.rs).
 LogicalResult translateFoptToRust(ModuleOp module, llvm::raw_ostream &os);
 

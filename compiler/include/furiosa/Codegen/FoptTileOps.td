@@ -67,6 +67,27 @@ def Fopt_VectorTagCmpOp : Fopt_StageOp<"vector_tag_cmp"> {
   let assemblyFormat = "$cmps $input attr-dict `:` qualified(type($input)) `->` qualified(type($result))";
 }
 
+// Hardware-abstract Vector Engine ops (grouped into passes by furiosa-ve-fuse, lib/Codegen/Tile/VeFuse.cpp). The
+// lowering says which ALU op each value takes; the pass decides which ops share a pass (one fetch, the ops in the
+// engine's stage order on distinct ALUs, one commit) and which values go back through DM between them.
+def Fopt_VeOp : Fopt_Op<"ve", [AttrSizedOperandSegments]> {
+  let summary = "one Vector Engine ALU op on a DM tensor's elements (abstract)";
+  let description = [{
+    `method`, `op`, `mode`, `imm`, `vrf` and `branches` are the ALU call's, as in vector_alu. `zip` pairs `input`
+    with a second DM tensor of its type, fetched interleaved on `axis`; `tags` are the four comparisons the pass
+    tags the stream with. Either makes the op start its pass. The result has the input's type.
+  }];
+  let arguments = (ins Fopt_DmTensor:$input, Optional<Fopt_DmTensor>:$zip, StrAttr:$method, StrAttr:$op,
+                       OptionalAttr<StrAttr>:$mode, OptionalAttr<F32Attr>:$imm, Optional<Fopt_VrfTensor>:$vrf,
+                       OptionalAttr<ArrayAttr>:$branches, OptionalAttr<StrArrayAttr>:$tags,
+                       OptionalAttr<Fopt_MapAttr>:$axis);
+  let results = (outs Fopt_DmTensor:$result);
+  let assemblyFormat = [{
+    $method $op $input (`zip` $zip^ `:` qualified(type($zip)))? (`vrf` $vrf^ `:` qualified(type($vrf)))? attr-dict
+    `:` qualified(type($input)) `->` qualified(type($result))
+  }];
+}
+
 // Kept device loops: `for i in 0..count { body }`. The body block's one index argument is the induction variable;
 // tile_at views inside index with it, so one DMA statement covers every iteration (the NPU keeps HBM loops,
 // where unrolled DMAs cost compile time superlinearly).

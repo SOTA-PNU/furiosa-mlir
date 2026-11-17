@@ -113,7 +113,8 @@ are sliced) and K loops over its contraction's reduction dims (`furiosa.tile_dim
 whole taps or part of the inner axis), and mapping to fopt folds the loops back into the plan's tile digits and
 K tiles. Codegen maps this stage. L1
 runs `linalg.mlir`, `structured.mlir`, `steps.mlir` and `tiled.mlir`.
-Mapping a tiled kernel to fopt is the second level: the tiled class emits its engine stages as fopt, its tiles as
+Mapping a tiled kernel to fopt is the second level: the tiled class emits its contraction stages as fopt, its
+Vector Engine work as one abstract op per operation (`fopt.ve`: the ALU call, its operand, or a zip of two tiles), its tiles as
 device loops (one `fopt.for` per tile digit, the body once with its tile views indexed by the loop's induction
 variable; furiosa-opt keeps the loop), and its data movement abstract, as `fopt.stage` (a buffer read at a linear index over the program's axes, with the layout its
 tiles are cut from) and `fopt.read` (one tile of it in DM). `furiosa-dma` (lib/Codegen/Tile/Dma.cpp) makes the
@@ -121,8 +122,12 @@ data-movement decisions and lowers both to HBM staging buffers and DMAs: padded 
 shared by the stages of a buffer that differ only in their windows, such as unrolled taps), tap-major or
 row-major K for contraction operands, inner digits zero-padded in the source copy (a K window of a longer dim,
 such as attention's P x V reading one key block of V, is one block of the padded K digit), the taps' DMAs as kept loops
-over affine tap classes. The crate writes each kernel's level before the pass as `<stem>.ftile.mlir`, next
-to the final `<stem>.fopt.mlir`.
+over affine tap classes. `furiosa-ve-fuse` (lib/Codegen/Tile/VeFuse.cpp) groups the `fopt.ve` ops into passes:
+an op joins the pass of its input when that input has no other use and the op fits the engine's stage order
+(stages never go back; the float and clip stages take several ops, each on its own ALU; multiplications take
+Mul0, Mul1, then the FMA unit; an add moves to the clip stage once the FMA unit is taken), so a batch norm's
+subtract, scale and shift share one fetch and one commit. The crate writes each kernel's level before both passes
+as `<stem>.ftile.mlir`, next to the final `<stem>.fopt.mlir`.
 fp16 buffers live as f32 on the device (furiosa-opt has no f16): mapping a kernel to fopt widens its `f16` to
 `f32` and drops the conversions between them, and the crate converts F16 at the graph boundary (exactly in,
 round-to-nearest-even out); `steps.mlir` and the stages before it keep `f16`.
