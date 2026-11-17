@@ -159,6 +159,10 @@ compiler/.venv/bin/python -m harness.ops.run --stage npu --jobs 8      # kernel[
 compiler/.venv/bin/python -m harness.ops.case reduce.argmax.int8.2x7x33 --stage npu   # one case
 ```
 
+The npu stage of all cases takes hours. To keep one compiler under it while others relink, run it against a copy of
+the Triton package: `cp -a third_party/triton/python/triton <snap>/triton` (replace `backends/furiosa`, a symlink,
+with a copy of `compiler/backend`), then `PYTHONPATH=<snap> compiler/.venv/bin/python -m harness.ops.run ...`.
+
 Each run writes `harness/out/ops/<stage>.{json,md}`: an operator x dtype table and the failures grouped
 by the compiler's diagnostic. At the raise stage (raised IR on the CPU JIT) the first 791 cases pass; the npu stage is the verdict.
 
