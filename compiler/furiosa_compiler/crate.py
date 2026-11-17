@@ -18,9 +18,9 @@ from pathlib import Path
 
 from triton._C.libtriton import furiosa
 
-# fp16 buffers live as f32 on the device (furiosa-opt has no f16), int8 ones as i32 (the Vector Engine computes on
-# 32-bit lanes); both convert at the graph boundary.
-RUST_DTYPES = {"fp32": "f32", "bf16": "bf16", "i32": "i32", "fp16": "f32", "i8": "i32"}
+# fp16 and fp8 buffers live as f32 on the device (furiosa-opt has no f16), int8 ones as i32 (the Vector Engine
+# computes on 32-bit lanes); all convert at the graph boundary.
+RUST_DTYPES = {"fp32": "f32", "bf16": "bf16", "i32": "i32", "fp16": "f32", "i8": "i32", "fp8e4nv": "f32"}
 MLIR_DTYPES = {"f32": "f32", "bf16": "bf16", "i32": "i32", "f16": "f32", "i8": "i32", "i16": "i32"}  # element types of step temporaries
 ELEMENT_BYTES = {"fp32": 4, "bf16": 2, "i32": 4}
 
@@ -109,6 +109,13 @@ impl Stored for i32 {
     const DTYPE: Dtype = Dtype::I32;
 }
 
+/// An E4M3 fp8 code's value (bias 7, no infinities, S.1111.111 the NaN).
+fn f8e4m3(b: u8) -> f32 {
+    let (e, m) = (i32::from(b >> 3 & 15), f32::from(b & 7));
+    let v = if e == 15 && m == 7.0 { f32::NAN } else if e == 0 { m / 8.0 * 2f32.powi(-6) } else { (1.0 + m / 8.0) * 2f32.powi(e - 7) };
+    if b & 128 != 0 { -v } else { v }
+}
+
 /// A graph's inputs file: every input, weight and state buffer by name.
 pub struct Inputs(Vec<u8>);
 
@@ -126,6 +133,12 @@ impl Inputs {
             let wide: Vec<u8> = view.data().chunks_exact(2)
                 .flat_map(|h| half::f16::from_le_bytes([h[0], h[1]]).to_f32().to_le_bytes())
                 .collect();
+            let wide = TensorView::new(Dtype::F32, view.shape().to_vec(), &wide)?;
+            return HostTensor::from_safetensors(&wide).map_err(|e| eyre!("buffer {name}: {e:?}"));
+        }
+        if view.dtype() == Dtype::F8_E4M3 && D::DTYPE == Dtype::F32 {
+            // An fp8 buffer lives as f32 on the device: E4M3 widens exactly.
+            let wide: Vec<u8> = view.data().iter().flat_map(|&b| f8e4m3(b).to_le_bytes()).collect();
             let wide = TensorView::new(Dtype::F32, view.shape().to_vec(), &wide)?;
             return HostTensor::from_safetensors(&wide).map_err(|e| eyre!("buffer {name}: {e:?}"));
         }
@@ -160,6 +173,23 @@ impl Outputs {
             .flat_map(|f| half::f16::from_f32(f32::from_le_bytes([f[0], f[1], f[2], f[3]])).to_le_bytes())
             .collect();
         self.0.insert(name.to_owned(), (Dtype::F16, shape.to_vec(), narrow));
+    }
+
+    /// Stores an fp8 buffer (f32 on the device) as F8_E4M3: the nearest finite code, ties to the even one (a value
+    /// past the largest saturates to it).
+    pub fn put_f8<E: M>(&mut self, name: &str, shape: &[usize], tensor: HostTensor<f32, E>) {
+        let bytes: Vec<u8> = tensor.into_buffer().into();
+        assert_eq!(bytes.len(), shape.iter().product::<usize>() * 4, "{name}: shape {shape:?}");
+        let narrow = bytes.chunks_exact(4).map(|f| {
+            let x = f32::from_le_bytes([f[0], f[1], f[2], f[3]]);
+            if x.is_nan() {
+                return 0x7f;
+            }
+            (0..=255u8).filter(|&b| !f8e4m3(b).is_nan())
+                .min_by(|&a, &b| (f8e4m3(a) - x).abs().total_cmp(&(f8e4m3(b) - x).abs()).then((a & 1).cmp(&(b & 1))))
+                .unwrap()
+        }).collect();
+        self.0.insert(name.to_owned(), (Dtype::F8_E4M3, shape.to_vec(), narrow));
     }
 
     /// Stores an int8 buffer (i32 on the device, its values kept within int8) as I8.
@@ -467,7 +497,7 @@ class RunGraph:
                     raise CrateError(f"graph {g}: output {buffer} is never written")
                 mapping = self.host_mapping(g, names, buffer, info["shape"])
                 shape = ", ".join(str(d) for d in info["shape"])
-                put = {"fp16": "put_f16", "i8": "put_i8"}.get(info["dtype"], "put")
+                put = {"fp16": "put_f16", "i8": "put_i8", "fp8e4nv": "put_f8"}.get(info["dtype"], "put")
                 lines.append(
                     f"    files.{put}({json.dumps(buffer)}, &[{shape}], HbmTensor::<{dtype(buffer)}, m![1], {mapping}>"
                     f"::try_from({variable(buffer)}.alias(..)?)?.to_host::<{mapping}>(&mut device.pdma).await?);"

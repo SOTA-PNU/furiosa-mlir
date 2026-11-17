@@ -112,14 +112,16 @@ SmallVector<int64_t> writtenArgs(func::FuncOp func) {
   return written;
 }
 
-/// fp16 buffers live as f32 on the device (furiosa-opt has no f16, and every f16 is exact in f32; F16 converts at
-/// the graph boundary): the kernel's f16 tensors and scalars become f32, and the conversions between them vanish.
+/// fp16 and fp8 buffers live as f32 on the device (furiosa-opt has no f16, every f16 and fp8 is exact in f32, and
+/// an fp8 is exact in the bf16 a contraction casts f32 to; both convert at the graph boundary): the kernel's f16 and
+/// fp8 tensors and scalars become f32, and the conversions between them vanish.
 void widenF16(func::FuncOp func) {
   Type f32 = Float32Type::get(func.getContext());
+  auto narrow = [](Type t) { return t.isF16() || isa<Float8E4M3FNType, Float8E5M2Type>(t); };
   auto widen = [&](Type t) -> Type {
-    if (t.isF16())
+    if (narrow(t))
       return f32;
-    if (auto rt = dyn_cast<RankedTensorType>(t); rt && rt.getElementType().isF16())
+    if (auto rt = dyn_cast<RankedTensorType>(t); rt && narrow(rt.getElementType()))
       return rt.clone(f32);
     return t;
   };
@@ -138,7 +140,7 @@ void widenF16(func::FuncOp func) {
     for (Value v : op->getResults())
       retype(v);
     if (auto c = dyn_cast<arith::ConstantOp>(op))
-      if (auto fa = dyn_cast<FloatAttr>(c.getValue()); fa && fa.getType().isF16())
+      if (auto fa = dyn_cast<FloatAttr>(c.getValue()); fa && narrow(fa.getType()))
         c.setValueAttr(FloatAttr::get(f32, fa.getValueAsDouble()));
   });
   if (!any)

@@ -12,6 +12,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
@@ -456,9 +457,76 @@ void collapse(linalg::GenericOp g) {
   g.erase();
 }
 
+/// An int8 contraction (i32 sums of int8 products: Triton's int8 tl.dot) runs on the f32 path where that is exact:
+/// int8 values are exact in the bf16 the Contraction Engine reads, their products (at most 2^14) in f32, and a sum of
+/// K of them while K * 2^14 stays within 2^24. The operands convert to f32 and the sums back to i32 in elementwise
+/// generics of their own.
+/// shortcut: K <= 1024 only; longer K needs the Contraction Engine's native int8 path (i8 operands, i32 sums).
+void int8ContractionsAsFloat(ModuleOp module) {
+  SmallVector<linalg::GenericOp> found;
+  module.walk([&](linalg::GenericOp g) {
+    if (g.getNumDpsInputs() != 2 || g.getNumDpsInits() != 1 || !g.getNumReductionLoops())
+      return;
+    auto fill = g.getDpsInits()[0].getDefiningOp<linalg::FillOp>();
+    if (!fill || !matchPattern(fill.getInputs()[0], m_Zero()))
+      return;
+    int64_t k = 1;
+    for (auto [it, n] : llvm::zip(g.getIteratorTypesArray(), g.getStaticLoopRanges()))
+      if (it == utils::IteratorType::reduction)
+        k *= n;
+    Block &body = g.getRegion().front();
+    auto add = dyn_cast_or_null<arith::AddIOp>(body.getTerminator()->getOperand(0).getDefiningOp());
+    auto mul = add ? add.getOperand(1).getDefiningOp<arith::MulIOp>() : arith::MulIOp();
+    auto extended = [&](Value v) {
+      auto ext = v.getDefiningOp<arith::ExtSIOp>();
+      return ext && ext.getIn().getType().isInteger(8) && isa<BlockArgument>(ext.getIn());
+    };
+    if (k <= 1024 && add && add.getOperand(0) == body.getArgument(2) && add.getType().isInteger(32) && mul &&
+        extended(mul.getLhs()) && extended(mul.getRhs()) && body.getOperations().size() == 5)
+      found.push_back(g);
+  });
+  for (linalg::GenericOp g : found) {
+    OpBuilder b(g);
+    Location loc = g.getLoc();
+    Type f32 = b.getF32Type();
+    auto elementwise = [&](Value in, Type to, function_ref<Value(OpBuilder &, Location, Value)> fn) {
+      auto t = cast<RankedTensorType>(in.getType());
+      Value empty = tensor::EmptyOp::create(b, loc, t.getShape(), to);
+      AffineMap id = b.getMultiDimIdentityMap(t.getRank());
+      return linalg::GenericOp::create(b, loc, TypeRange{t.clone(to)}, ValueRange{in}, ValueRange{empty},
+                                       ArrayRef<AffineMap>{id, id},
+                                       SmallVector<utils::IteratorType>(t.getRank(), utils::IteratorType::parallel),
+                                       [&](OpBuilder &nb, Location l, ValueRange args) {
+                                         linalg::YieldOp::create(nb, l, fn(nb, l, args[0]));
+                                       })
+          .getResult(0);
+    };
+    auto toFloat = [&](OpBuilder &nb, Location l, Value v) { return arith::SIToFPOp::create(nb, l, f32, v).getResult(); };
+    Value x = elementwise(g.getDpsInputs()[0], f32, toFloat), w = elementwise(g.getDpsInputs()[1], f32, toFloat);
+    auto outType = cast<RankedTensorType>(g.getResult(0).getType());
+    Value zero = arith::ConstantOp::create(b, loc, b.getF32FloatAttr(0));
+    Value acc = linalg::FillOp::create(b, loc, zero, tensor::EmptyOp::create(b, loc, outType.getShape(), f32).getResult())
+                    .getResult(0);
+    Value sums = linalg::GenericOp::create(b, loc, TypeRange{outType.clone(f32)}, ValueRange{x, w}, ValueRange{acc},
+                                           g.getIndexingMapsArray(), g.getIteratorTypesArray(),
+                                           [](OpBuilder &nb, Location l, ValueRange args) {
+                                             Value m = arith::MulFOp::create(nb, l, args[0], args[1]);
+                                             linalg::YieldOp::create(nb, l, arith::AddFOp::create(nb, l, args[2], m).getResult());
+                                           })
+                     .getResult(0);
+    // The sums are integers: rounding them first makes the conversion exact however it rounds.
+    Value back = elementwise(sums, outType.getElementType(), [&](OpBuilder &nb, Location l, Value v) {
+      return arith::FPToSIOp::create(nb, l, outType.getElementType(), math::RoundOp::create(nb, l, v)).getResult();
+    });
+    g.getResult(0).replaceAllUsesWith(back);
+    g.erase();
+  }
+}
+
 } // namespace
 
 void mlir::furiosa::normalizeContractions(ModuleOp module, function_ref<bool(linalg::GenericOp)> mapsAlone) {
+  int8ContractionsAsFloat(module);
   SmallVector<linalg::GenericOp> generics;
   module.walk([&](linalg::GenericOp g) {
     if (asContraction(g))
