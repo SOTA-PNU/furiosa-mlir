@@ -30,7 +30,8 @@ npu stage) against GPU goldens.
   nearest code); int8 sums run on the f32 path where exact (K <= 1024) (ae033b8).
 - Triton's attention backward tutorial on npu3, L0 to L4 (dq rel 0.017): the tiled analysis merges a loop's adjacent
   digits back into one axis; 2^x folds as e^(x ln 2); a reduction guarded by a program-dependent trip count splits
-  along the program loops; a guarded load reads the window it spans at an affine address (2f945b0).
+  along the program loops; a guarded load reads the window it spans at an affine address (2f945b0). All 25 corpus
+  cases now reach L4 (attention backward was the last).
 
 ## 1.1.0 (2026-11-17, release/1.1.0)
 
