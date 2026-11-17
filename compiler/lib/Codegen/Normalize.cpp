@@ -864,7 +864,10 @@ void splitIndexSelects(ModuleOp module, function_ref<bool(linalg::GenericOp)> ma
     }
     // Else (with the oracle) a read whose address wraps, a mod or floordiv by a constant of a linear term one loop
     // decides (tl.gather by (j + 1) % C): the runs are where the quotient holds, over which the read is linear.
-    for (OpOperand *in : sel || !mapsAlone ? ArrayRef<OpOperand *>{} : g.getDpsInputOperands())
+    SmallVector<OpOperand *> wrapping;
+    if (!sel && mapsAlone)
+      wrapping = g.getDpsInputOperands();
+    for (OpOperand *in : wrapping)
       for (AffineExpr e : g.getMatchingIndexingMap(in).getResults())
         e.walk([&](AffineExpr x) {
           auto bin = dyn_cast<AffineBinaryOpExpr>(x);
