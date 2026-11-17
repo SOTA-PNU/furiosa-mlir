@@ -13,6 +13,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SCF/Utils/Utils.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
@@ -25,6 +26,8 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/Support/Base64.h"
 #include "llvm/Support/JSON.h"
+
+#include <array>
 
 using namespace mlir;
 using namespace mlir::furiosa;
@@ -47,6 +50,32 @@ bool isCheap(Operation *op) {
 bool isIterationSlice(Operation *op) {
   auto slice = dyn_cast<tensor::ExtractSliceOp>(op);
   return slice && !slice.getOffsets().empty() && isa<scf::ForOp>(op->getParentOp());
+}
+
+/// The bytes an iteration slice views of its source, {offset, per-iteration stride, size}, when they are one
+/// contiguous range at the iteration index (the loop counting 0, 1, ...); the plan aliases nothing else.
+std::optional<std::array<int64_t, 3>> iterationView(tensor::ExtractSliceOp slice) {
+  auto loop = cast<scf::ForOp>(slice->getParentOp());
+  if (!matchPattern(loop.getLowerBound(), m_Zero()) || !matchPattern(loop.getStep(), m_One()))
+    return std::nullopt;
+  RankedTensorType src = slice.getSourceType();
+  int64_t width = src.getElementType().getIntOrFloatBitWidth() / 8, stride = width, offset = 0, perIter = -1;
+  bool inner = true; // the dims inside the box's first partial dim must be whole
+  for (int64_t d = src.getRank() - 1; d >= 0; --d) {
+    int64_t size = slice.getStaticSizes()[d], at = slice.getStaticOffsets()[d];
+    if (ShapedType::isDynamic(at)) {
+      if (slice.getDynamicOffset(d) != loop.getInductionVar() || perIter >= 0)
+        return std::nullopt;
+      perIter = stride;
+    } else {
+      offset += at * stride;
+    }
+    if (!inner && size != 1)
+      return std::nullopt;
+    inner &= size == src.getDimSize(d);
+    stride *= src.getDimSize(d);
+  }
+  return std::array<int64_t, 3>{offset, perIter, slice.getType().getNumElements() * width};
 }
 
 /// A kept loop whose body is split into steps: the plan runs it.
@@ -765,6 +794,19 @@ LogicalResult mlir::furiosa::splitSteps(ModuleOp module) {
     // A kept loop's body splits into steps of its own, which the plan runs once per iteration; the fills that
     // start its carried values become tables.
     for (auto loop : llvm::to_vector(kernel.getBody().front().getOps<scf::ForOp>())) {
+      // A slice the plan cannot view as one range (a box of several rows per iteration) unrolls the loop: its
+      // iterations' boxes are then copy steps.
+      bool viewable = true;
+      loop.getBody()->walk([&](tensor::ExtractSliceOp s) { viewable &= !isIterationSlice(s) || iterationView(s); });
+      if (!viewable) {
+        if (failed(loopUnrollFull(loop)))
+          return loop.emitError("cannot unroll a kept loop");
+        // The iterations' index arithmetic folds into static box offsets (upstream canonicalizations).
+        RewritePatternSet patterns(kernel.getContext());
+        tensor::ExtractSliceOp::getCanonicalizationPatterns(patterns, kernel.getContext());
+        (void)applyPatternsGreedily(kernel, std::move(patterns));
+        continue;
+      }
       for (OpOperand &init : loop.getInitArgsMutable()) {
         Attribute c;
         auto fill = init.get().getDefiningOp<linalg::FillOp>();
@@ -866,33 +908,16 @@ FailureOr<std::string> mlir::furiosa::stepsPlan(ModuleOp module) {
       } else if (isIterationSlice(&op)) {
         // A contiguous box at the iteration: the source's bytes from offset + iteration * iter_stride.
         auto slice = cast<tensor::ExtractSliceOp>(op);
-        auto loop = cast<scf::ForOp>(op.getParentOp());
         auto it = slot.find(slice.getSource());
         if (it == slot.end() || it->second.get("offset"))
           return op.emitError("an iteration slice of an unknown slot");
-        RankedTensorType src = slice.getSourceType();
-        int64_t width = src.getElementType().getIntOrFloatBitWidth() / 8, stride = width, offset = 0, perIter = -1;
-        bool inner = true; // the dims inside the box's first partial dim must be whole
-        for (int64_t d = src.getRank() - 1; d >= 0; --d) {
-          int64_t size = slice.getStaticSizes()[d], at = slice.getStaticOffsets()[d];
-          if (ShapedType::isDynamic(at)) {
-            Value v = slice.getDynamicOffset(d);
-            if (v != loop.getInductionVar() || !matchPattern(loop.getLowerBound(), m_Zero()) ||
-                !matchPattern(loop.getStep(), m_One()))
-              return op.emitError("an iteration slice at an offset other than the iteration index");
-            perIter = stride;
-          } else {
-            offset += at * stride;
-          }
-          if (!inner && size != 1)
-            return op.emitError("an iteration slice that is not contiguous");
-          inner &= size == src.getDimSize(d);
-          stride *= src.getDimSize(d);
-        }
+        std::optional<std::array<int64_t, 3>> bytes = iterationView(slice);
+        if (!bytes)
+          return op.emitError("an iteration slice that is not one contiguous range at the iteration index");
         llvm::json::Object view(it->second);
-        view["offset"] = offset;
-        view["iter_stride"] = perIter;
-        view["bytes"] = slice.getType().getNumElements() * width;
+        view["offset"] = (*bytes)[0];
+        view["iter_stride"] = (*bytes)[1];
+        view["bytes"] = (*bytes)[2];
         slot[slice.getResult()] = std::move(view);
       } else if (auto loop = dyn_cast<scf::ForOp>(op)) {
         if (!loop->hasAttr(kStepsAttr) || !loop.getStaticTripCount())
