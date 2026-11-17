@@ -13,6 +13,11 @@ SCAN = ["cumsum", "cumprod", "flip", "sort", "softmax"]
 MISC = ["cast", "clamp", "fma", "full", "zeros_like", "arange"]
 SHAPE = ["trans", "reshape", "expand_dims", "broadcast_to", "permute"]
 ATOMIC = ["atomic_add", "atomic_max", "atomic_min", "atomic_and", "atomic_or", "atomic_xor", "atomic_add_rows"]
+# The rest of lowlevel-api-test's operator list (cpu_gpu.py), one kernel per group as above.
+EXTRA = ["reduce_or", "topk", "map_elementwise", "squeeze_ravel", "broadcast", "rand", "randn", "randint", "rand4x",
+         "randn4x", "randint4x", "associative_scan", "reduce_keep_dims", "join", "split", "interleave", "cat",
+         "swizzle2d", "umulhi", "gather", "histogram", "maximum_nan", "atomic_xchg_old", "atomic_add_old",
+         "device_print", "device_assert", "range_loop"]
 
 
 @triton.jit
@@ -244,3 +249,100 @@ def atomic_kernel(x_ptr, out_ptr, R: tl.constexpr, C: tl.constexpr, OP: tl.const
         tl.atomic_xor(out_ptr + c, x)
     else:
         tl.atomic_add(out_ptr + row * C + c, x)
+
+
+@triton.jit
+def _compare(x, y):
+    if x < y:
+        return -1
+    elif x == y:
+        return 0
+    return 1
+
+
+@triton.jit
+def _add(a, b):
+    return a + b
+
+
+@triton.jit
+def extra_kernel(x_ptr, y_ptr, out_ptr, R: tl.constexpr, C: tl.constexpr, OP: tl.constexpr):
+    """The rest of lowlevel-api-test's operators on an [R, C] block (powers of two); out is [R, C]."""
+    r = tl.arange(0, R)[:, None]
+    c = tl.arange(0, C)[None, :]
+    offs = r * C + c
+    x = tl.load(x_ptr + offs)
+    y = tl.load(y_ptr + offs)
+    if OP == 0:
+        out = x * 0 + tl.reduce_or(x, axis=1)[:, None]
+    elif OP == 1:
+        out = tl.topk(x, C)
+    elif OP == 2:
+        out = tl.map_elementwise(_compare, x, y)
+    elif OP == 3:
+        flat = tl.ravel(tl.unsqueeze(x, 0))
+        out = tl.reshape(tl.squeeze(tl.reshape(flat, (1, R * C)), 0), (R, C))
+    elif OP == 4:
+        a, b = tl.broadcast(tl.sum(x, axis=1)[:, None], y)
+        out = a + b
+    elif OP == 5:
+        out = tl.rand(1234, offs)
+    elif OP == 6:
+        out = tl.randn(1234, offs)
+    elif OP == 7:
+        out = tl.randint(1234, offs)
+    elif OP == 8:
+        u1, u2, u3, u4 = tl.rand4x(1234, offs)
+        out = u1 + u2 + u3 + u4
+    elif OP == 9:
+        n1, n2, n3, n4 = tl.randn4x(1234, offs)
+        out = n1 + n2 + n3 + n4
+    elif OP == 10:
+        i1, i2, i3, i4 = tl.randint4x(1234, offs)
+        out = i1 ^ i2 ^ i3 ^ i4
+    elif OP == 11:
+        out = tl.associative_scan(x, 1, _add)
+    elif OP == 12:
+        out = x * 0 + tl.reduce(x, 1, _add, keep_dims=True)
+    elif OP == 13:  # the left halves of x and y, joined along a new last axis
+        h = tl.arange(0, C // 2)[None, :]
+        out = tl.reshape(tl.join(tl.load(x_ptr + r * C + h), tl.load(y_ptr + r * C + h)), (R, C))
+    elif OP == 14:  # even columns, then odd columns
+        a, b = tl.split(tl.reshape(x, (R, C // 2, 2)))
+        out = tl.reshape(tl.join(a, b).permute(0, 2, 1), (R, C))
+    elif OP == 15:
+        h = tl.arange(0, C // 2)[None, :]
+        out = tl.interleave(tl.load(x_ptr + r * C + h), tl.load(y_ptr + r * C + h))
+    elif OP == 16:  # two halves of the flat block concatenated (any order: can_reorder)
+        n: tl.constexpr = R * C // 2
+        flat = tl.cat(tl.load(x_ptr + tl.arange(0, n)), tl.load(x_ptr + n + tl.arange(0, n)), can_reorder=True)
+        out = tl.reshape(flat, (R, C))
+    elif OP == 17:
+        i, j = tl.swizzle2d(offs // C, offs % C, R, C, 4)
+        out = i * C + j
+    elif OP == 18:
+        out = tl.umulhi(x, y)
+    elif OP == 19:
+        index = tl.broadcast_to(((tl.arange(0, C) + 1) % C)[None, :], (R, C))
+        out = tl.gather(x, index, axis=1)
+    elif OP == 20:
+        out = x * 0 + tl.histogram(tl.ravel(x), C)[None, :]
+    elif OP == 21:  # NaN propagates in the left half, is ignored in the right
+        all_ = tl.maximum(x, y, propagate_nan=tl.PropagateNan.ALL)
+        none = tl.maximum(x, y, propagate_nan=tl.PropagateNan.NONE)
+        out = tl.where(c < C // 2, all_, none)
+    elif OP == 22:  # the old values; x_ptr receives y
+        out = tl.atomic_xchg(x_ptr + offs, y)
+    elif OP == 23:
+        out = tl.atomic_add(x_ptr + offs, y)
+    elif OP == 24:
+        tl.device_print("x", x)
+        out = x
+    elif OP == 25:
+        tl.device_assert(x == x, "x is not NaN")
+        out = x
+    else:
+        out = x * 0
+        for i in tl.range(0, 4):
+            out += i
+    tl.store(out_ptr + offs, out.to(out_ptr.dtype.element_ty))

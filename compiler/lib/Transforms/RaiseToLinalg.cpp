@@ -22,6 +22,7 @@
 #include "furiosa/Transforms/Passes.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -905,6 +906,17 @@ struct Write {
   Operation *operator->() const { return op; }
 };
 
+/// What reads a buffer: a load, or the old value an atomic read-modify-write returns.
+struct Read {
+  Operation *op;
+  Value getPtr() const { return isa<tt::LoadOp>(op) ? cast<tt::LoadOp>(op).getPtr() : cast<tt::AtomicRMWOp>(op).getPtr(); }
+  Value getMask() const { return isa<tt::LoadOp>(op) ? cast<tt::LoadOp>(op).getMask() : cast<tt::AtomicRMWOp>(op).getMask(); }
+  Value getOther() const { return isa<tt::LoadOp>(op) ? cast<tt::LoadOp>(op).getOther() : Value(); }
+  Type getType() const { return op->getResult(0).getType(); }
+  InFlightDiagnostic emitError(const Twine &message) const { return op->emitError(message); }
+  operator Operation *() const { return op; }
+};
+
 struct StoreSpace {
   int arg = -1;
   SmallVector<int64_t> viewShape, viewStrides; // row-major view of the buffer
@@ -1135,7 +1147,9 @@ private:
   Value flatOf(Value version, int arg);
   Value versionAt(Operation *load, int arg);
   FailureOr<Value> emit(Gen &g, Value v, ArrayRef<Axis> env);
-  FailureOr<Value> emitLoad(Gen &g, tt::LoadOp load, ArrayRef<Axis> env);
+  FailureOr<Value> emitLoad(Gen &g, Read load, ArrayRef<Axis> env);
+  FailureOr<Value> axisValue(Gen &g, Operation *at, ArrayRef<Axis> env, unsigned k);
+  FailureOr<Value> emitMapElementwise(Gen &g, tt::MapElementwiseOp op, ArrayRef<Axis> env);
   FailureOr<Value> emitSym(Gen &g, Value v, const Sym &s0, ArrayRef<Axis> env);
   FailureOr<Value> emitDataTerms(Gen &g, const Sym &s0, ArrayRef<Axis> env);
   FailureOr<Value> emitElementwise(Gen &g, Operation *op, ArrayRef<Axis> env);
@@ -2130,7 +2144,7 @@ FailureOr<Value> Raiser::emitSym(Gen &g, Value v, const Sym &s0, ArrayRef<Axis> 
   return arith::IndexCastOp::create(ob, loc, getElementTypeOrSelf(v.getType()), iv).getResult();
 }
 
-FailureOr<Value> Raiser::emitLoad(Gen &g, tt::LoadOp load, ArrayRef<Axis> env) {
+FailureOr<Value> Raiser::emitLoad(Gen &g, Read load, ArrayRef<Axis> env) {
   OpBuilder &ob = *g.ob;
   const Sym *p0 = act[0]->get(load.getPtr());
   if (!p0 || p0->kind != Sym::Ptr)
@@ -2281,6 +2295,116 @@ static bool isElementwise(Operation *op) {
   return d && (isa<arith::ArithDialect>(d) || isa<math::MathDialect>(d)) && !isa<arith::ConstantOp>(op);
 }
 
+/// The index of axis `k` of `env` at the current point of `g`.
+FailureOr<Value> Raiser::axisValue(Gen &g, Operation *at, ArrayRef<Axis> env, unsigned k) {
+  auto e = rewrite(at, g, env, [&](const Sym &) { return getAffineDimExpr(k, ctx); }, Value());
+  if (failed(e))
+    return failure();
+  return exprValue(g, *e);
+}
+
+/// tl.map_elementwise: the scalar function's blocks, all pure, evaluated in order (an acyclic CFG,
+/// successors after their predecessors) with each block's arguments selected by the branch taken.
+FailureOr<Value> Raiser::emitMapElementwise(Gen &g, tt::MapElementwiseOp op, ArrayRef<Axis> env) {
+  if (op.getPackAttr().getInt() != 1)
+    return op.emitError("furiosa: a packed map_elementwise is not raised yet"), failure();
+  Region &region = op->getRegion(0);
+  OpBuilder &ob = *g.ob;
+  IRMapping map;
+  for (auto [arg, src] : llvm::zip(region.front().getArguments(), op.getSrcs())) {
+    auto x = emit(g, src, env);
+    if (failed(x))
+      return failure();
+    map.map(arg, *x);
+  }
+  auto lookup = [&](Value v) -> FailureOr<Value> {
+    if (Value m = map.lookupOrNull(v))
+      return m;
+    if (region.isAncestor(v.getParentRegion()))
+      return op.emitError("furiosa: internal: map_elementwise value used before its block"), failure();
+    return emit(g, v, {}); // a scalar from outside the function
+  };
+  DenseMap<Block *, unsigned> order;
+  for (auto [i, blk] : llvm::enumerate(region))
+    order[&blk] = i;
+  DenseMap<Block *, SmallVector<std::pair<Value, SmallVector<Value>>>> incoming;
+  DenseMap<Block *, Value> reach;
+  reach[&region.front()] = arith::ConstantIntOp::create(ob, loc, ob.getI1Type(), 1);
+  Value result;
+  for (Block &blk : region) {
+    if (&blk != &region.front()) {
+      auto &in = incoming[&blk];
+      if (in.empty())
+        continue; // unreachable
+      Value p = in[0].first;
+      for (auto &[q, vals] : ArrayRef(in).drop_front())
+        p = arith::OrIOp::create(ob, loc, p, q);
+      reach[&blk] = p;
+      for (auto [i, arg] : llvm::enumerate(blk.getArguments())) {
+        Value x = in[0].second[i];
+        for (auto &[q, vals] : ArrayRef(in).drop_front())
+          x = arith::SelectOp::create(ob, loc, q, vals[i], x);
+        map.map(arg, x);
+      }
+    }
+    for (Operation &o : blk.without_terminator()) {
+      if (o.getNumRegions() || !isMemoryEffectFree(&o))
+        return o.emitError("furiosa: a map_elementwise function with side effects or regions is not raised"), failure();
+      for (Value operand : o.getOperands())
+        if (!map.contains(operand)) {
+          auto x = lookup(operand);
+          if (failed(x))
+            return failure();
+          map.map(operand, *x);
+        }
+      ob.clone(o, map);
+    }
+    Operation *term = blk.getTerminator();
+    auto values = [&](ValueRange vs) -> FailureOr<SmallVector<Value>> {
+      SmallVector<Value> out;
+      for (Value x : vs) {
+        auto y = lookup(x);
+        if (failed(y))
+          return failure();
+        out.push_back(*y);
+      }
+      return out;
+    };
+    Value here = reach[&blk];
+    auto edge = [&](Block *dest, Value cond, ValueRange operands) -> LogicalResult {
+      if (order[dest] <= order[&blk])
+        return op.emitError("furiosa: a map_elementwise function with a loop is not raised"), failure();
+      auto vals = values(operands);
+      if (failed(vals))
+        return failure();
+      incoming[dest].push_back({cond, *vals});
+      return success();
+    };
+    if (auto br = dyn_cast<cf::BranchOp>(term)) {
+      if (failed(edge(br.getDest(), here, br.getDestOperands())))
+        return failure();
+    } else if (auto cb = dyn_cast<cf::CondBranchOp>(term)) {
+      auto c = lookup(cb.getCondition());
+      if (failed(c))
+        return failure();
+      Value notC = arith::XOrIOp::create(ob, loc, *c, arith::ConstantIntOp::create(ob, loc, ob.getI1Type(), 1));
+      if (failed(edge(cb.getTrueDest(), arith::AndIOp::create(ob, loc, here, *c), cb.getTrueDestOperands())) ||
+          failed(edge(cb.getFalseDest(), arith::AndIOp::create(ob, loc, here, notC), cb.getFalseDestOperands())))
+        return failure();
+    } else if (isa<tt::MapElementwiseReturnOp>(term) && term->getNumOperands() == 1) {
+      auto r = lookup(term->getOperand(0));
+      if (failed(r))
+        return failure();
+      result = result ? arith::SelectOp::create(ob, loc, here, *r, result).getResult() : *r;
+    } else {
+      return term->emitError("furiosa: a map_elementwise terminator not raised"), failure();
+    }
+  }
+  if (!result)
+    return op.emitError("furiosa: a map_elementwise function that never returns"), failure();
+  return result;
+}
+
 FailureOr<Value> Raiser::emit(Gen &g, Value v, ArrayRef<Axis> env) {
   auto memoKey = std::make_pair(v.getAsOpaquePointer(), key(env));
   if (auto it = g.memo.find(memoKey); it != g.memo.end())
@@ -2333,7 +2457,65 @@ FailureOr<Value> Raiser::emit(Gen &g, Value v, ArrayRef<Axis> env) {
       senv[o] = env[i];
     out = emit(g, t.getSrc(), senv);
   } else if (auto load = dyn_cast<tt::LoadOp>(def)) {
-    out = emitLoad(g, load, env);
+    out = emitLoad(g, Read{load}, env);
+  } else if (auto rmw = dyn_cast<tt::AtomicRMWOp>(def)) { // its old value: the buffer before it writes
+    out = emitLoad(g, Read{rmw}, env);
+  } else if (auto j = dyn_cast<tt::JoinOp>(def)) { // a new last axis of 2: lhs at 0, rhs at 1
+    SmallVector<Axis> senv(env.begin(), env.end() - 1);
+    auto l = emit(g, j.getLhs(), senv), r = emit(g, j.getRhs(), senv);
+    auto k = axisValue(g, def, env, env.size() - 1);
+    if (failed(l) || failed(r) || failed(k))
+      return failure();
+    Value first = arith::CmpIOp::create(*g.ob, loc, arith::CmpIPredicate::eq, *k,
+                                        arith::ConstantIndexOp::create(*g.ob, loc, 0));
+    out = arith::SelectOp::create(*g.ob, loc, first, *l, *r).getResult();
+  } else if (auto sp = dyn_cast<tt::SplitOp>(def)) { // the source's last axis of 2 at 0 or 1
+    SmallVector<Axis> senv(env.begin(), env.end());
+    Axis last;
+    if (cast<OpResult>(v).getResultNumber()) {
+      last.kind = Axis::Expr;
+      last.expr = getAffineConstantExpr(1, ctx);
+    }
+    senv.push_back(last);
+    out = emit(g, sp.getSrc(), senv);
+  } else if (auto cat = dyn_cast<tt::CatOp>(def)) { // lhs then rhs along axis 0
+    int64_t n = shapeOf(cat.getLhs().getType())[0];
+    SmallVector<Axis> senv(env.begin(), env.end());
+    if (env[0].kind != Axis::Unit) {
+      senv[0] = Axis{};
+      senv[0].kind = Axis::Expr;
+      senv[0].expr = getAffineDimExpr(0, ctx) % n;
+      senv[0].of = {env[0]};
+    }
+    auto l = emit(g, cat.getLhs(), senv), r = emit(g, cat.getRhs(), senv);
+    auto i = axisValue(g, def, env, 0);
+    if (failed(l) || failed(r) || failed(i))
+      return failure();
+    Value left = arith::CmpIOp::create(*g.ob, loc, arith::CmpIPredicate::slt, *i,
+                                       arith::ConstantIndexOp::create(*g.ob, loc, n));
+    out = arith::SelectOp::create(*g.ob, loc, left, *l, *r).getResult();
+  } else if (auto ga = dyn_cast<tt::GatherOp>(def)) { // src with the gathered axis at the index
+    const Sym *ix = act[0]->get(ga.getIndices());
+    bool same = ix && llvm::all_of(act, [&](Evaluator *ev) {
+      const Sym *s = ev->get(ga.getIndices());
+      return s && s->expr == ix->expr;
+    });
+    bool symbolic = false; // a program id or loop counter: not a function of the axes alone
+    if (same)
+      ix->expr.walk([&](AffineExpr e) { symbolic |= isa<AffineSymbolExpr>(e); });
+    if (!same || symbolic || ix->kind != Sym::Int || !ix->data.empty())
+      return def->emitError("furiosa: a gather whose indices are not the same function of its axes in every instance "
+                            "is not raised yet"),
+             failure();
+    SmallVector<Axis> senv(env.begin(), env.end());
+    unsigned axis = ga.getAxisAttr().getInt();
+    senv[axis] = Axis{};
+    senv[axis].kind = Axis::Expr;
+    senv[axis].expr = ix->expr;
+    senv[axis].of.assign(env.begin(), env.end());
+    out = emit(g, ga.getSrc(), senv);
+  } else if (auto me = dyn_cast<tt::MapElementwiseOp>(def)) {
+    out = emitMapElementwise(g, me, env);
   } else if (auto branch = dyn_cast<scf::IfOp>(def)) {
     // The partition's instances all take the same branch: follow its yield.
     bool then = act[0]->taken.lookup(branch);
@@ -3491,6 +3673,38 @@ void Raiser::lowerScans() {
       scan->getResult(k).replaceAllUsesWith(red->getResult(k));
     scan.erase();
   }
+  // A histogram as a reduction: count[b] sums (x_i == b) over i, masked lanes left out.
+  SmallVector<tt::HistogramOp> hists;
+  kernel.walk([&](tt::HistogramOp h) { hists.push_back(h); });
+  for (tt::HistogramOp h : hists) {
+    OpBuilder ob(h);
+    int64_t n = shapeOf(h.getSrc().getType())[0], bins = shapeOf(h.getType())[0];
+    SmallVector<int64_t> wide{bins, n};
+    Type src = getElementTypeOrSelf(h.getSrc().getType()), count = getElementTypeOrSelf(h.getType());
+    auto bcast = [&](Value x, unsigned axis) -> Value {
+      return tt::BroadcastOp::create(ob, loc, RankedTensorType::get(wide, getElementTypeOrSelf(x.getType())),
+                                     tt::ExpandDimsOp::create(ob, loc, x, axis));
+    };
+    Value b = tt::MakeRangeOp::create(ob, loc, RankedTensorType::get({bins}, ob.getI32Type()), 0, bins);
+    if (src.getIntOrFloatBitWidth() > 32)
+      b = arith::ExtSIOp::create(ob, loc, RankedTensorType::get({bins}, src), b);
+    else if (src.getIntOrFloatBitWidth() < 32)
+      b = arith::TruncIOp::create(ob, loc, RankedTensorType::get({bins}, src), b);
+    Value hit = arith::CmpIOp::create(ob, loc, arith::CmpIPredicate::eq, bcast(h.getSrc(), 0), bcast(b, 1));
+    if (Value m = h.getMask())
+      hit = arith::AndIOp::create(ob, loc, hit, bcast(m, 0));
+    auto t = RankedTensorType::get(wide, count);
+    Value one = arith::SelectOp::create(ob, loc, hit, arith::ConstantOp::create(ob, loc, DenseElementsAttr::get(t, ob.getIntegerAttr(count, 1))),
+                                        arith::ConstantOp::create(ob, loc, DenseElementsAttr::get(t, ob.getIntegerAttr(count, 0))));
+    auto red = tt::ReduceOp::create(ob, loc, ValueRange{one}, 1);
+    Block *blk = new Block();
+    red.getCombineOp().push_back(blk);
+    Value acc = blk->addArgument(count, loc), x = blk->addArgument(count, loc);
+    OpBuilder rb = OpBuilder::atBlockEnd(blk);
+    tt::ReduceReturnOp::create(rb, loc, ValueRange{arith::AddIOp::create(rb, loc, acc, x)});
+    h.getResult().replaceAllUsesWith(red->getResult(0));
+    h.erase();
+  }
 }
 
 LogicalResult Raiser::run() {
@@ -3507,12 +3721,10 @@ LogicalResult Raiser::run() {
   WalkResult walked = kernel.walk([&](Operation *op) {
     if (isa<tt::StoreOp>(op))
       stores.push_back({op});
-    if (isa<tt::AtomicRMWOp>(op) && op->use_empty() && !op->getParentOfType<scf::ForOp>())
+    if (isa<tt::AtomicRMWOp>(op) && !op->getParentOfType<scf::ForOp>())
       stores.push_back({op});
     else if (isa<tt::AtomicRMWOp, tt::AtomicCASOp>(op))
-      return op->emitError("furiosa: only an atomic read-modify-write outside loops whose old value is unused is "
-                           "raised"),
-             WalkResult::interrupt();
+      return op->emitError("furiosa: only an atomic read-modify-write outside loops is raised"), WalkResult::interrupt();
     return WalkResult::advance();
   });
   if (walked.wasInterrupted())
@@ -3573,6 +3785,10 @@ LogicalResult Raiser::run() {
         rounds[r].push_back(ev);
         roundAddrs[r].insert(addrs.begin(), addrs.end());
       }
+      // Its old value is the buffer before it writes: one value only if every instance writes alone.
+      if (rounds.size() > 1 && !st->use_empty())
+        return st.emitError("furiosa: an atomic whose old value is used, by instances that write an element in "
+                            "common, is not raised");
       for (auto &round : rounds)
         parts.push_back({st, round});
     }
