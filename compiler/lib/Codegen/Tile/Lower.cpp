@@ -574,19 +574,55 @@ FailureOr<Val> Lowering::select(const Node &n, ArrayRef<int64_t> tileIndex) {
       return failure();
     return binary("mul", *y, constTile(1, -1));
   }
-  // Otherwise a * s + b * (1 - s) with s = select(c, 1, 0): exact for finite branches (an infinite one would
-  // give inf * 0 = NaN on the other side).
-  if ((ta.kind == Node::Const && !std::isfinite(ta.value)) || (fb.kind == Node::Const && !std::isfinite(fb.value)))
-    return fail("a select between a tile and an infinite constant");
-  auto a = evaluate(n.args[1], tileIndex);
-  auto bb = evaluate(n.args[2], tileIndex);
+  // Otherwise each branch's value comes in under the tag: Max in Mode11 (op(b, b)) of a VRF tile or an
+  // immediate, exact for any bits, so a NaN or infinity in the branch not taken cannot leak. Two tile branches
+  // take an op each, the other branch 0, and an add (shortcut: a -0.0 taken from either comes out +0.0).
+  // shortcut: a branch tile beyond the 8 KB VRF blends as a * s + b * (1 - s), s = select(c, 1, 0), exact unless the
+  // branch not taken holds a NaN or infinity; stream it instead (a stash) once VeFuse places vector_stash.
+  auto branch = [&](unsigned arg, const Node &k) -> FailureOr<Val> {
+    return k.kind == Node::Const ? FailureOr<Val>(Val{Val::Scalar, Value(), k.value}) : evaluate(arg, tileIndex);
+  };
+  auto a = branch(n.args[1], ta), bb = branch(n.args[2], fb);
   if (failed(a) || failed(bb))
     return failure();
-  auto as = binary("mul", *a, constTile(1, 0));
-  if (failed(as))
-    return failure();
-  auto bs = binary("mul", *bb, constTile(0, 1));
-  if (failed(bs))
+  auto fits = [](const Val &v) {
+    return v.kind == Val::Scalar || cast<DmTensorType>(v.dm.getType()).getElement().size() * 4 <= 8192;
+  };
+  if (!fits(*a) || !fits(*bb)) {
+    if ((a->kind == Val::Scalar && !std::isfinite(a->value)) || (bb->kind == Val::Scalar && !std::isfinite(bb->value)))
+      return fail("a select between a tile beyond the VRF and an infinite constant");
+    auto as = binary("mul", *a, constTile(1, 0));
+    if (failed(as))
+      return failure();
+    auto bs = binary("mul", *bb, constTile(0, 1));
+    if (failed(bs))
+      return failure();
+    return binary("add", *as, *bs);
+  }
+  auto by = [&](const Val &whenTrue, const Val &otherwise) -> FailureOr<Val> {
+    AluSpec spec;
+    spec.method = "vector_clip";
+    spec.op = "ClipBinaryOpF32::Max";
+    spec.mode = "Mode11";
+    const Val &tile = whenTrue.kind != Val::Scalar ? whenTrue : otherwise;
+    const Val &k = whenTrue.kind != Val::Scalar ? otherwise : whenTrue;
+    if (tile.kind == Val::Tile && x->kind != Val::Tile)
+      return fail("a select whose key varies along less than its values");
+    spec.vrf = vrfOf(tile.dm);
+    // The immediate comes first under its guard (the tag's bits, or their complement), the VRF after for the rest.
+    std::string guard = tag->second;
+    if (&k == &otherwise)
+      for (char &c : guard)
+        c = c == '1' ? '0' : c == '0' ? '1' : c;
+    spec.branches = b.getArrayAttr({b.getArrayAttr({b.getStringAttr(guard), b.getF32FloatAttr(k.value)}),
+                                    b.getArrayAttr({b.getStringAttr("all"), b.getStringAttr("rf")})});
+    return Val{x->kind, pass(x->dm, spec, cmps)};
+  };
+  if (a->kind == Val::Scalar || bb->kind == Val::Scalar)
+    return by(*a, *bb);
+  Val zero{Val::Scalar, Value(), 0.0};
+  auto as = by(*a, zero), bs = by(zero, *bb);
+  if (failed(as) || failed(bs))
     return failure();
   return binary("add", *as, *bs);
 }
