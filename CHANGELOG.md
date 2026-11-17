@@ -32,6 +32,10 @@ npu stage) against GPU goldens.
   digits back into one axis; 2^x folds as e^(x ln 2); a reduction guarded by a program-dependent trip count splits
   along the program loops; a guarded load reads the window it spans at an affine address (2f945b0). All 25 corpus
   cases now reach L4 (attention backward was the last).
+- `maxnumf`/`minnumf` (`tl.maximum`/`tl.minimum`'s default, `tl.max`/`tl.min`, relu) return the non-NaN operand on
+  npu3 as on the GPU: a NaN guard runs before the whole-kernel check, at no measured run-time cost (vgg16 3.05 s,
+  resnet101 2.21 s either way). Still open: two computed operands (an attention running max) keep the engine's
+  NaN-propagating max, and an all-NaN row reduces to -inf (30e9144).
 
 ## 1.1.0 (2026-11-17, release/1.1.0)
 
