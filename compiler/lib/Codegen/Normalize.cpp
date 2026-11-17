@@ -1068,6 +1068,8 @@ void splitIndexSelects(ModuleOp module, function_ref<bool(linalg::GenericOp)> ma
     Location loc = g.getLoc();
     auto outType = cast<RankedTensorType>(g.getResult(0).getType());
     Value result = g.getDpsInits()[0];
+    Operation *before = g->getPrevNode();
+    SmallVector<linalg::GenericOp> pieces;
     for (auto [i, run] : llvm::enumerate(runs)) {
       int64_t start = run.first, end = i + 1 < runs.size() ? runs[i + 1].first : ranges[k];
       SmallVector<int64_t> shape(outType.getShape()), pieceRanges(ranges);
@@ -1129,8 +1131,24 @@ void splitIndexSelects(ModuleOp module, function_ref<bool(linalg::GenericOp)> ma
       for (int64_t n : shape)
         sizes.push_back(b.getIndexAttr(n));
       result = tensor::InsertSliceOp::create(b, loc, piece.getResult(0), result, offsets, sizes, strides);
-      work.push_back(piece);
+      pieces.push_back(piece);
     }
+    // A split only the oracle asks for (a select inside a body, a wrapped read) stands when each piece maps, its
+    // reads projected: split again, pieces that do not would multiply (tl.sort's last stage, a select per bit, into
+    // a piece per element).
+    bool choice = sel && body.getTerminator()->getOperand(0) == sel.getResult() &&
+                  isa<BlockArgument>(sel.getTrueValue()) && isa<BlockArgument>(sel.getFalseValue());
+    if (mapsAlone && !choice) {
+      for (linalg::GenericOp piece : pieces)
+        for (unsigned i = 0; i < piece.getNumDpsInputs(); ++i)
+          delinearizeRead(piece, i);
+      if (!llvm::all_of(pieces, mapsAlone)) {
+        while (g->getPrevNode() != before)
+          g->getPrevNode()->erase();
+        continue;
+      }
+    }
+    work.append(pieces.begin(), pieces.end());
     g.getResult(0).replaceAllUsesWith(result);
     g.erase();
   }
