@@ -19,6 +19,7 @@
 //  - A single row (R = 1) may come rank-reduced: rank-0 row values and constant-0 row indices.
 
 #include "Mapping.h"
+#include "../Tile/TileLoops.h"
 #include "furiosa/Codegen/Codegen.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -78,6 +79,10 @@ struct Dag {
   SmallVector<Type> outTypes; // their stored element types
   SmallVector<int64_t> rowExtents; // the row dims (all but the last output dim); r is their product
   int64_t r = 0, h = 0;
+  /// The row tiles: windows of `tileStep` along row dim `tileDim` (furiosa-tile's loop, or rowTile's choice for
+  /// an untiled kernel); none (step 0) when every row has its slice.
+  int tileDim = -1;
+  int64_t tileStep = 0;
 
   /// Adds a node, or returns the equal one already there: generics recompute shared subexpressions (each
   /// reads the buffers again), and the DAG keeps one of each.
@@ -103,6 +108,33 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
     why = "expected a result per written buffer";
     return failure();
   }
+  // A kernel furiosa-tile tiled: each stored value is a row tile loop's result. The DAG is its body's, one tile
+  // of rows along one row dim; the buffers keep their whole shapes (the planner makes the tile views).
+  SmallVector<Value> stored(ret.getOperands());
+  Block *body = &func.getBody().front();
+  Value iv;
+  for (Value &v : stored) {
+    if (!v.getDefiningOp<scf::ForOp>())
+      continue;
+    FailureOr<std::optional<tile::TileNest>> nest = tile::tileNest(v, why);
+    if (failed(nest))
+      return failure();
+    auto tiledDims = llvm::count_if((*nest)->loopOf, [](std::optional<unsigned> l) { return l.has_value(); });
+    if ((*nest)->loops.size() != 1 || tiledDims != 1 || (iv && iv != (*nest)->loops[0].iv)) {
+      why = "row tiles other than one loop over one row dim";
+      return failure();
+    }
+    iv = (*nest)->loops[0].iv;
+    dag.tileDim = llvm::find_if((*nest)->loopOf, [](std::optional<unsigned> l) { return l.has_value(); }) -
+                  (*nest)->loopOf.begin();
+    dag.tileStep = (*nest)->loops[0].step;
+    body = (*nest)->insert->getBlock();
+    v = (*nest)->tile;
+  }
+  if (iv && llvm::any_of(ret.getOperands(), [](Value v) { return !v.getDefiningOp<scf::ForOp>(); })) {
+    why = "stored values of which only some are row-tiled";
+    return failure();
+  }
   // The outputs: [rows..., columns] (the highest rank), or [rows...] for values of a row.
   RankedTensorType full;
   for (Value result : ret.getOperands()) {
@@ -121,10 +153,13 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
   }
   // Only row values stored: the rows are their shape, and the columns the extent a reduction over the rows
   // reduces.
+  SmallVector<int64_t> tileShape(full.getShape());
+  if (dag.tileStep)
+    tileShape[dag.tileDim] = dag.tileStep;
   linalg::GenericOp reducer;
-  for (auto g : func.getOps<linalg::GenericOp>())
+  for (auto g : body->getOps<linalg::GenericOp>())
     if (!reducer && g.getNumReductionLoops() == 1 &&
-        cast<RankedTensorType>(g.getResultTypes()[0]).getShape() == full.getShape())
+        cast<RankedTensorType>(g.getResultTypes()[0]).getShape() == ArrayRef<int64_t>(tileShape))
       reducer = g;
   bool sameShapes = llvm::all_of(ret.getOperands(), [&](Value v) { return v.getType() == ret.getOperand(0).getType(); });
   bool onlyRows = sameShapes && reducer;
@@ -196,7 +231,7 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
         bool fits = reduction < 0 || extents[reduction] == dag.h;
         for (auto [i, d] : llvm::enumerate(rowDims)) {
           roles[parallel[i]] = d;
-          fits &= extents[parallel[i]] == dag.rowExtents[d];
+          fits &= extents[parallel[i]] == (int(d) == dag.tileDim ? dag.tileStep : dag.rowExtents[d]);
         }
         if (withCol)
           fits &= extents[parallel.back()] == dag.h;
@@ -234,6 +269,23 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
       return failure();
     }
     std::optional<Shape> shape = read->shape;
+    // In a row tile: a buffer's tile (its tiled dim at the loop's offset, the rest whole) reads the buffer.
+    if (auto slice = t.getDefiningOp<tensor::ExtractSliceOp>(); slice && iv && slice->getBlock() == body) {
+      auto src = dyn_cast<BlockArgument>(slice.getSource());
+      bool tileOfIt = src && src.getOwner() == &func.getBody().front() && slice.hasUnitStride() &&
+                      slice.getSourceType().getRank() == slice.getType().getRank();
+      for (int64_t d = 0; tileOfIt && d < slice.getSourceType().getRank(); ++d) {
+        FailureOr<AffineExpr> at = tile::offsetExpr(slice.getMixedOffsets()[d], {iv}, func.getContext());
+        int64_t size = slice.getStaticSizes()[d], whole = slice.getSourceType().getDimSize(d);
+        tileOfIt = succeeded(at) && ((size == whole && *at == getAffineConstantExpr(0, func.getContext())) ||
+                                     (size == dag.tileStep && *at == getAffineDimExpr(0, func.getContext())));
+      }
+      if (!tileOfIt) {
+        why = "a row tile reads a slice that is not a buffer's tile";
+        return failure();
+      }
+      t = slice.getSource();
+    }
     if (auto arg = dyn_cast<BlockArgument>(t); arg && arg.getOwner() == &func.getBody().front()) {
       Node n{Node::Input};
       n.shape = *shape;
@@ -478,7 +530,7 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
     return genericNode[g] = result;
   };
 
-  for (Value result : ret.getOperands()) {
+  for (Value result : stored) {
     auto producer = result.getDefiningOp<linalg::GenericOp>();
     if (!producer) {
       why = "a result is not a generic's";
@@ -576,7 +628,7 @@ public:
   /// Emits the passes and returns the stored HbmTensors, one per root (none when the rows are tiled: the
   /// outputs are then written in place).
   FailureOr<SmallVector<Value>> emitBody(func::FuncOp func);
-  bool tiled() const { return dag.r > kSlices; }
+  bool tiled() const { return dag.tileStep > 0; }
 
 private:
   KernelBuilder &kb;
@@ -1118,7 +1170,9 @@ LogicalResult Planner::declare(func::FuncOp func, ArrayRef<int64_t> written) {
     return fail(func, "rows inside the outermost row dim (") << inner << ") do not divide the 256 slices";
   // The NPU tiles a window of L rows over an extent E only when L grows into a divisor of E within [L, 2L).
   if (tiled()) {
-    int64_t extent = rowAxes.front().second.size(), step = kSlices / inner;
+    int64_t extent = rowAxes.front().second.size(), step = dag.tileStep;
+    if (rowAxes.front().first != dag.tileDim || step * inner > kSlices)
+      return fail(func, "row tiles that are not windows of the outermost row dim within the slices");
     auto windows = [&](int64_t len) {
       for (int64_t d = len; d < 2 * len && d <= extent; ++d)
         if (extent % d == 0)
@@ -1237,7 +1291,7 @@ FailureOr<SmallVector<Value>> Planner::emitBody(func::FuncOp func) {
   // Row tiles along the outermost row axis: each reads its rows of the inputs that have that axis through a
   // tile view (the others broadcast as they are), and writes its rows of the outputs through a mutable one.
   MapAttr outer = rowAxes.front().second;
-  int64_t extent = outer.size(), step = kSlices / inner;
+  int64_t extent = outer.size(), step = dag.tileStep;
   for (int64_t start = 0; start < extent; start += step) {
     int64_t len = std::min(step, extent - start);
     slice = rowsMap(len);
@@ -1322,6 +1376,49 @@ FailureOr<SmallVector<Value>> Planner::emitTile(func::FuncOp func) {
   return outs;
 }
 
+/// Without reductions, row or column values or broadcast reads, the DAG is elementwise and its elements are
+/// free to regroup into rows: of 16-element multiples, and at most kRow long to keep a second streamed tensor
+/// within the VRF. Returns whether it regrouped.
+bool regroup(Dag &dag) {
+  unsigned allRows = 0;
+  for (auto [i, e] : llvm::enumerate(dag.rowExtents))
+    if (e != 1)
+      allRows |= 1u << i;
+  if (!llvm::all_of(dag.nodes, [&](const Node &n) {
+        return n.kind == Node::Const || (n.shape == Shape::Full && (n.kind != Node::Input || n.rows == allRows));
+      }))
+    return false;
+  // Each input may be a VRF operand of some pass: rows short enough for all of them at once.
+  int64_t inputs = llvm::count_if(dag.nodes, [](const Node &n) { return n.kind == Node::Input; });
+  int64_t kRow = std::min<int64_t>(1024, kVrfBytes / 4 / std::max<int64_t>(inputs, 2) / 16 * 16);
+  int64_t total = dag.r * dag.h;
+  for (int64_t h = std::min(total, kRow); h >= 16 && (dag.h > kRow || dag.h % 16); --h)
+    if (total % h == 0 && h % 16 == 0) {
+      dag.r = total / h;
+      dag.h = h;
+      dag.rowExtents = {dag.r};
+      for (Node &n : dag.nodes)
+        if (n.kind == Node::Input)
+          n.rows = dag.r > 1 ? 1 : 0;
+      return true;
+    }
+  return false;
+}
+
+/// The row tiles, the one decision both furiosa-tile (through `tiling`) and the mapping of an untiled kernel
+/// use: rows beyond the 256 slices take windows of the outermost row dim, as many of its rows as fill the slices
+/// with all the rows inside it.
+void rowTile(Dag &dag) {
+  if (dag.r <= kSlices)
+    return;
+  for (auto [d, extent] : llvm::enumerate(dag.rowExtents))
+    if (extent != 1) {
+      dag.tileDim = d;
+      dag.tileStep = std::max<int64_t>(1, kSlices / (dag.r / extent));
+      return;
+    }
+}
+
 bool match(RaisedKernel &kernel) {
   std::string why;
   bool ok = succeeded(fold(kernel.func, kernel.written, why));
@@ -1341,30 +1438,10 @@ LogicalResult map(RaisedKernel &kernel) {
   rewriteRsqrt(dag);
   rewriteReversedSub(dag);
   rewriteSigmoid(dag);
-  // Without reductions, row or column values or broadcast reads, the DAG is elementwise and its elements are
-  // free to regroup into rows: of 16-element multiples, and at most kRow long to keep a second streamed tensor
-  // within the VRF.
-  unsigned allRows = 0;
-  for (auto [i, e] : llvm::enumerate(dag.rowExtents))
-    if (e != 1)
-      allRows |= 1u << i;
-  if (llvm::all_of(dag.nodes, [&](const Node &n) {
-        return n.kind == Node::Const || (n.shape == Shape::Full && (n.kind != Node::Input || n.rows == allRows));
-      })) {
-    // Each input may be a VRF operand of some pass: rows short enough for all of them at once.
-    int64_t inputs = llvm::count_if(dag.nodes, [](const Node &n) { return n.kind == Node::Input; });
-    int64_t kRow = std::min<int64_t>(1024, kVrfBytes / 4 / std::max<int64_t>(inputs, 2) / 16 * 16);
-    int64_t total = dag.r * dag.h;
-    for (int64_t h = std::min(total, kRow); h >= 16 && (dag.h > kRow || dag.h % 16); --h)
-      if (total % h == 0 && h % 16 == 0) {
-        dag.r = total / h;
-        dag.h = h;
-        dag.rowExtents = {dag.r};
-        for (Node &n : dag.nodes)
-          if (n.kind == Node::Input)
-            n.rows = dag.r > 1 ? 1 : 0;
-        break;
-      }
+  // A tiled kernel brings its row tiles; an untiled one takes rowTile's.
+  if (!dag.tileStep) {
+    regroup(dag);
+    rowTile(dag);
   }
   KernelBuilder kb(kernel);
   Planner planner(kb, dag, kernel);
@@ -1378,6 +1455,36 @@ LogicalResult map(RaisedKernel &kernel) {
   return success();
 }
 
+/// furiosa-tile's loops for a kernel: rowTile's windows as a tile of the root generic's loop over that row dim.
+/// Nothing for a kernel within the slices, a regrouped one (its rows are no loop of a generic), stored values
+/// from several generics, or windows that do not divide the dim.
+std::optional<Tiling> tiling(RaisedKernel &kernel) {
+  std::string why;
+  FailureOr<Dag> folded = fold(kernel.func, kernel.written, why);
+  if (failed(folded) || folded->tileStep)
+    return std::nullopt;
+  Dag dag = *folded;
+  if (regroup(dag))
+    return std::nullopt;
+  rowTile(dag);
+  if (!dag.tileStep || dag.rowExtents[dag.tileDim] % dag.tileStep)
+    return std::nullopt;
+  auto ret = cast<func::ReturnOp>(kernel.func.getBody().front().getTerminator());
+  auto root = ret.getOperand(0).getDefiningOp<linalg::GenericOp>();
+  if (!root || llvm::any_of(ret.getOperands(), [&](Value v) { return v.getDefiningOp() != root; }))
+    return std::nullopt;
+  auto result = cast<OpResult>(ret.getOperand(0));
+  AffineMap out = root.getMatchingIndexingMap(root.getDpsInitOperand(result.getResultNumber()));
+  auto loop = dyn_cast<AffineDimExpr>(out.getResult(dag.tileDim));
+  if (!loop)
+    return std::nullopt;
+  Tiling t;
+  t.root = root;
+  t.rowSizes.assign(root.getNumLoops(), 0);
+  t.rowSizes[loop.getPosition()] = dag.tileStep;
+  return t;
+}
+
 } // namespace
 
-OpClass mlir::furiosa::mapping::rowwiseClass() { return {"row-wise", match, map}; }
+OpClass mlir::furiosa::mapping::rowwiseClass() { return {"row-wise", match, map, tiling}; }
