@@ -656,10 +656,17 @@ private:
           return fail(op, "furiosa: index remainder by a non-constant or non-positive value");
         res = normalize(a % cb.getValue());
       } else {
-        if (!ca || !cb)
-          return fail(op, "furiosa: min/max of non-constant indices");
+        // Decided by the ranges of the axes, loop counters and program ids when not by constants
+        // (a grouped tile order's min(num_pid_m - first_pid_m, GROUP_SIZE_M)).
+        auto [ra, ia] = ranged(a, l->shape);
+        auto [rb, ib] = ranged(b, r->shape);
         bool isMin = isa<arith::MinSIOp, arith::MinUIOp>(op);
-        res = cst(isMin ? std::min(ca.getValue(), cb.getValue()) : std::max(ca.getValue(), cb.getValue()));
+        if (ia.hi <= ib.lo)
+          res = isMin ? ra : rb;
+        else if (ib.hi <= ia.lo)
+          res = isMin ? rb : ra;
+        else
+          return fail(op, "furiosa: min/max of indices whose ranges overlap");
       }
       setInt(op->getResult(0), res);
       return success();
@@ -788,6 +795,26 @@ private:
     trips[id] = trip;
     setInt(f.getInductionVar(), cst(*lb) + getAffineSymbolExpr(id, ctx) * *step);
     return evalBody(f, id, trip);
+  }
+
+  /// `e` (over the axes of a value of `shape`) simplified with the ranges of its axes, of the loop
+  /// counters this instance knows the trips of, and of symbolic program ids; and its range.
+  std::pair<AffineExpr, Interval> ranged(AffineExpr e, ArrayRef<int64_t> shape) {
+    const int64_t wide = int64_t(1) << 40;
+    SmallVector<Interval> dims, syms;
+    for (int64_t d : shape)
+      dims.push_back({0, d - 1});
+    unsigned ns = symbolic ? pidSymbol + 3 : loopIds.size();
+    for (unsigned k = 0; k < ns; ++k) {
+      Interval in{-wide, wide};
+      if (auto it = trips.find(k); it != trips.end() && k < loopIds.size())
+        in = {0, std::max<int64_t>(it->second - 1, 0)};
+      if (symbolic && k >= pidSymbol)
+        in = {0, grid[k - pidSymbol] - 1};
+      syms.push_back(in);
+    }
+    AffineExpr r = simplify(resolveDigits(simplify(e, dims.size(), ns), dims, syms), dims.size(), ns);
+    return {r, bounds(r, dims, syms)};
   }
 
   /// The body of loop `f` (counter symbol `id`): carried indices in closed form, then every op.
@@ -1309,7 +1336,16 @@ FailureOr<StoreSpace> Raiser::storeSpace(Write store, ArrayRef<int64_t> extraStr
     const Sym *p = ev->get(store.getPtr());
     if (!p || p->kind != Sym::Ptr || p->base != arg || !p->data.empty())
       return store.emitError("furiosa: store base differs between program instances"), failure();
-    address[n] = simplify(p->expr.replaceDimsAndSymbols(toDims, toSyms), rank, 0);
+    for (unsigned id : encl)
+      extentsOf[n].push_back(ev->trips.lookup(id));
+    extentsOf[n].append(vshape.begin(), vshape.end());
+    // Over this instance's ranges of the loop counters and axes, digits resolve ((pid + 4 t) mod 32
+    // floordiv 4 = t when the address stays below 32).
+    SmallVector<Interval> ranges;
+    for (int64_t e : extentsOf[n])
+      ranges.push_back({0, std::max<int64_t>(e - 1, 0)});
+    address[n] = simplify(resolveDigits(simplify(p->expr.replaceDimsAndSymbols(toDims, toSyms), rank, 0), ranges, {}),
+                          rank, 0);
     if (store.getMask()) {
       SmallVector<AffineExpr> conds;
       bool never = false;
@@ -1321,9 +1357,6 @@ FailureOr<StoreSpace> Raiser::storeSpace(Write store, ArrayRef<int64_t> extraStr
       if (n == 0)
         dataMask = data;
     }
-    for (unsigned id : encl)
-      extentsOf[n].push_back(ev->trips.lookup(id));
-    extentsOf[n].append(vshape.begin(), vshape.end());
   }
 
   // Axes the address takes apart with div/mod get a per-instance origin read off the atoms

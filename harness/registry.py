@@ -33,6 +33,7 @@ CASES = {
     "tutorial_layer_norm": Case("harness/cases/tutorial_layer_norm.py", exact=Tol(rtol=2e-3, atol=2e-3)),
     "tutorial_dropout": Case("harness/cases/tutorial_dropout.py"),
     "tutorial_fused_attention": Case("harness/cases/tutorial_fused_attention.py", exact=Tol(rtol=2e-3, atol=2e-3)),
+    "tutorial_persistent_matmul": Case("harness/cases/tutorial_persistent_matmul.py", exact=Tol(rtol=2e-3, atol=2e-3)),
     # Held-out kernels, written apart from the corpus (harness/README.md). NPU tolerances: data movement
     # and max are exact; contractions allow twice the measured drift of rounding their operands to bf16
     # (bmm 0.34%, depthwise 0.32% of max|out|); a bf16 output allows one bf16 ulp at max|golden|; fp32
