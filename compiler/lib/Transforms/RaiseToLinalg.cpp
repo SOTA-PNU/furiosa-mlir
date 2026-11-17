@@ -116,6 +116,42 @@ int64_t evalAt(AffineExpr e, ArrayRef<int64_t> dims) {
   }
 }
 
+/// The exact range of `e` over the box `dims` x `syms`, enumerating the dims and symbols it reads when
+/// they span at most 2^20 points (intervals lose correlations: c - c mod 2 >= 0); else bounds().
+Interval exactBounds(AffineExpr e, ArrayRef<Interval> dims, ArrayRef<Interval> syms) {
+  SmallVector<Interval> box(dims.begin(), dims.end());
+  box.append(syms.begin(), syms.end());
+  SmallVector<AffineExpr> symAsDim;
+  for (unsigned k = 0; k < syms.size(); ++k)
+    symAsDim.push_back(getAffineDimExpr(dims.size() + k, e.getContext()));
+  AffineExpr f = e.replaceSymbols(symAsDim);
+  SmallVector<unsigned> used;
+  int64_t points = 1;
+  for (unsigned i = 0; i < box.size(); ++i)
+    if (f.isFunctionOfDim(i)) {
+      used.push_back(i);
+      points *= box[i].hi - box[i].lo + 1;
+      if (points > (1 << 20))
+        return bounds(e, dims, syms);
+    }
+  SmallVector<int64_t> at;
+  for (const Interval &b : box)
+    at.push_back(b.lo);
+  Interval r{std::numeric_limits<int64_t>::max(), std::numeric_limits<int64_t>::min()};
+  while (true) {
+    int64_t v = evalAt(f, at);
+    r = {std::min(r.lo, v), std::max(r.hi, v)};
+    unsigned k = 0;
+    for (; k < used.size(); ++k) { // next point, odometer order
+      if (++at[used[k]] <= box[used[k]].hi)
+        break;
+      at[used[k]] = box[used[k]].lo;
+    }
+    if (k == used.size())
+      return r;
+  }
+}
+
 /// Constant coefficients of the dims of a purely linear `e`, plus its constant.
 std::optional<std::pair<SmallVector<int64_t>, int64_t>> linearize(AffineExpr e, unsigned numDims) {
   SmallVector<int64_t> coeffs(numDims, 0);
@@ -834,8 +870,10 @@ struct StoreSpace {
 
 /// What an axis of a value means inside the generic being built.
 struct Axis {
-  enum Kind { Store, Iter, Unit } kind = Unit;
-  int dim = 0; // Store: stored axis; Iter: generic dim
+  enum Kind { Store, Iter, Unit, Expr } kind = Unit;
+  int dim = 0;          // Store: stored axis; Iter: generic dim
+  AffineExpr expr;      // Expr: a function of the axes `of`, as its dims
+  std::vector<Axis> of; // Expr: the axes it reads
 };
 
 /// The generic being built: its dims are the store-view dims it keeps, then its own dims.
@@ -854,9 +892,84 @@ struct Gen {
 
 std::string key(ArrayRef<Axis> env) {
   std::string s;
-  for (const Axis &a : env)
-    s += std::to_string((int)a.kind) + ":" + std::to_string(a.dim) + ",";
+  for (const Axis &a : env) {
+    s += std::to_string((int)a.kind) + ":" + std::to_string(a.dim);
+    if (a.kind == Axis::Expr) {
+      llvm::raw_string_ostream os(s);
+      os << "[" << a.expr << "|" << key(a.of) << "]";
+    }
+    s += ",";
+  }
   return s;
+}
+
+/// The source axes of a row-major reshape to `src`, given the result axes `env` (shape `dst`): each
+/// source axis is a mixed-radix digit of the result's linear index, resolved over the result axes'
+/// ranges, so a source axis that is one result axis stays that axis.
+SmallVector<Axis> reshapeEnv(ArrayRef<Axis> env, ArrayRef<int64_t> dst, ArrayRef<int64_t> src, MLIRContext *ctx) {
+  std::vector<Axis> of; // the result axes that vary, as dims
+  SmallVector<Interval> ranges;
+  AffineExpr lin = getAffineConstantExpr(0, ctx);
+  int64_t stride = 1;
+  for (int k = dst.size() - 1; k >= 0; stride *= dst[k], --k)
+    if (env[k].kind != Axis::Unit) { // Unit: index 0
+      lin = lin + getAffineDimExpr(of.size(), ctx) * stride;
+      of.push_back(env[k]);
+      ranges.push_back({0, dst[k] - 1});
+    }
+  SmallVector<Axis> out(src.size());
+  stride = 1;
+  for (int k = src.size() - 1; k >= 0; stride *= src[k], --k) {
+    AffineExpr e = simplify(resolveDigits(simplify(lin.floorDiv(stride) % src[k], of.size()), ranges, {}), of.size());
+    if (auto c = dyn_cast<AffineConstantExpr>(e); c && c.getValue() == 0)
+      continue;
+    if (auto d = dyn_cast<AffineDimExpr>(e)) {
+      out[k] = of[d.getPosition()];
+      continue;
+    }
+    // Only the axes it reads, renumbered.
+    SmallVector<AffineExpr> renum(of.size(), getAffineConstantExpr(0, ctx));
+    out[k].kind = Axis::Expr;
+    for (unsigned i = 0; i < of.size(); ++i)
+      if (e.isFunctionOfDim(i)) {
+        renum[i] = getAffineDimExpr(out[k].of.size(), ctx);
+        out[k].of.push_back(of[i]);
+      }
+    out[k].expr = e.replaceDims(renum);
+  }
+  return out;
+}
+
+/// The identity of a single-operand combiner that is one known op on its two arguments, else null.
+TypedAttr identityOf(Block &combiner) {
+  if (combiner.getNumArguments() != 2 || !llvm::hasSingleElement(combiner.without_terminator()))
+    return {};
+  Operation *comb = &combiner.front();
+  Value a = combiner.getArgument(0), x = combiner.getArgument(1);
+  if (comb->getNumOperands() != 2 || combiner.getTerminator()->getOperands() != comb->getResults() ||
+      !((comb->getOperand(0) == a && comb->getOperand(1) == x) || (comb->getOperand(0) == x && comb->getOperand(1) == a)))
+    return {};
+  Builder b(comb->getContext());
+  Type et = a.getType();
+  if (isa<arith::AddFOp>(comb))
+    return b.getFloatAttr(et, 0.0);
+  if (isa<arith::MulFOp>(comb))
+    return b.getFloatAttr(et, 1.0);
+  if (isa<arith::MaxNumFOp, arith::MaximumFOp>(comb))
+    return b.getFloatAttr(et, -std::numeric_limits<double>::infinity());
+  if (isa<arith::MinNumFOp, arith::MinimumFOp>(comb))
+    return b.getFloatAttr(et, std::numeric_limits<double>::infinity());
+  if (isa<arith::AddIOp, arith::XOrIOp, arith::OrIOp, arith::MaxUIOp>(comb))
+    return b.getIntegerAttr(et, 0);
+  if (isa<arith::MulIOp>(comb))
+    return b.getIntegerAttr(et, 1);
+  if (isa<arith::AndIOp, arith::MinUIOp>(comb))
+    return b.getIntegerAttr(et, APInt::getAllOnes(et.getIntOrFloatBitWidth()));
+  if (isa<arith::MaxSIOp>(comb))
+    return b.getIntegerAttr(et, APInt::getSignedMinValue(et.getIntOrFloatBitWidth()));
+  if (isa<arith::MinSIOp>(comb))
+    return b.getIntegerAttr(et, APInt::getSignedMaxValue(et.getIntOrFloatBitWidth()));
+  return {};
 }
 
 class Raiser {
@@ -1514,21 +1627,30 @@ FailureOr<AffineExpr> Raiser::rewrite(Operation *at, const Gen &g, ArrayRef<Axis
     const Sym *s = ev->get(v);
     if (!s)
       return at->emitError("furiosa: value is not symbolic in every instance"), failure();
-    SmallVector<AffineExpr> dims;
-    for (const Axis &a : env) {
+    bool outside = false;
+    std::function<AffineExpr(const Axis &)> axisAt = [&](const Axis &a) -> AffineExpr {
       if (a.kind == Axis::Store) {
         AffineExpr gl = space->global[a.dim];
         for (unsigned j = 0; j < g.coordPos.size(); ++j)
-          if (g.coordPos[j] < 0 && gl.isFunctionOfDim(j))
-            return at->emitError("furiosa: internal: coordinate dim not in this generic"), failure();
-        dims.push_back(space->step[a.dim] > 1 ? gl.replaceDims(viewToGen).floorDiv(space->step[a.dim])
-                                              : gl.replaceDims(viewToGen) - space->origin[n][a.dim]);
-      } else if (a.kind == Axis::Iter) {
-        dims.push_back(getAffineDimExpr(a.dim, ctx));
-      } else {
-        dims.push_back(getAffineConstantExpr(0, ctx));
+          outside |= g.coordPos[j] < 0 && gl.isFunctionOfDim(j);
+        return space->step[a.dim] > 1 ? gl.replaceDims(viewToGen).floorDiv(space->step[a.dim])
+                                      : gl.replaceDims(viewToGen) - space->origin[n][a.dim];
       }
-    }
+      if (a.kind == Axis::Iter)
+        return getAffineDimExpr(a.dim, ctx);
+      if (a.kind == Axis::Expr) {
+        SmallVector<AffineExpr> args;
+        for (const Axis &x : a.of)
+          args.push_back(axisAt(x));
+        return a.expr.replaceDims(args);
+      }
+      return getAffineConstantExpr(0, ctx);
+    };
+    SmallVector<AffineExpr> dims;
+    for (const Axis &a : env)
+      dims.push_back(axisAt(a));
+    if (outside)
+      return at->emitError("furiosa: internal: coordinate dim not in this generic"), failure();
     SmallVector<AffineExpr> syms;
     for (unsigned l = 0; l < loopTrip.size(); ++l) {
       auto it = g.loopPos.find(l);
@@ -1626,20 +1748,27 @@ FailureOr<AffineExpr> Raiser::rewriteSymbolic(Operation *at, const Gen &g, Array
   SmallVector<AffineExpr> viewToGen;
   for (int pos : g.coordPos)
     viewToGen.push_back(pos >= 0 ? getAffineDimExpr(pos, ctx) : getAffineConstantExpr(0, ctx));
-  SmallVector<AffineExpr> dims;
-  for (const Axis &a : env) {
+  std::function<AffineExpr(const Axis &)> axisAt = [&](const Axis &a) -> AffineExpr {
     if (a.kind == Axis::Store) {
       AffineExpr origin = getAffineConstantExpr(basisOf[a.dim][3], ctx);
       for (unsigned d = 0; d < 3; ++d)
         origin = origin + pidExpr[d] * basisOf[a.dim][d];
       AffineExpr gl = space->global[a.dim].replaceDims(viewToGen);
-      dims.push_back(space->step[a.dim] > 1 ? gl.floorDiv(space->step[a.dim]) : gl - origin);
-    } else if (a.kind == Axis::Iter) {
-      dims.push_back(getAffineDimExpr(a.dim, ctx));
-    } else {
-      dims.push_back(getAffineConstantExpr(0, ctx));
+      return space->step[a.dim] > 1 ? gl.floorDiv(space->step[a.dim]) : gl - origin;
     }
-  }
+    if (a.kind == Axis::Iter)
+      return getAffineDimExpr(a.dim, ctx);
+    if (a.kind == Axis::Expr) {
+      SmallVector<AffineExpr> args;
+      for (const Axis &x : a.of)
+        args.push_back(axisAt(x));
+      return a.expr.replaceDims(args);
+    }
+    return getAffineConstantExpr(0, ctx);
+  };
+  SmallVector<AffineExpr> dims;
+  for (const Axis &a : env)
+    dims.push_back(axisAt(a));
   SmallVector<AffineExpr> syms;
   for (unsigned l = 0; l < nl; ++l) {
     auto it = g.loopPos.find(l);
@@ -1903,6 +2032,8 @@ FailureOr<Value> Raiser::emitLoad(Gen &g, tt::LoadOp load, ArrayRef<Axis> env) {
   if (failed(data))
     return failure();
   Interval range = bounds(*addr, ranges, symRanges);
+  if (range.lo < 0 || range.hi >= numel)
+    range = exactBounds(*addr, ranges, symRanges);
   bool mayLeave = *data || range.lo < 0 || range.hi >= numel;
   // A load in an iteration that a shorter trip masks off may be clamped: its value is discarded.
   bool guarded = llvm::any_of(g.loopPos, [&](auto kv) { return varTrip[kv.first]; }) ||
@@ -2001,13 +2132,15 @@ FailureOr<Value> Raiser::emit(Gen &g, Value v, ArrayRef<Axis> env) {
     out = emit(g, s.getSrc(), {});
   } else if (auto rs = dyn_cast<tt::ReshapeOp>(def)) {
     SmallVector<int64_t> src = shapeOf(rs.getSrc().getType());
-    auto oldOf = unitReshape(src, shapeOf(rs.getResult().getType()));
-    if (!oldOf)
-      return def->emitError("furiosa: a reshape that moves data between dims is not raised yet"), failure();
+    SmallVector<int64_t> dst = shapeOf(rs.getResult().getType());
     SmallVector<Axis> senv(src.size());
-    for (auto [i, o] : llvm::enumerate(*oldOf))
-      if (o >= 0)
-        senv[o] = env[i];
+    if (auto oldOf = unitReshape(src, dst)) {
+      for (auto [i, o] : llvm::enumerate(*oldOf))
+        if (o >= 0)
+          senv[o] = env[i];
+    } else {
+      senv = reshapeEnv(env, dst, src, ctx);
+    }
     out = emit(g, rs.getSrc(), senv);
   } else if (auto br = dyn_cast<tt::BroadcastOp>(def)) {
     SmallVector<int64_t> src = shapeOf(br.getSrc().getType());
@@ -2324,41 +2457,24 @@ FailureOr<Value> Raiser::materialize(Gen &g, Value v, ArrayRef<Axis> env) {
   for (unsigned d = 0; d < g.extent.size(); ++d)
     parentDims.push_back(d);
   // Remaps an env over the parent's dims into a generic built with `remap`.
-  auto remapEnv = [](ArrayRef<Axis> e, ArrayRef<int> remap) {
+  std::function<void(Axis &, ArrayRef<int>)> remapAxis = [&](Axis &a, ArrayRef<int> remap) {
+    if (a.kind == Axis::Iter)
+      a.dim = remap[a.dim];
+    for (Axis &x : a.of)
+      remapAxis(x, remap);
+  };
+  auto remapEnv = [&](ArrayRef<Axis> e, ArrayRef<int> remap) {
     SmallVector<Axis> out(e.begin(), e.end());
     for (Axis &a : out)
-      if (a.kind == Axis::Iter)
-        a.dim = remap[a.dim];
+      remapAxis(a, remap);
     return out;
   };
   FailureOr<std::pair<Value, SmallVector<unsigned>>> built = failure();
 
   if (auto red = dyn_cast<tt::ReduceOp>(def)) {
     Block &combiner = red.getCombineOp().front();
-    Operation *comb = &combiner.front();
     unsigned n = red.getNumOperands();
-    Attribute identity;
-    Type et = elem;
-    if (n != 1)
-      ;
-    else if (isa<arith::AddFOp>(comb))
-      identity = b.getFloatAttr(et, 0.0);
-    else if (isa<arith::MulFOp>(comb))
-      identity = b.getFloatAttr(et, 1.0);
-    else if (isa<arith::MaxNumFOp, arith::MaximumFOp>(comb))
-      identity = b.getFloatAttr(et, -std::numeric_limits<double>::infinity());
-    else if (isa<arith::MinNumFOp, arith::MinimumFOp>(comb))
-      identity = b.getFloatAttr(et, std::numeric_limits<double>::infinity());
-    else if (isa<arith::AddIOp, arith::XOrIOp, arith::OrIOp, arith::MaxUIOp>(comb))
-      identity = b.getIntegerAttr(et, 0);
-    else if (isa<arith::MulIOp>(comb))
-      identity = b.getIntegerAttr(et, 1);
-    else if (isa<arith::AndIOp, arith::MinUIOp>(comb))
-      identity = b.getIntegerAttr(et, APInt::getAllOnes(et.getIntOrFloatBitWidth()));
-    else if (isa<arith::MaxSIOp>(comb))
-      identity = b.getIntegerAttr(et, APInt::getSignedMinValue(et.getIntOrFloatBitWidth()));
-    else if (isa<arith::MinSIOp>(comb))
-      identity = b.getIntegerAttr(et, APInt::getSignedMaxValue(et.getIntOrFloatBitWidth()));
+    TypedAttr identity = identityOf(combiner);
     unsigned axis = red.getAxis();
     int64_t extent = shapeOf(red.getOperand(0).getType())[axis];
     // Every operand at reduction index `r`.
@@ -2652,7 +2768,9 @@ FailureOr<SmallVector<SmallVector<Axis>>> Raiser::stateEnvs(scf::ForOp loop, uns
     }
   });
   for (auto [k, a] : llvm::enumerate(env))
-    if (a.kind != Axis::Unit) {
+    if (a.kind == Axis::Expr)
+      return loop.emitError("furiosa: a loop state read through a data reshape is not raised yet"), failure();
+    else if (a.kind != Axis::Unit) {
       int x = find(node(loop.getResult(result), k));
       if (bound[x] && (bound[x]->kind != a.kind || bound[x]->dim != a.dim))
         conflict = true;
@@ -3014,8 +3132,9 @@ LogicalResult Raiser::raiseStoreIn(tt::StoreOp store, const StoreSpace &spRef) {
 }
 
 /// A scan as a reduction: out[i] combines the elements j <= i (j >= i reversed) of the scanned axis.
-/// The reduction runs over a new j axis next to i, with j's condition as one more operand; the combiner
-/// keeps the accumulator where the condition fails, so no identity is needed.
+/// The reduction runs over a new j axis next to i: with a known identity, of x_j where j is in range and
+/// the identity elsewhere; otherwise with j's condition as one more operand, and a combiner that keeps
+/// the accumulator where it fails.
 void Raiser::lowerScans() {
   SmallVector<tt::ScanOp> scans;
   kernel.walk([&](tt::ScanOp s) { scans.push_back(s); });
@@ -3038,10 +3157,24 @@ void Raiser::lowerScans() {
     SmallVector<Value> srcs;
     for (Value x : scan.getOperands())
       srcs.push_back(bcast(tt::ExpandDimsOp::create(ob, loc, x, a)));
-    srcs.push_back(arith::CmpIOp::create(ob, loc, scan.getReverse() ? arith::CmpIPredicate::sge : arith::CmpIPredicate::sle,
-                                         along(a + 1), along(a)));
-    auto red = tt::ReduceOp::create(ob, loc, srcs, a + 1);
+    Value in = arith::CmpIOp::create(ob, loc, scan.getReverse() ? arith::CmpIPredicate::sge : arith::CmpIPredicate::sle,
+                                     along(a + 1), along(a));
     Block &old = scan.getCombineOp().front();
+    if (TypedAttr e = identityOf(old)) { // the identity where j is out of range, the combiner as is
+      auto t = cast<RankedTensorType>(srcs[0].getType());
+      Value fill = arith::ConstantOp::create(ob, loc, DenseElementsAttr::get(t, e));
+      auto red = tt::ReduceOp::create(ob, loc, ValueRange{arith::SelectOp::create(ob, loc, in, srcs[0], fill)}, a + 1);
+      red.getCombineOp().takeBody(scan.getCombineOp());
+      Block &body = red.getCombineOp().front();
+      OpBuilder rb(body.getTerminator());
+      tt::ReduceReturnOp::create(rb, loc, body.getTerminator()->getOperands());
+      body.getTerminator()->erase();
+      scan->getResult(0).replaceAllUsesWith(red->getResult(0));
+      scan.erase();
+      continue;
+    }
+    srcs.push_back(in);
+    auto red = tt::ReduceOp::create(ob, loc, srcs, a + 1);
     Block *blk = new Block();
     red.getCombineOp().push_back(blk);
     SmallVector<Value> accs, xs;

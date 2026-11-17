@@ -1,15 +1,15 @@
-// RUN: furiosa-mlir-opt --furiosa-raise-to-linalg %s | FileCheck %s --implicit-check-not=tt.scan
+// RUN: furiosa-mlir-opt --furiosa-raise-to-linalg %s | FileCheck %s --implicit-check-not=tt.scan --implicit-check-not='xi1>'
 
-// tl.cumsum: a scan becomes a reduction over a new axis j next to the scanned axis i, with j <= i as
-// one more operand; the combiner keeps the accumulator where j > i. Element 0 seeds it.
+// tl.cumsum: a scan becomes a reduction over a new axis j next to the scanned axis i. The combiner
+// (addf) has an identity, so the reduction adds x_j where j <= i and 0 elsewhere: one accumulator.
 
 // CHECK-LABEL: func.func @scan_kernel
-// CHECK: %[[SEED:.*]]:2 = linalg.generic {{.*}} outs({{.*}} : tensor<64x64xf32>, tensor<64x64xi1>)
-// CHECK: linalg.generic {{.*}}["parallel", "parallel", "reduction"]{{.*}} ins({{.*}} : tensor<63xi8>) outs(%[[SEED]]#0, %[[SEED]]#1
+// CHECK: %[[INIT:.*]] = linalg.generic {{.*}} outs({{.*}} : tensor<64x64xf32>)
+// CHECK: linalg.yield %cst : f32
+// CHECK: linalg.generic {{.*}}["parallel", "parallel", "reduction"]{{.*}} ins({{.*}} : tensor<64xi8>) outs(%[[INIT]] : tensor<64x64xf32>)
 // CHECK: %[[IN:.*]] = arith.cmpi sge
-// CHECK: %[[SUM:.*]] = arith.addf %out, %[[X:.*]] : f32
-// CHECK: %[[NEW:.*]] = arith.select %out_0, %[[SUM]], %[[X]] : f32
-// CHECK: arith.select %{{.*}}, %[[NEW]], %out : f32
+// CHECK: %[[X:.*]] = arith.select %{{.*}}, %extracted, %cst : f32
+// CHECK: arith.addf %out, %[[X]] : f32
 
 // Triton source (harness/ops scan_kernel, OP=0): y = tl.cumsum(x, axis=1) on a 64x64 block.
 

@@ -21,34 +21,35 @@ def unary_kernel(x_ptr, out_ptr, R: tl.constexpr, C: tl.constexpr, BR: tl.conste
     c = tl.arange(0, BC)[None, :]
     m = (r < R) & (c < C)
     x = tl.load(x_ptr + r * C + c, mask=m, other=1)
+    xf = x.to(tl.float32)  # Triton's math functions take fp32/fp64 only: fp16/bf16 compute in fp32
     if OP == 0:
         y = tl.abs(x)
     elif OP == 1:
-        y = tl.ceil(x)
+        y = tl.ceil(xf)
     elif OP == 2:
-        y = tl.cos(x)
+        y = tl.cos(xf)
     elif OP == 3:
-        y = tl.erf(x)
+        y = tl.erf(xf)
     elif OP == 4:
-        y = tl.exp(x)
+        y = tl.exp(xf)
     elif OP == 5:
-        y = tl.exp2(x)
+        y = tl.exp2(xf)
     elif OP == 6:
-        y = tl.floor(x)
+        y = tl.floor(xf)
     elif OP == 7:
-        y = tl.log(x)
+        y = tl.log(xf)
     elif OP == 8:
-        y = tl.log2(x)
+        y = tl.log2(xf)
     elif OP == 9:
-        y = tl.rsqrt(x)
+        y = tl.rsqrt(xf)
     elif OP == 10:
-        y = tl.sigmoid(x)
+        y = tl.sigmoid(xf)
     elif OP == 11:
-        y = tl.sin(x)
+        y = tl.sin(xf)
     elif OP == 12:
-        y = tl.sqrt(x)
+        y = tl.sqrt(xf)
     elif OP == 13:
-        y = tl.sqrt_rn(x)
+        y = tl.sqrt_rn(xf)
     else:
         y = -x
     tl.store(out_ptr + r * C + c, y.to(out_ptr.dtype.element_ty), mask=m)
@@ -71,7 +72,7 @@ def binary_kernel(x_ptr, y_ptr, out_ptr, R: tl.constexpr, C: tl.constexpr, BR: t
     elif OP == 3:
         z = tl.fdiv(x, y)
     elif OP == 4:
-        z = tl.div_rn(x, y)
+        z = tl.div_rn(x.to(tl.float32), y.to(tl.float32))  # fp32/fp64 only, as above
     elif OP == 5:
         z = tl.maximum(x, y)
     elif OP == 6:
@@ -126,7 +127,7 @@ def scan_kernel(x_ptr, out_ptr, R: tl.constexpr, C: tl.constexpr, BR: tl.constex
     elif OP == 3:
         y = tl.sort(x, dim=1)
     else:
-        y = tl.softmax(x)
+        y = tl.softmax(x, dim=1)
     tl.store(out_ptr + r * C + c, y.to(out_ptr.dtype.element_ty), mask=m)
 
 
