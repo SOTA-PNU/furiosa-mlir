@@ -104,8 +104,10 @@ steps: private functions in the raised-kernel contract that one op class maps ea
 kernel on its buffers and `tensor.empty` temporaries. The crate launches the steps in call order and uploads
 the tables.
 `tiled.mlir` is `steps.mlir` after `furiosa-tile` (lib/Codegen/Tile/TilePass.cpp), the first level of codegen's
-progressive lowering: each kernel the tiled class maps is tiled by that class's plan (Tile/Plan.h, the cost
-model holding the NPU's capacities: TRF lanes, the DM budget, intra-slice accumulators, slices, lanes) into
+progressive lowering: each kernel gets the loops its op class's tiling hook asks for (`OpClass::tiling`, a
+class-neutral `mapping::Tiling`; the class maps the tiled kernel, reading the loops back with
+Tile/TileLoops.h). The tiled class tiles by its plan (Tile/Plan.h, the cost model holding the NPU's capacities:
+TRF lanes, the DM budget, intra-slice accumulators, slices, lanes) into
 `scf.for` loops over its output rows (upstream TilingInterface tile and fuse; pads and buffers stay whole and
 are sliced) and K loops over its contraction's reduction dims (`furiosa.tile_dim` names the dim; a K tile is
 whole taps or part of the inner axis), and mapping to fopt folds the loops back into the plan's tile digits and

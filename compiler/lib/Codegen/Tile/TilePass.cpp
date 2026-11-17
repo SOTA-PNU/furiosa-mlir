@@ -1,10 +1,8 @@
-// Pass furiosa-tile: tiles each kernel by the tiled lowering's plan (Plan.h), its cost model. The plan's tiles
-// of the output rows become a nest of scf.for over the kernel's root generic (upstream TilingInterface tile and
-// fuse: the generics and fills it reads are computed per tile, pads and buffers are sliced), so the loops carry
-// the tiling decision and the tiled class maps one tile (Analysis.cpp folds the loops back into the plan's tile
-// digits). Kernels the plan cannot lower, or whose tiles are not whole ranges of one loop, stay as they are.
-
-#include "Plan.h"
+// Pass furiosa-tile: before an op class maps a kernel, makes the loops the class's tiling hook asks for
+// (mapping::Tiling): row tile loops over the root generic (upstream TilingInterface tile and fuse: the generics and
+// fills it reads compute per tile, pads and buffers are sliced) and K loops over one generic's reduction loops
+// (tileUsingSCF, each marked furiosa.tile_dim). The class is the one mapKernel picks; it maps the tiled kernel,
+// reading the loops back (TileLoops.h). The tiled class's hook tiles by its plan (Plan.h).
 
 #include "../Mapping/Mapping.h"
 
@@ -16,69 +14,16 @@
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/PatternMatch.h"
-#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Interfaces/TilingInterface.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
-#include <cstdlib>
-
 using namespace mlir;
 using namespace mlir::furiosa;
-using namespace mlir::furiosa::tile;
 
 namespace {
 
-/// What the plan tiles: the root generic's loops (row tiles; 0 for a loop not tiled) and the contraction
-/// generic's reduction loops (K tiles). Empty when the plan cannot lower the kernel or a tile is no whole range of
-/// one loop (a padded axis, an axis that is an inner digit of its dim).
-struct Tiling {
-  linalg::GenericOp root, contraction;
-  SmallVector<int64_t> rowSizes, kSizes;
-  bool rows() const { return llvm::any_of(rowSizes, [](int64_t t) { return t; }); }
-};
-
-std::optional<Tiling> planTiling(func::FuncOp func, ArrayRef<int64_t> written) {
-  std::string why;
-  FailureOr<Program> p = analyze(func, written, why);
-  if (failed(p) || !p->rootOp || p->outLoop.empty())
-    return std::nullopt;
-  Plan plan(func, *p, /*quiet=*/true);
-  if (failed(plan.plan()))
-    return std::nullopt;
-  auto debug = [&](const Twine &msg) {
-    if (std::getenv("FURIOSA_TILED_DEBUG"))
-      llvm::errs() << "tile: " << func.getName() << ": " << msg << "\n";
-    return std::nullopt;
-  };
-  Tiling t;
-  t.root = cast<linalg::GenericOp>(p->rootOp);
-  t.rowSizes.assign(t.root.getNumLoops(), 0);
-  for (const Digit &d : plan.tiles()) {
-    auto [dim, place] = p->axisDim[d.axis];
-    int64_t size = place * d.place;
-    if (d.extent || dim >= p->outLoop.size() || size * d.size != p->dimExtent[dim] || t.rowSizes[p->outLoop[dim]])
-      return debug("tile digit of axis " + Twine(d.axis) + " is no whole range of a loop");
-    t.rowSizes[p->outLoop[dim]] = size;
-  }
-  if (auto k = plan.kAxisTiles()) {
-    for (auto [a, size] : *k) {
-      auto [dim, place] = p->axisDim[a];
-      auto it = p->reductionLoop.find(dim);
-      if (place != 1 || p->axes[a].size != p->dimExtent[dim] || it == p->reductionLoop.end() ||
-          (t.contraction && t.contraction != it->second.first))
-        return debug("K tile of axis " + Twine(a) + " is no whole reduction loop of the contraction");
-      t.contraction = cast<linalg::GenericOp>(it->second.first);
-      t.kSizes.resize(t.contraction.getNumLoops(), 0);
-      t.kSizes[it->second.second] = size;
-    }
-  }
-  if (!t.rows() && !t.contraction)
-    return std::nullopt;
-  return t;
-}
-
 /// Tiles `g`'s reduction loops by `sizes` into K loops, each marked with the loop it tiles.
-LogicalResult tileK(IRRewriter &rewriter, linalg::GenericOp g, ArrayRef<int64_t> sizes) {
+LogicalResult tileReduction(IRRewriter &rewriter, linalg::GenericOp g, ArrayRef<int64_t> sizes) {
   rewriter.setInsertionPoint(g);
   scf::SCFTilingOptions options;
   options.setTileSizes(getAsIndexOpFoldResult(rewriter.getContext(), sizes));
@@ -95,12 +40,53 @@ LogicalResult tileK(IRRewriter &rewriter, linalg::GenericOp g, ArrayRef<int64_t>
   return success();
 }
 
+/// Makes `t`'s loops in `func`; failure leaves the kernel as it was where upstream tiling refuses.
+LogicalResult applyTiling(func::FuncOp func, mapping::Tiling t) {
+  IRRewriter rewriter(func.getContext());
+  linalg::GenericOp reduce = t.reduce;
+  if (llvm::any_of(t.rowSizes, [](int64_t s) { return s; })) {
+    rewriter.setInsertionPoint(t.root);
+    scf::SCFTilingOptions rowTiling;
+    rowTiling.setTileSizes(getAsIndexOpFoldResult(func.getContext(), t.rowSizes));
+    scf::SCFTileAndFuseOptions options;
+    options.setTilingOptions(rowTiling);
+    // Producers computed per tile: generics and fills. Pads and buffers are sliced as they are.
+    options.setFusionControlFn([](tensor::ExtractSliceOp, OpResult producer,
+                                  bool) -> std::optional<scf::SCFTileAndFuseOptions::ControlFnResult> {
+      if (isa<linalg::GenericOp, linalg::FillOp>(producer.getOwner()))
+        return scf::SCFTileAndFuseOptions::ControlFnResult{};
+      return std::nullopt;
+    });
+    FailureOr<scf::SCFTileAndFuseResult> result =
+        scf::tileConsumerAndFuseProducersUsingSCF(rewriter, cast<TilingInterface>(t.root.getOperation()), options);
+    if (failed(result))
+      return failure();
+    for (Value r : t.root->getResults())
+      rewriter.replaceAllUsesWith(r, result->replacements.lookup(r));
+    // The reduction's tile: the fused copy with the same loops and maps.
+    if (reduce) {
+      linalg::GenericOp tiled;
+      for (Operation *op : result->tiledAndFusedOps)
+        if (auto g = dyn_cast<linalg::GenericOp>(op); g &&
+            g.getIteratorTypesArray() == reduce.getIteratorTypesArray() &&
+            g.getIndexingMapsArray() == reduce.getIndexingMapsArray())
+          tiled = g;
+      reduce = tiled;
+    }
+  }
+  if (reduce && failed(tileReduction(rewriter, reduce, t.reduceSizes)))
+    return failure();
+  // The untiled root, the producers only it read, and the slices of them fusion left unused are dead now.
+  (void)applyPatternsGreedily(func, RewritePatternSet(func.getContext()));
+  return success();
+}
+
 struct TilePass : PassWrapper<TilePass, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(TilePass)
 
   StringRef getArgument() const override { return "furiosa-tile"; }
   StringRef getDescription() const override {
-    return "Tile kernels by the tiled lowering's plan: scf.for over output tiles (TilingInterface)";
+    return "Make the loops the op class mapping each kernel tiles it by (row tiles, K tiles)";
   }
   void getDependentDialects(DialectRegistry &registry) const override {
     registerCodegenDialects(registry);
@@ -108,64 +94,21 @@ struct TilePass : PassWrapper<TilePass, OperationPass<ModuleOp>> {
   }
 
   void runOnOperation() override {
-    MLIRContext *ctx = &getContext();
     for (func::FuncOp func : llvm::to_vector(getOperation().getOps<func::FuncOp>())) {
-      auto attr = func->getAttrOfType<ArrayAttr>("furiosa.written");
-      if (func.isExternal() || func->hasAttr(fopt::kChipAttr) || !attr)
+      if (func.isExternal() || func->hasAttr(fopt::kChipAttr) || !func->hasAttr("furiosa.written"))
         continue;
-      SmallVector<int64_t> written;
-      for (Attribute x : attr)
-        written.push_back(cast<IntegerAttr>(x).getInt());
-      // Only kernels the tiled class maps (no op class before it does) are tiled for it.
+      // The class mapKernel picks: the first that matches and maps the kernel.
       mapping::RaisedKernel raised = mapping::raisedKernel(func);
-      bool earlier = false;
-      for (const mapping::OpClass &c : mapping::opClasses()) {
-        if (StringRef(c.name) == "tiled")
+      const mapping::OpClass *cls = nullptr;
+      for (const mapping::OpClass &c : mapping::opClasses())
+        if (c.match(raised) && mapping::mapsOnCopy(func, c)) {
+          cls = &c;
           break;
-        if ((earlier = c.match(raised) && mapping::mapsOnCopy(func, c)))
-          break;
-      }
-      if (earlier)
-        continue;
-      std::optional<Tiling> tiling = planTiling(func, written);
-      if (!tiling)
-        continue;
-      IRRewriter rewriter(ctx);
-      linalg::GenericOp contraction = tiling->contraction;
-      if (tiling->rows()) {
-        rewriter.setInsertionPoint(tiling->root);
-        scf::SCFTilingOptions rowTiling;
-        rowTiling.setTileSizes(getAsIndexOpFoldResult(ctx, tiling->rowSizes));
-        scf::SCFTileAndFuseOptions options;
-        options.setTilingOptions(rowTiling);
-        // Producers computed per tile: generics and fills. Pads and buffers are sliced as they are.
-        options.setFusionControlFn([](tensor::ExtractSliceOp, OpResult producer,
-                                      bool) -> std::optional<scf::SCFTileAndFuseOptions::ControlFnResult> {
-          if (isa<linalg::GenericOp, linalg::FillOp>(producer.getOwner()))
-            return scf::SCFTileAndFuseOptions::ControlFnResult{};
-          return std::nullopt;
-        });
-        FailureOr<scf::SCFTileAndFuseResult> result = scf::tileConsumerAndFuseProducersUsingSCF(
-            rewriter, cast<TilingInterface>(tiling->root.getOperation()), options);
-        if (failed(result))
-          continue;
-        for (Value r : tiling->root->getResults())
-          rewriter.replaceAllUsesWith(r, result->replacements.lookup(r));
-        // The contraction's tile: the fused copy with the same loops and maps.
-        if (contraction) {
-          linalg::GenericOp tiled;
-          for (Operation *op : result->tiledAndFusedOps)
-            if (auto g = dyn_cast<linalg::GenericOp>(op);
-                g && g.getIteratorTypesArray() == contraction.getIteratorTypesArray() &&
-                g.getIndexingMapsArray() == contraction.getIndexingMapsArray())
-              tiled = g;
-          contraction = tiled;
         }
-      }
-      if (contraction && failed(tileK(rewriter, contraction, tiling->kSizes)))
+      if (!cls || !cls->tiling)
         continue;
-      // The untiled root, the producers only it read, and the slices of them fusion left unused are dead now.
-      (void)applyPatternsGreedily(func, RewritePatternSet(ctx));
+      if (std::optional<mapping::Tiling> t = cls->tiling(raised))
+        (void)applyTiling(func, *t);
     }
   }
 };

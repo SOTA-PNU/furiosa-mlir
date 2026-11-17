@@ -10,6 +10,7 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/IR/Builders.h"
 
+#include <optional>
 #include <string>
 
 namespace mlir::furiosa::mapping {
@@ -75,12 +76,23 @@ private:
   func::FuncOp kernel;
 };
 
+/// The loops furiosa-tile makes before a class maps a kernel (lib/Codegen/Tile/TilePass.cpp): tile sizes of the
+/// root generic's loops (0 for a loop not tiled) and of one generic's reduction loops (K or chunk tiles), each a
+/// whole range of its loop. A class that returns a tiling maps the tiled kernel (Tile/TileLoops.h reads the loops).
+struct Tiling {
+  linalg::GenericOp root;
+  SmallVector<int64_t> rowSizes;
+  linalg::GenericOp reduce;
+  SmallVector<int64_t> reduceSizes;
+};
+
 /// An op class: `match` says whether the raised kernel is one; `map` builds its furiosa-opt kernel or
-/// explains why it cannot.
+/// explains why it cannot; `tiling`, when set, the loops furiosa-tile makes for a kernel the class maps.
 struct OpClass {
   const char *name;
   bool (*match)(RaisedKernel &);
   LogicalResult (*map)(RaisedKernel &);
+  std::optional<Tiling> (*tiling)(RaisedKernel &) = nullptr;
 };
 
 /// Elementwise linalg.generic over f32 (Mapping/Elementwise.cpp).

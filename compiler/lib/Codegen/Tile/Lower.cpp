@@ -1390,6 +1390,52 @@ LogicalResult map(RaisedKernel &kernel) {
   return l.emit();
 }
 
+/// The loops the plan tiles a kernel into: its tile digits as tile sizes of the root generic's loops, its K tiles
+/// as tile sizes of the contraction's reduction loops. Nothing when there are none, or one is no whole range of a
+/// loop (a padded axis, an axis that is an inner digit of its dim).
+std::optional<Tiling> tiling(RaisedKernel &kernel) {
+  func::FuncOp func = kernel.func;
+  std::string why;
+  FailureOr<Program> p = analyze(func, kernel.written, why);
+  if (failed(p) || !p->rootOp || p->outLoop.empty())
+    return std::nullopt;
+  Plan plan(func, *p, /*quiet=*/true);
+  if (failed(plan.plan()))
+    return std::nullopt;
+  auto debug = [&](const Twine &msg) {
+    if (std::getenv("FURIOSA_TILED_DEBUG"))
+      llvm::errs() << "tile: " << func.getName() << ": " << msg << "\n";
+    return std::nullopt;
+  };
+  Tiling t;
+  t.root = cast<linalg::GenericOp>(p->rootOp);
+  t.rowSizes.assign(t.root.getNumLoops(), 0);
+  bool rows = false;
+  for (const Digit &d : plan.tiles()) {
+    auto [dim, place] = p->axisDim[d.axis];
+    int64_t size = place * d.place;
+    if (d.extent || dim >= p->outLoop.size() || size * d.size != p->dimExtent[dim] || t.rowSizes[p->outLoop[dim]])
+      return debug("tile digit of axis " + Twine(d.axis) + " is no whole range of a loop");
+    t.rowSizes[p->outLoop[dim]] = size;
+    rows = true;
+  }
+  if (auto k = plan.kAxisTiles()) {
+    for (auto [a, size] : *k) {
+      auto [dim, place] = p->axisDim[a];
+      auto it = p->reductionLoop.find(dim);
+      if (place != 1 || p->axes[a].size != p->dimExtent[dim] || it == p->reductionLoop.end() ||
+          (t.reduce && t.reduce != it->second.first))
+        return debug("K tile of axis " + Twine(a) + " is no whole reduction loop of the contraction");
+      t.reduce = cast<linalg::GenericOp>(it->second.first);
+      t.reduceSizes.resize(t.reduce.getNumLoops(), 0);
+      t.reduceSizes[it->second.second] = size;
+    }
+  }
+  if (!rows && !t.reduce)
+    return std::nullopt;
+  return t;
+}
+
 } // namespace
 
-OpClass mlir::furiosa::mapping::tiledClass() { return {"tiled", match, map}; }
+OpClass mlir::furiosa::mapping::tiledClass() { return {"tiled", match, map, tiling}; }

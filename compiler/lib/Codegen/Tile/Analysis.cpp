@@ -2,6 +2,7 @@
 // expression over its output space, then splits divided dims into digits so every index is linear.
 
 #include "Program.h"
+#include "TileLoops.h"
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -501,19 +502,16 @@ public:
       why = "a tensor that is neither an argument nor an op result";
       return failure();
     }
-    if (auto loop = dyn_cast<scf::ForOp>(op)) {
+    if (isa<scf::ForOp>(op)) {
       // A K loop (furiosa-tile): one tile of a generic's reduction dim per iteration, accumulated in its
       // iteration argument. generic() gives that dim a tile dim alongside it.
-      std::optional<int64_t> lb = getConstantIntValue(loop.getLowerBound()),
-                             ub = getConstantIntValue(loop.getUpperBound()),
-                             step = getConstantIntValue(loop.getStep());
-      if (!lb || !ub || !step || *lb != 0 || *ub % *step || loop.getNumRegionIterArgs() != 1 ||
-          !loop->hasAttr("furiosa.tile_dim")) {
+      std::optional<TileLoop> k = kLoop(tensor);
+      if (!k) {
         why = "an scf.for that is not a K tile loop";
         return failure();
       }
-      kLoopOf[loop.getRegionIterArgs()[0]] = loop;
-      return valueAt(loop.getBody()->getTerminator()->getOperand(0), idx, fill);
+      kLoopOf[k->iterArg] = k->op;
+      return valueAt(k->yield, idx, fill);
     }
     if (auto pad = dyn_cast<tensor::PadOp>(op)) {
       llvm::APFloat value(0.0f);
@@ -812,83 +810,39 @@ FailureOr<Program> mlir::furiosa::tile::analyze(func::FuncOp func, ArrayRef<int6
     reshapes.push_back(v.getDefiningOp());
     v = v.getDefiningOp()->getOperand(0);
   }
-  // Tile loops (furiosa-tile): a nest of static scf.for whose innermost body inserts one tile of the stored value
-  // at the loops' offsets. Each tiled dim gets two dims, the tile index (with the output dims) and the index in
-  // the tile (after them); the axes merge back into one once the Program is built (mergeTiles).
+  // Tile loops (furiosa-tile, TileLoops.h): a nest of row tile loops inserting one tile of the stored value. Each
+  // tiled dim gets two dims, the tile index (with the output dims) and the index in the tile (after them); the
+  // axes merge back into one once the Program is built.
   SmallVector<AffineExpr> rootIdx, outIdx;
-  if (auto loop = v.getDefiningOp<scf::ForOp>(); loop && !loop->hasAttr("furiosa.tile_dim")) {
-    SmallVector<scf::ForOp> loops;
-    tensor::InsertSliceOp insert;
-    while (loop) {
-      std::optional<int64_t> lb = getConstantIntValue(loop.getLowerBound()),
-                             ub = getConstantIntValue(loop.getUpperBound()),
-                             step = getConstantIntValue(loop.getStep());
-      if (!lb || !ub || !step || *lb != 0 || *ub % *step || loop.getNumRegionIterArgs() != 1 ||
-          (!loops.empty() && loop.getInitArgs()[0] != loops.back().getRegionIterArgs()[0])) {
-        why = "a tile loop that is not a static nest over its stored value";
-        return failure();
-      }
-      loops.push_back(loop);
-      Value y = loop.getBody()->getTerminator()->getOperand(0);
-      loop = y.getDefiningOp<scf::ForOp>();
-      if (!loop) {
-        insert = y.getDefiningOp<tensor::InsertSliceOp>();
-        if (!insert || insert.getDest() != loops.back().getRegionIterArgs()[0]) {
-          why = "a tile loop that does not insert a tile of its stored value";
-          return failure();
-        }
-      }
-    }
-    if (llvm::is_contained(insert.getStaticSizes(), ShapedType::kDynamic) ||
-        llvm::any_of(insert.getStaticStrides(), [](int64_t x) { return x != 1; }) ||
-        insert.getSourceType().getRank() != insert.getDestType().getRank()) {
-      why = "a tile insert that is not a static box at the tile loops' offsets";
-      return failure();
-    }
-    auto shape = insert.getDestType().getShape();
-    SmallVector<std::optional<unsigned>> loopOf(shape.size());
-    for (auto [j, offset] : llvm::enumerate(insert.getMixedOffsets())) {
-      if (std::optional<int64_t> c = getConstantIntValue(offset)) {
-        if (*c != 0 || insert.getStaticSizes()[j] != shape[j]) {
-          why = "a tile insert at a fixed offset";
-          return failure();
-        }
-        continue;
-      }
-      for (auto [i, l] : llvm::enumerate(loops))
-        if (cast<Value>(offset) == l.getInductionVar())
-          loopOf[j] = i;
-      if (!loopOf[j] || insert.getStaticSizes()[j] != *getConstantIntValue(loops[*loopOf[j]].getStep()) ||
-          *getConstantIntValue(loops[*loopOf[j]].getUpperBound()) != shape[j]) {
-        why = "a tile insert whose offset is not a whole tile of a loop";
-        return failure();
-      }
-    }
+  FailureOr<std::optional<TileNest>> nest = tileNest(v, why);
+  if (failed(nest))
+    return failure();
+  if (*nest) {
+    TileNest n = **nest;
+    auto shape = n.insert.getDestType().getShape();
     SmallVector<unsigned> outer(shape.size());
     for (auto [j, extent] : llvm::enumerate(shape))
-      outer[j] = folder.dim(loopOf[j] ? extent / insert.getStaticSizes()[j] : extent, false);
+      outer[j] = folder.dim(n.loopOf[j] ? n.loops[*n.loopOf[j]].trips : extent, false);
     for (auto [j, extent] : llvm::enumerate(shape)) {
       AffineExpr d = getAffineDimExpr(outer[j], ctx);
-      if (!loopOf[j]) {
+      if (!n.loopOf[j]) {
         rootIdx.push_back(d);
         outIdx.push_back(d);
         continue;
       }
-      int64_t t = insert.getStaticSizes()[j];
-      unsigned in = folder.dim(t, false);
-      folder.bound[loops[*loopOf[j]].getInductionVar()] = d * t;
+      const TileLoop &l = n.loops[*n.loopOf[j]];
+      unsigned in = folder.dim(l.step, false);
+      folder.bound[l.iv] = d * l.step;
       rootIdx.push_back(getAffineDimExpr(in, ctx));
-      outIdx.push_back(d * t + getAffineDimExpr(in, ctx));
-      folder.tiled.push_back({outer[j], in, t});
+      outIdx.push_back(d * l.step + getAffineDimExpr(in, ctx));
+      folder.tiled.push_back({outer[j], in, l.step});
     }
-    v = insert.getSource();
+    v = n.tile;
   }
   // K loops (furiosa-tile) around the stored generic: it reduces across their iterations (generic() below).
-  while (auto k = v.getDefiningOp<scf::ForOp>()) {
-    if (!k->hasAttr("furiosa.tile_dim") || k.getNumRegionIterArgs() != 1)
-      break;
-    folder.kLoopOf[k.getRegionIterArgs()[0]] = k;
-    v = k.getBody()->getTerminator()->getOperand(0);
+  while (std::optional<TileLoop> k = kLoop(v)) {
+    folder.kLoopOf[k->iterArg] = k->op;
+    v = k->yield;
   }
   auto last = v.getDefiningOp<linalg::GenericOp>();
   if (!last) {
