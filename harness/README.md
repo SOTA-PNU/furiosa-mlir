@@ -165,7 +165,10 @@ with a copy of `compiler/backend`), then `PYTHONPATH=<snap>:compiler compiler/.v
 (the backend finds `furiosa_compiler` next to its own file, which the copy moves).
 
 Each run writes `harness/out/ops/<stage>.{json,md}`: an operator x dtype table and the failures grouped
-by the compiler's diagnostic. At the raise stage (raised IR on the CPU JIT) the first 791 cases pass; the npu stage is the verdict.
+by the compiler's diagnostic. At the raise stage (raised IR on the CPU JIT) 905 of the 907 cases pass (int32
+sort at 256 and 1024 lanes exceeds the 900 s limit in codegen). The npu stage at 0242fc9: 610 of 907 pass, none
+with a wrong result; the rest are kernels codegen does not map yet (int8 and rows that are not a multiple of 16
+were the largest groups; both have landed since).
 
 ## Running
 
