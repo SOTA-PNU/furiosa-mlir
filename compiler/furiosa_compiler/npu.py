@@ -23,7 +23,11 @@ from furiosa_compiler.crate import build_crate
 ROOT = Path(__file__).resolve().parents[2]
 CACHE = Path(os.environ.get("FURIOSA_NPU_CACHE", Path.home() / ".cache" / "furiosa-npu"))
 NPU = os.environ.get("FURIOSA_VISIBLE_CHIPS", "3")  # the only NPU this host may open
-DTYPES = {torch.float32: "fp32", torch.float16: "fp16", torch.bfloat16: "bf16", torch.int32: "i32", torch.int64: "i64"}
+DTYPES = {torch.float32: "fp32", torch.float16: "fp16", torch.bfloat16: "bf16", torch.int32: "i32", torch.int64: "i64",
+          torch.int8: "i8", torch.float8_e4m3fn: "fp8e4nv"}
+# dtypes numpy has no native form of: the integer view torch hands over, and the ml_dtypes type to read it as.
+VIEWS = {torch.bfloat16: (torch.int16, np.int16, ml_dtypes.bfloat16),
+         torch.float8_e4m3fn: (torch.uint8, np.uint8, ml_dtypes.float8_e4m3fn)}
 
 
 @dataclass(frozen=True)
@@ -53,11 +57,19 @@ class Graph:
 
 def host(t: torch.Tensor) -> np.ndarray:
     t = t.detach().contiguous()
-    return t.view(torch.int16).numpy().view(ml_dtypes.bfloat16) if t.dtype == torch.bfloat16 else t.numpy()
+    if t.dtype in VIEWS:
+        bits, _, kind = VIEWS[t.dtype]
+        return t.view(bits).numpy().view(kind)
+    return t.numpy()
 
 
 def store(t: torch.Tensor, a: np.ndarray):
-    t.copy_(torch.from_numpy(a.view(np.int16)).view(torch.bfloat16) if t.dtype == torch.bfloat16 else torch.from_numpy(a))
+    if t.dtype in VIEWS:
+        _, bits, _ = VIEWS[t.dtype]
+        a = a.view(bits)
+        t.copy_(torch.from_numpy(a).view(t.dtype))
+    else:
+        t.copy_(torch.from_numpy(a))
 
 
 def deps_binary(uplifted: Path) -> Path:

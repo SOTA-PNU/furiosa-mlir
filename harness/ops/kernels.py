@@ -193,14 +193,12 @@ def dot_kernel(a_ptr, b_ptr, out_ptr, M: tl.constexpr, N: tl.constexpr, K: tl.co
 
 
 @triton.jit
-def block_ptr_kernel(x_ptr, out_ptr, R: tl.constexpr, C: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr):
-    """make_block_ptr + advance: copies x tile by tile along the rows."""
-    src = tl.make_block_ptr(x_ptr, (R, C), (C, 1), (0, 0), (BR, BC), (1, 0))
-    dst = tl.make_block_ptr(out_ptr, (R, C), (C, 1), (0, 0), (BR, BC), (1, 0))
-    for _ in range(0, R, BR):
-        tl.store(dst, tl.load(src, boundary_check=(0, 1)), boundary_check=(0, 1))
-        src = tl.advance(src, (BR, 0))
-        dst = tl.advance(dst, (BR, 0))
+def descriptor_kernel(x_ptr, out_ptr, R: tl.constexpr, C: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr):
+    """Tensor descriptors (Triton 3.9 removed block pointers in their favor): copies x a row tile at a time."""
+    src = tl.make_tensor_descriptor(x_ptr, [R, C], [C, 1], [BR, BC])
+    dst = tl.make_tensor_descriptor(out_ptr, [R, C], [C, 1], [BR, BC])
+    for r0 in tl.static_range(0, R, BR):
+        dst.store([r0, 0], src.load([r0, 0]))
 
 
 @triton.jit

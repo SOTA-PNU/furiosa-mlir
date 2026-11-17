@@ -18,11 +18,13 @@ DTYPES = {
     "i16": np.dtype(np.int16),
     "i8": np.dtype(np.int8),
     "u8": np.dtype(np.uint8),
+    "fp8e4nv": np.dtype(ml_dtypes.float8_e4m3fn),
 }
 
 # safetensors dtype tag <-> numpy dtype.
 _TAGS = {"F64": np.float64, "F32": np.float32, "F16": np.float16, "BF16": ml_dtypes.bfloat16, "I64": np.int64,
-         "I32": np.int32, "I16": np.int16, "I8": np.int8, "U8": np.uint8, "BOOL": np.bool_}
+         "I32": np.int32, "I16": np.int16, "I8": np.int8, "U8": np.uint8, "BOOL": np.bool_,
+         "F8_E4M3": ml_dtypes.float8_e4m3fn}
 _TAG_OF = {np.dtype(v): k for k, v in _TAGS.items()}
 
 

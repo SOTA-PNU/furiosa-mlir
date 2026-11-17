@@ -57,7 +57,7 @@ def all_cases() -> list[Case]:
         cases += [Case("shape", op, dtype, s) for dtype in ALL for s in [(1, 64, 64), (2, 32, 64)]]
     for dtype in FLOATS + ["int8", "float8_e4m3fn"]:
         cases += [Case("dot", "dot", dtype, s) for s in DOTS]
-    cases += [Case("memory", "block_ptr", dtype, s) for dtype in ALL for s in [(1, 64, 64), (1, 50, 70)]]
+    cases += [Case("memory", "descriptor", dtype, s) for dtype in ALL for s in [(1, 64, 64), (1, 50, 64)]]
     cases += [Case("program", "program_id", "float32", (1, 64, 64))]
     cases += [Case("atomic", "atomic_add", "float32", (1, 8, 64))]
     return cases
@@ -106,7 +106,8 @@ def build(case: Case):
             ref = {"sum": lambda: xs.sum(-1), "max": lambda: xs.amax(-1), "min": lambda: xs.amin(-1),
                    "argmax": lambda: xs.argmax(-1), "argmin": lambda: xs.argmin(-1)}[case.op]()
         out = torch.empty(rows, dtype=torch.int32 if case.op in ("argmax", "argmin") else x.dtype)
-        return K.reduce_kernel, (1,), dict(x_ptr=x, out_ptr=out, OP=K.REDUCE.index(case.op), **blk), {"out_ptr": ref}, "sum"
+        return (K.reduce_kernel, (1,), dict(x_ptr=x, out_ptr=out, OP=K.REDUCE.index(case.op), **blk),
+                {"out_ptr": (ref, xs.abs().sum(-1))}, "sum")
     if case.group == "scan":
         if case.op == "cumprod":
             x = (_input((rows, c), "float32", 0.5, 1.5, g) * torch.where(torch.rand(rows, c, generator=g) < 0.5, -1, 1)).to(DTYPES[dt])
@@ -151,7 +152,7 @@ def build(case: Case):
     if case.group == "memory":
         x = _input((rows, c), dt, generator=g)
         out = torch.empty_like(x)
-        return (K.block_ptr_kernel, (1,), dict(x_ptr=x, out_ptr=out, R=rows, C=c, BR=16, BC=blk["BC"]),
+        return (K.descriptor_kernel, (1,), dict(x_ptr=x, out_ptr=out, R=rows, C=c, BR=16, BC=blk["BC"]),
                 {"out_ptr": wide(x)}, "float")
     if case.group == "program":
         x = _input((rows, c), dt, generator=g)
@@ -159,27 +160,31 @@ def build(case: Case):
     if case.group == "atomic":
         x = _input((rows, c), dt, generator=g)
         return (K.atomic_kernel, (rows,), dict(x_ptr=x, out_ptr=torch.zeros(c, dtype=x.dtype), R=rows, C=c),
-                {"out_ptr": wide(x).sum(0)}, "sum")
+                {"out_ptr": (wide(x).sum(0), wide(x).abs().sum(0))}, "sum")
     raise ValueError(case.group)
 
 
 def check(actual: torch.Tensor, expected, kind: str) -> tuple[bool, str]:
-    """lowlevel-api-test's rule: floats allclose(1e-2, 1e-2, equal_nan), integers exact. Running sums allow
-    log2(n)*eps*scale more; dots allow the bf16 operand rounding of the NPU's contraction, 2^-8*(|a|@|b|)."""
-    bound = None
-    if kind == "dot":
-        expected, bound = expected
+    """lowlevel-api-test's rule: the reference cast to the output dtype (so integers wrap as the kernel's
+    do), then floats allclose(1e-2, 1e-2, equal_nan) and integers exact. Running sums and reductions
+    allow log2(n)*eps*scale more; dots allow the NPU contraction's bf16 operand rounding, 2^-8*(|a|@|b|)."""
+    scale = None
+    if kind in ("dot", "sum"):
+        expected, scale = expected
+    expected = expected.to(actual.dtype)
     if not actual.is_floating_point():
-        ok = torch.equal(actual.long(), expected.long())
-        return ok, "" if ok else f"{int((actual.long() != expected.long()).sum())} integer mismatches"
+        ok = torch.equal(actual, expected)
+        return ok, "" if ok else f"{int((actual != expected).sum())} integer mismatches"
     exp = expected.to(torch.float64)
     act = actual.to(torch.float64)
     tol = 1e-2 + 1e-2 * exp.abs()
+    eps = torch.finfo(actual.dtype).eps
     if kind == "scan":
-        eps = torch.finfo(actual.dtype).eps
         tol = tol + torch.log2(torch.tensor(float(exp.shape[-1]))) * eps * exp.abs().cummax(-1).values
+    if kind == "sum":
+        tol = tol + torch.log2(torch.tensor(1024.0)) * eps * scale.to(torch.float64)
     if kind == "dot":
-        tol = tol + 2.0**-8 * bound
+        tol = tol + 2.0**-8 * scale
     err = (act - exp).abs()
     nan_ok = torch.isnan(act) & torch.isnan(exp)
     ok = bool(((err <= tol) | nan_ok).all())

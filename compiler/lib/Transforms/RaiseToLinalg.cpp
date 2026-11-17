@@ -314,6 +314,27 @@ std::optional<SmallVector<int64_t>> fitAffine(ArrayRef<SmallVector<int64_t>> x, 
   return c;
 }
 
+/// For a reshape that only inserts or drops unit dims, the source axis of each result axis (-1: new).
+std::optional<SmallVector<int>> unitReshape(ArrayRef<int64_t> src, ArrayRef<int64_t> dst) {
+  SmallVector<int> oldOf;
+  unsigned k = 0;
+  for (int64_t d : dst) {
+    if (d == 1) {
+      oldOf.push_back(-1);
+      continue;
+    }
+    while (k < src.size() && src[k] == 1)
+      ++k;
+    if (k == src.size() || src[k] != d)
+      return std::nullopt;
+    oldOf.push_back(k++);
+  }
+  for (; k < src.size(); ++k)
+    if (src[k] != 1)
+      return std::nullopt;
+  return oldOf;
+}
+
 std::string show(AffineExpr e) {
   std::string out;
   llvm::raw_string_ostream os(out);
@@ -499,6 +520,33 @@ private:
           oldOf.push_back(o);
       }
       syms[op->getResult(0)] = remapAxes(*src, oldOf, dst);
+      return success();
+    }
+    if (auto rs = dyn_cast<tt::ReshapeOp>(op)) {
+      const Sym *src = get(rs.getSrc());
+      if (!src)
+        return success(); // data
+      SmallVector<int64_t> dst = shapeOf(rs.getResult().getType());
+      if (auto oldOf = unitReshape(src->shape, dst)) {
+        syms[rs.getResult()] = remapAxes(*src, *oldOf, dst);
+        return success();
+      }
+      if (!src->data.empty())
+        return fail(op, "furiosa: reshape of a data-dependent index");
+      // Each old axis is a mixed-radix digit of the new axes' row-major linear index.
+      AffineExpr lin = cst(0);
+      for (int64_t i = 0, stride = 1, n = dst.size(); i < n; stride *= dst[n - 1 - i], ++i)
+        lin = lin + getAffineDimExpr(n - 1 - i, ctx) * stride;
+      SmallVector<AffineExpr> repl(src->shape.size());
+      for (int64_t k = src->shape.size() - 1, stride = 1; k >= 0; stride *= src->shape[k], --k)
+        repl[k] = lin.floorDiv(stride) % src->shape[k];
+      Sym out = *src;
+      out.shape.assign(dst.begin(), dst.end());
+      if (out.expr)
+        out.expr = out.expr.replaceDims(repl);
+      for (AffineExpr &c : out.conds)
+        c = c.replaceDims(repl);
+      syms[rs.getResult()] = out;
       return success();
     }
     if (auto a = dyn_cast<tt::AddPtrOp>(op)) {
@@ -1942,6 +1990,16 @@ FailureOr<Value> Raiser::emit(Gen &g, Value v, ArrayRef<Axis> env) {
     out = constantOf(getElementTypeOrSelf(c.getType()), c.getValue());
   } else if (auto s = dyn_cast<tt::SplatOp>(def)) {
     out = emit(g, s.getSrc(), {});
+  } else if (auto rs = dyn_cast<tt::ReshapeOp>(def)) {
+    SmallVector<int64_t> src = shapeOf(rs.getSrc().getType());
+    auto oldOf = unitReshape(src, shapeOf(rs.getResult().getType()));
+    if (!oldOf)
+      return def->emitError("furiosa: a reshape that moves data between dims is not raised yet"), failure();
+    SmallVector<Axis> senv(src.size());
+    for (auto [i, o] : llvm::enumerate(*oldOf))
+      if (o >= 0)
+        senv[o] = env[i];
+    out = emit(g, rs.getSrc(), senv);
   } else if (auto br = dyn_cast<tt::BroadcastOp>(def)) {
     SmallVector<int64_t> src = shapeOf(br.getSrc().getType());
     SmallVector<Axis> senv;
@@ -2257,8 +2315,12 @@ FailureOr<Value> Raiser::materialize(Gen &g, Value v, ArrayRef<Axis> env) {
       identity = b.getFloatAttr(et, -std::numeric_limits<double>::infinity());
     else if (isa<arith::MinNumFOp, arith::MinimumFOp>(comb))
       identity = b.getFloatAttr(et, std::numeric_limits<double>::infinity());
-    else if (isa<arith::AddIOp>(comb))
+    else if (isa<arith::AddIOp, arith::XOrIOp, arith::OrIOp, arith::MaxUIOp>(comb))
       identity = b.getIntegerAttr(et, 0);
+    else if (isa<arith::MulIOp>(comb))
+      identity = b.getIntegerAttr(et, 1);
+    else if (isa<arith::AndIOp, arith::MinUIOp>(comb))
+      identity = b.getIntegerAttr(et, APInt::getAllOnes(et.getIntOrFloatBitWidth()));
     else if (isa<arith::MaxSIOp>(comb))
       identity = b.getIntegerAttr(et, APInt::getSignedMinValue(et.getIntOrFloatBitWidth()));
     else if (isa<arith::MinSIOp>(comb))
@@ -2386,7 +2448,8 @@ FailureOr<Value> Raiser::materialize(Gen &g, Value v, ArrayRef<Axis> env) {
           });
     } else if (upd->getNumOperands() == 2 &&
                isa<arith::AddFOp, arith::MulFOp, arith::MaxNumFOp, arith::MinNumFOp, arith::MaximumFOp,
-                   arith::MinimumFOp, arith::AddIOp, arith::MaxSIOp, arith::MinSIOp>(upd)) {
+                   arith::MinimumFOp, arith::AddIOp, arith::MulIOp, arith::MaxSIOp, arith::MinSIOp, arith::MaxUIOp,
+                   arith::MinUIOp, arith::XOrIOp, arith::OrIOp, arith::AndIOp>(upd)) {
       Value term = upd->getOperand(0) == iter ? upd->getOperand(1) : upd->getOperand(0);
       built = buildGeneric(
           g, parentDims, extents, loopDims, elem, initFn,
@@ -2502,6 +2565,11 @@ FailureOr<SmallVector<SmallVector<Axis>>> Raiser::stateEnvs(scf::ForOp loop, uns
     } else if (auto t = dyn_cast<tt::TransOp>(op)) {
       for (auto [k, o] : llvm::enumerate(t.getOrder()))
         unite(r, k, t.getSrc(), o);
+    } else if (auto rs = dyn_cast<tt::ReshapeOp>(op)) {
+      if (auto oldOf = unitReshape(shapeOf(rs.getSrc().getType()), shapeOf(r.getType())))
+        for (auto [k, o] : llvm::enumerate(*oldOf))
+          if (o >= 0)
+            unite(r, k, rs.getSrc(), o);
     } else if (auto red = dyn_cast<tt::ReduceOp>(op)) {
       for (unsigned k = 0; k < rank(r); ++k)
         unite(r, k, red.getOperand(0), k < red.getAxis() ? k : k + 1);
