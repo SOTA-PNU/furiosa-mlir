@@ -32,10 +32,12 @@ npu stage) against GPU goldens.
   digits back into one axis; 2^x folds as e^(x ln 2); a reduction guarded by a program-dependent trip count splits
   along the program loops; a guarded load reads the window it spans at an affine address (2f945b0). All 25 corpus
   cases now reach L4 (attention backward was the last).
-- `maxnumf`/`minnumf` (`tl.maximum`/`tl.minimum`'s default, `tl.max`/`tl.min`, relu) return the non-NaN operand on
-  npu3 as on the GPU: a NaN guard runs before the whole-kernel check, at no measured run-time cost (vgg16 3.05 s,
-  resnet101 2.21 s either way). Still open: two computed operands (an attention running max) keep the engine's
-  NaN-propagating max, and an all-NaN row reduces to -inf (30e9144).
+- `maxnumf`/`minnumf` (`tl.maximum`/`tl.minimum`'s default, `tl.max`/`tl.min`, relu) skip NaN as on the GPU in
+  kernels the row-wise class maps: a NaN guard runs before the whole-kernel check, at no measured run-time cost
+  (vgg16 3.05 s, resnet101 2.21 s either way) (30e9144). Known issues: in the tiled path the guard's clean leaves
+  NaN as NaN, so tiled relus and reductions still propagate NaN as the engine does (a fix is in progress); two
+  computed operands (an attention running max) keep the engine's NaN-propagating max; an all-NaN row reduces to
+  -inf. No corpus or matrix golden holds NaN, so no result changes.
 - Row-wise row tiles run as one device loop (a 1x256x256 cumsum was a 350 KB kernel past furiosa-opt's 128 dynamic
   indices); the Splitter refuses a step past 256 DMA statements (furiosa-opt's compile time grows superlinearly in
   them). cumsum and cumprod at 1x256x256, cumprod at 1024 lanes, flip at 4x32x128 and 1x256x256 pass on npu3;
