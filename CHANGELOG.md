@@ -6,6 +6,9 @@ npu stage) against GPU goldens.
 
 ## 1.2.0 (unreleased, main)
 
+Known issue on main: fused attention's forward kernel no longer maps whole (14 unmapped steps at a1ec302; it
+passed L4 in 1.1.0); a fix is in progress.
+
 - Normalization: reduction loops of extent 1 drop (`tl.expand_dims` with a reduction, int32 and int8); `tl.umulhi`
   computed from 16-bit limbs, exact under the engine's wrapping multiply (cae9784).
 - Operator matrix on npu3: masked stores pass in every dtype (10 cases; they failed at 1805f3e).
