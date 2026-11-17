@@ -1,5 +1,5 @@
 // RUN: furiosa-mlir-opt --furiosa-tile %s | FileCheck %s
-// RUN: furiosa-mlir-opt --furiosa-tile --furiosa-linalg-to-fopt %s | FileCheck %s --check-prefix=FOPT
+// RUN: furiosa-mlir-opt --furiosa-tile --furiosa-linalg-to-fopt --furiosa-dma %s | FileCheck %s --check-prefix=FOPT
 
 // furiosa-tile turns the plan's K tiles into a K loop: a 3x3 convolution with 128 input channels (VGG conv3)
 // contracts K = 9 x 128 in three passes of 3 taps (384 fit a TRF lane with the column groups the plan

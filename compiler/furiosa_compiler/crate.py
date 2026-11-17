@@ -184,6 +184,8 @@ def map_kernel(linalg: str, kernel_dir: Path, stem: str, what: str) -> tuple[str
     except RuntimeError as e:
         raise CrateError(f"{what}: linalg -> fopt: {str(e).strip()}") from None
     (kernel_dir / ("fopt.mlir" if stem == "kernel" else f"{stem}.fopt.mlir")).write_text(fopt)
+    # The level before furiosa-dma (staged reads still abstract), for inspection.
+    (kernel_dir / ("ftile.mlir" if stem == "kernel" else f"{stem}.ftile.mlir")).write_text(furiosa.codegen.linalg_to_ftile(linalg))
     try:
         rust = furiosa.codegen.fopt_to_rust(fopt)
         signature = json.loads(furiosa.codegen.fopt_signature(fopt))

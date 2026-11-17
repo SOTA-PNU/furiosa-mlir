@@ -12,6 +12,7 @@ add_triton_library(FuriosaCodegen
   Mapping/Rowwise.cpp
   Normalize.cpp
   Tile/Analysis.cpp
+  Tile/Dma.cpp
   Tile/Lower.cpp
   Tile/Plan.cpp
   Tile/TileLoops.cpp

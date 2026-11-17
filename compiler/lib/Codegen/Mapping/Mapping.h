@@ -35,6 +35,8 @@ public:
 
   /// Declares an axis of the kernel's axes! and returns it as a mapping.
   fopt::MapAttr axis(StringRef name, int64_t size);
+  /// How many axes are declared so far.
+  size_t numAxes() const { return axes.size(); }
   fopt::MapAttr one() { return fopt::MapAttr::broadcast(ctx, 1); }
   /// The chip mapping (one chip) and cluster mapping (cluster 0 of 2) every kernel uses for now.
   fopt::MapAttr chip() { return one(); }

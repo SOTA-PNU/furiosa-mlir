@@ -35,6 +35,10 @@ std::unique_ptr<Pass> createStepsPlanPass();
 /// generic (lib/Codegen/Tile/TilePass.cpp).
 std::unique_ptr<Pass> createTilePass();
 
+/// furiosa-dma: lowers staged reads (fopt.stage, fopt.read) to HBM staging buffers and DMAs, choosing their layout
+/// (lib/Codegen/Tile/Dma.cpp).
+std::unique_ptr<Pass> createDmaPass();
+
 /// Writes every fopt kernel of `module` as one Rust module (the body of src/kernel/<symbol>.rs).
 LogicalResult translateFoptToRust(ModuleOp module, llvm::raw_ostream &os);
 

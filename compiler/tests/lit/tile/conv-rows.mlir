@@ -1,5 +1,5 @@
 // RUN: furiosa-mlir-opt --furiosa-tile %s | FileCheck %s
-// RUN: furiosa-mlir-opt --furiosa-tile --furiosa-linalg-to-fopt %s | FileCheck %s --check-prefix=FOPT
+// RUN: furiosa-mlir-opt --furiosa-tile --furiosa-linalg-to-fopt --furiosa-dma %s | FileCheck %s --check-prefix=FOPT
 
 // furiosa-tile tiles a kernel by the tiled lowering's plan: a 3x3 convolution over 224x224x64 (VGG conv1_2)
 // splits its output rows into 4 tiles of 56. The loop computes each tile's contraction from a 58-row window of

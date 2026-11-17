@@ -54,6 +54,20 @@ void init_furiosa_codegen(nb::module_ &m) {
       mlir::PassManager pm(module->getContext());
       pm.addPass(mlir::furiosa::createTilePass());
       pm.addPass(mlir::furiosa::createLinalgToFoptPass());
+      pm.addPass(mlir::furiosa::createDmaPass());
+      if (mlir::failed(pm.run(module)))
+        return mlir::failure();
+      module.print(os);
+      return mlir::success();
+    });
+  });
+
+  // The tiled kernels mapped to fopt before furiosa-dma: staged reads still abstract (fopt.stage, fopt.read).
+  codegen.def("linalg_to_ftile", [](const std::string &text) {
+    return withModule(text, [](mlir::ModuleOp module, llvm::raw_ostream &os) {
+      mlir::PassManager pm(module->getContext());
+      pm.addPass(mlir::furiosa::createTilePass());
+      pm.addPass(mlir::furiosa::createLinalgToFoptPass());
       if (mlir::failed(pm.run(module)))
         return mlir::failure();
       module.print(os);

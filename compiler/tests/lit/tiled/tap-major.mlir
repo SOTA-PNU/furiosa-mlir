@@ -1,8 +1,16 @@
-// RUN: furiosa-mlir-opt --furiosa-linalg-to-fopt %s | FileCheck %s
+// RUN: furiosa-mlir-opt --furiosa-linalg-to-fopt %s | FileCheck %s --check-prefix=STAGE
+// RUN: furiosa-mlir-opt --furiosa-linalg-to-fopt --furiosa-dma %s | FileCheck %s
 
-// A windowed contraction operand (a 3x3 convolution's input) is materialized tap-major: each tap's DMA
-// writes one contiguous block of a [taps, rows, channels] HBM buffer (the NPU compiler's cost grows with the
-// contiguous runs an HBM destination has). Taps pad 9 -> 12 so K is whole 32-element packets.
+// The tiled class says what each contraction operand's tiles hold: the input read through its 3x3 window
+// (fopt.stage, index d0 + d3 - 1 with fill 0) and its tiles (fopt.read). furiosa-dma decides the staging: a
+// windowed operand is tap-major, each tap's DMA writing one contiguous block of a [taps, rows, channels] HBM
+// buffer (the NPU compiler's cost grows with the contiguous runs an HBM destination has), the taps a kept 3x3
+// loop. Taps pad 9 -> 12 so K is whole 32-element packets.
+
+// STAGE-LABEL: func.func @conv
+// STAGE: fopt.stage %arg0 {spec = {{{.*}}fill = 0.000000e+00 : f64, index = [array<i64: 0>, array<i64: -1, 0, 1, 3, 1>, array<i64: -1, 1, 1, 4, 1>, array<i64: 0, 5, 1>]{{.*}}tap_pad = 12
+// STAGE: fopt.read %{{.*}} {at = [], k_index = 0 : i64, rc_index = 0 : i64, with_k = true}
+// STAGE-NOT: fopt.alloc_hbm : !fopt.hbm<f32, <"1">, <"S{{[0-9]+}}_TQ
 
 // CHECK-LABEL: func.func @conv
 // CHECK: fopt.alloc_hbm : !fopt.hbm<f32, <"1">, <"[[S:S[0-9]+_]]TQ{12}, [[S]]D1_0{8} = 6, [[S]]D2_0{8} = 6, [[S]]CQ{8}">>

@@ -85,4 +85,35 @@ def Fopt_TileAtOp : Fopt_Op<"tile_at", [Pure]> {
   let hasVerifier = 1;
 }
 
+// Hardware-abstract data movement (lowered by furiosa-dma, lib/Codegen/Tile/Dma.cpp). The tiled lowering says
+// what each tile holds; the pass decides how the data gets there: the staging buffer's layout in HBM (padded
+// copies and their fills, tap-major or row-major K, zero-padded inner digits, tap-loop classes) and each tile's
+// view and DMA to DM.
+
+def Fopt_StageOp : Fopt_Op<"stage"> {
+  let summary = "a kernel buffer read at a linear index over the program's axes, staged in HBM (abstract)";
+  let description = [{
+    `spec` describes the read and the layout its tiles are cut from: `index` (per buffer dim, [offset, axis,
+    coeff, ...]), `shape`, `fill`; the program's axis `sizes` and padded `extents`; the layout's `rows` axes and
+    their `canonical` digits; for a contraction operand its K split (`taps`, `inner`, `tap_pad`, `inner_pad`,
+    `k_tile`, `kf`); inside a Vector Engine reduction its `ext` axes and `rf` (and `rc`) axes; the `tag` naming
+    the staging axes and `axes_at`, where they go in the kernel's axes. The result is only read by fopt.read.
+  }];
+  let arguments = (ins Fopt_HbmTensor:$source, DictionaryAttr:$spec);
+  let results = (outs Fopt_HbmTensor:$result);
+  let assemblyFormat = "$source attr-dict `:` qualified(type($source)) `->` qualified(type($result))";
+}
+
+def Fopt_ReadOp : Fopt_Op<"read"> {
+  let summary = "one tile of a staged read, moved to DM (abstract)";
+  let description = [{
+    `at` selects the tile: [digit, index] per tiled digit of the staging layout. `k_index` is the contraction's K
+    tile (with `with_k`), `rc_index` the reduction chunk.
+  }];
+  let arguments = (ins Fopt_HbmTensor:$staged, ArrayAttr:$at, BoolAttr:$with_k, I64Attr:$k_index,
+                       I64Attr:$rc_index);
+  let results = (outs Fopt_DmTensor:$result);
+  let assemblyFormat = "$staged attr-dict `:` qualified(type($staged)) `->` qualified(type($result))";
+}
+
 #endif // FURIOSA_CODEGEN_FOPT_TILE_OPS
