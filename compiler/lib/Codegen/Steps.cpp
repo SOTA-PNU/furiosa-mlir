@@ -681,6 +681,17 @@ void Splitter::run(bool single) {
 
   // Outline each step and call it from the kernel, in order.
   ModuleOp module = kernel->getParentOfType<ModuleOp>();
+  // Step names kernel__sN: a hashed table and a running N (probing from 0 with module.lookupSymbol, a scan of the
+  // module per probe, was cubic in the steps: minutes for tl.sort's thousands).
+  SymbolTable symbols(module);
+  int next = 0;
+  auto freshName = [&] {
+    std::string name;
+    do
+      name = (kernel.getName() + "__s" + Twine(next++)).str();
+    while (symbols.lookup(name));
+    return name;
+  };
   Operation *terminator = block.getTerminator();
   auto returnOp = dyn_cast<func::ReturnOp>(terminator);
   auto written = returnOp ? kernel->getAttrOfType<ArrayAttr>("furiosa.written") : ArrayAttr();
@@ -689,12 +700,9 @@ void Splitter::run(bool single) {
   SmallVector<std::pair<Value, unsigned>> misplaced; // results a step left in a temporary: (value, buffer)
   for (auto [s, group] : llvm::enumerate(groups)) {
     SmallVector<Value> inputs, outputs = outputsOf(s, /*all=*/false);
-    std::string name;
-    for (int k = 0; name.empty() || module.lookupSymbol(name); ++k)
-      name = (kernel.getName() + "__s" + Twine(k)).str();
-    func::FuncOp step = outline(group, name, outputs, inputs);
+    func::FuncOp step = outline(group, freshName(), outputs, inputs);
     step.setPrivate();
-    module.push_back(step);
+    symbols.insert(step);
     auto stepWritten = step->getAttrOfType<ArrayAttr>("furiosa.written");
     // Call operands: the inputs (as earlier steps left them), then a destination per fresh output: the buffer
     // the kernel returns it into (through reshapes, which move no data), or a new temporary.
@@ -743,16 +751,13 @@ void Splitter::run(bool single) {
   for (auto [out, index] : misplaced) {
     Value value = resultOf[out];
     auto t = cast<RankedTensorType>(value.getType());
-    std::string name;
-    for (int k = 0; name.empty() || module.lookupSymbol(name); ++k)
-      name = (kernel.getName() + "__s" + Twine(k)).str();
     OpBuilder detached(kernel.getContext());
-    auto copy = func::FuncOp::create(detached, kernel.getLoc(), name, b.getFunctionType({t, t}, {t}));
+    auto copy = func::FuncOp::create(detached, kernel.getLoc(), freshName(), b.getFunctionType({t, t}, {t}));
     copy->setAttr("furiosa.written", b.getI64ArrayAttr({1}));
     OpBuilder cb = OpBuilder::atBlockBegin(copy.addEntryBlock());
     func::ReturnOp::create(cb, kernel.getLoc(), copyOf(cb, kernel.getLoc(), copy.getArgument(0)));
     copy.setPrivate();
-    module.push_back(copy);
+    symbols.insert(copy);
     b.setInsertionPoint(terminator);
     resultOf[out] = func::CallOp::create(b, kernel.getLoc(), copy,
                                          ValueRange{value, reshapeTo(b, kernel.getLoc(), kernel.getArgument(index), t)})
