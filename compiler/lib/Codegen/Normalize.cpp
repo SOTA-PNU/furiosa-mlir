@@ -1037,6 +1037,42 @@ void relayoutReads(linalg::GenericOp g, function_ref<bool(linalg::GenericOp)> ma
   g.setIndexingMapsAttr(b.getAffineMapArrayAttr(maps));
 }
 
+/// A reduction no class maps whose inputs each vary along only some of its loops (tl.histogram: the values along
+/// the reduced loop, the bins along the other) reads the one spanning the reduced loops broadcast over the rest
+/// (a relayout, one DMA): the row-wise class streams a full tile of rows and columns.
+void broadcastStreams(linalg::GenericOp g, function_ref<bool(linalg::GenericOp)> mapsAlone) {
+  unsigned n = g.getNumLoops();
+  auto spans = [&](AffineMap m, auto pred) {
+    return llvm::all_of(llvm::seq<unsigned>(0, n), [&](unsigned d) { return !pred(d) || m.isFunctionOfDim(d); });
+  };
+  auto iters = g.getIteratorTypesArray();
+  auto reduced = [&](unsigned d) { return iters[d] == utils::IteratorType::reduction; };
+  auto all = [](unsigned) { return true; };
+  if (!mapsAlone || !g.getNumReductionLoops() || g.getNumDpsInits() != 1 ||
+      llvm::any_of(g.getDpsInputOperands(), [&](OpOperand *in) { return spans(g.getMatchingIndexingMap(in), all); }))
+    return;
+  OpOperand *stream = nullptr;
+  for (OpOperand *in : g.getDpsInputOperands())
+    if (g.getMatchingIndexingMap(in).isProjectedPermutation() && spans(g.getMatchingIndexingMap(in), reduced))
+      stream = in;
+  if (!stream || mapsAlone(g))
+    return;
+  OpBuilder b(g);
+  SmallVector<int64_t> ranges = g.getStaticLoopRanges();
+  auto t = cast<RankedTensorType>(stream->get().getType());
+  Value empty = tensor::EmptyOp::create(b, g.getLoc(), ranges, t.getElementType());
+  AffineMap id = b.getMultiDimIdentityMap(n);
+  auto broadcast = linalg::GenericOp::create(
+      b, g.getLoc(), TypeRange{empty.getType()}, ValueRange{stream->get()}, ValueRange{empty},
+      ArrayRef<AffineMap>{g.getMatchingIndexingMap(stream), id},
+      SmallVector<utils::IteratorType>(n, utils::IteratorType::parallel),
+      [](OpBuilder &nb, Location l, ValueRange args) { linalg::YieldOp::create(nb, l, args[0]); });
+  SmallVector<AffineMap> maps = g.getIndexingMapsArray();
+  maps[stream->getOperandNumber()] = id;
+  stream->set(broadcast.getResult(0));
+  g.setIndexingMapsAttr(b.getAffineMapArrayAttr(maps));
+}
+
 /// Selects in generic bodies keyed by a boolean combination of conditions become nested selects each keyed by
 /// one condition, as the Vector Engine selects by one tag comparison at a time: select(!c, a, b) =
 /// select(c, b, a) (!c written c ^ true), select(c1 & c2, a, b) = select(c1, select(c2, a, b), b), likewise |, and
@@ -1103,7 +1139,7 @@ void nestSelectKeys(ModuleOp module) {
 /// integers already and pass through (the conversion would saturate). Unsigned i32 min and max compare signed with
 /// the sign bits flipped (which maps unsigned order onto signed order): minui(a, b) = minsi(a ^ s, b ^ s) ^ s. An
 /// i32 mului_extended (tl.umulhi) is the wrapping product and its high half from 16-bit limbs (the engine's
-/// integer multiply wraps).
+/// integer multiply wraps). A widened i1 is a select: extui(c) = c ? 1 : 0, extsi(c) = c ? -1 : 0.
 void expandMath(ModuleOp module) {
   RewritePatternSet approximations(module.getContext());
   populateMathPolynomialApproximationPatterns(approximations, [](StringRef name) {
@@ -1121,6 +1157,16 @@ void expandMath(ModuleOp module) {
     Value l = arith::XOrIOp::create(b, loc, op->getOperand(0), sign), r = arith::XOrIOp::create(b, loc, op->getOperand(1), sign);
     Value m = isa<arith::MinUIOp>(op) ? arith::MinSIOp::create(b, loc, l, r).getResult() : arith::MaxSIOp::create(b, loc, l, r).getResult();
     op->getResult(0).replaceAllUsesWith(arith::XOrIOp::create(b, loc, m, sign));
+    op->erase();
+  });
+  module.walk([&](Operation *op) {
+    if (!isa<arith::ExtUIOp, arith::ExtSIOp>(op) || !op->getOperand(0).getType().isInteger(1))
+      return;
+    OpBuilder b(op);
+    Type t = op->getResult(0).getType();
+    auto c = [&](int64_t v) { return arith::ConstantOp::create(b, op->getLoc(), b.getIntegerAttr(t, v)).getResult(); };
+    op->getResult(0).replaceAllUsesWith(
+        arith::SelectOp::create(b, op->getLoc(), op->getOperand(0), c(isa<arith::ExtUIOp>(op) ? 1 : -1), c(0)));
     op->erase();
   });
   module.walk([&](arith::MulUIExtendedOp op) {
@@ -1203,6 +1249,7 @@ void mlir::furiosa::normalizeKernels(ModuleOp module, function_ref<bool(linalg::
     }
     dropCarriers(g);
     relayoutReads(g, mapsAlone);
+    broadcastStreams(g, mapsAlone);
   }
   // The slices and carriers the reads no longer use.
   for (auto func : module.getOps<func::FuncOp>())
