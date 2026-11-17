@@ -4,7 +4,8 @@
 // the pass's last op: its stage is not behind (only the float and clip stages take several ops), its ALU is free,
 // and a 4-wide float op does not follow the widening. Multiplications take Mul0, Mul1, then the FMA unit; an add
 // of an immediate or VRF moves to the clip stage once the FMA unit is taken or passed (the stage rules the
-// row-wise class plans by). An op that zips two tensors, tags the stream or branches on the tags starts a pass.
+// row-wise class plans by). An op that zips two tensors, tags the stream or branches on the tags starts a pass;
+// a branched op without tags of its own reads the tags its pass began with, and joins that pass or fails.
 
 #include "Plan.h"
 #include "furiosa/Codegen/Codegen.h"
@@ -24,7 +25,7 @@ using namespace mlir::furiosa::fopt;
 namespace {
 
 // The Vector Engine's stages, in pass order (as row-wise numbers them).
-enum Stage { Tag = 0, Narrow = 4, Fp = 5, FpDiv = 7, Widen = 8, Clip = 10, Last = 11 };
+enum Stage { Tag = 0, Logic = 1, Narrow = 4, Fp = 5, FpDiv = 7, Widen = 8, Clip = 10, Last = 11 };
 
 /// An op placed in a pass: its stage, ALU, whether it runs 4-wide, and its call (the ALU's op).
 struct Placed {
@@ -37,10 +38,11 @@ struct Placed {
 
 struct PassState {
   int stage = Tag;
-  bool way4 = false;
+  bool way4 = false, tagged = false;
   std::set<std::string> alus;
 
   void add(const Placed &p) {
+    tagged |= bool(VeOp(p.ve).getTags());
     if (p.way4 != way4)
       stage = std::max(stage, int(p.way4 ? Narrow : Widen));
     way4 = p.way4;
@@ -55,7 +57,7 @@ std::optional<Placed> place(VeOp ve, const PassState *st) {
   bool head = !st;
   if (head)
     st = &fresh;
-  else if (ve.getZip() || ve.getTags() || ve.getBranches()) // branches read the tags the pass began with
+  else if (ve.getZip() || ve.getTags() || (ve.getBranches() && !st->tagged)) // the tags the pass began with
     return std::nullopt;
   StringRef m = ve.getMethod(), op = ve.getOp();
   Placed p{ve, Last, m.str(), m.starts_with("vector_fp"), m.str(), op.str()};
@@ -80,13 +82,15 @@ std::optional<Placed> place(VeOp ve, const PassState *st) {
       p = {ve, Clip, "ClipAdd", false, "vector_clip", "ClipBinaryOpF32::Add"};
   } else if (m == "vector_fp_div") {
     p.stage = FpDiv, p.alu = "ReduceFpDiv";
+  } else if (m == "vector_logic") {
+    p.stage = Logic, p.alu = op.ends_with("BitAnd") ? "LogicAnd" : op.ends_with("BitOr") ? "LogicOr" : "LogicXor";
   } else if (m == "vector_clip" || m == "vector_clip_zip") {
     p.stage = Clip;
     p.alu = op.ends_with("Max") ? "ClipMax" : op.ends_with("Min") ? "ClipMin" : "ClipAdd"; // zipped or not
   }
   if (head)
     return p;
-  bool sameStageAllowed = p.stage == Fp || p.stage == Clip;
+  bool sameStageAllowed = p.stage == Logic || p.stage == Fp || p.stage == Clip;
   if (p.stage == Last || p.stage < st->stage || (p.stage == st->stage && !sameStageAllowed) ||
       st->alus.count(p.alu) || (p.way4 && st->stage > Narrow && !st->way4))
     return std::nullopt;
@@ -174,13 +178,14 @@ void lowerPass(ArrayRef<Placed> ops) {
 }
 
 /// Groups the fopt.ve ops of `block` (and of the blocks nested in it) into passes and lowers each.
-void fuseBlock(Block &block) {
+LogicalResult fuseBlock(Block &block) {
   SmallVector<SmallVector<Placed>> passes;
   DenseMap<Operation *, std::pair<size_t, PassState>> open; // a pass's last op -> (the pass, its state)
   for (Operation &o : block) {
     for (Region &r : o.getRegions())
       for (Block &inner : r)
-        fuseBlock(inner);
+        if (failed(fuseBlock(inner)))
+          return failure();
     auto ve = dyn_cast<VeOp>(&o);
     if (!ve)
       continue;
@@ -195,6 +200,8 @@ void fuseBlock(Block &block) {
         continue;
       }
     }
+    if (ve.getBranches() && !ve.getTags())
+      return ve.emitError("a branch on the tags of a pass it cannot join");
     Placed p = *place(ve, nullptr);
     PassState state;
     state.add(p);
@@ -203,6 +210,7 @@ void fuseBlock(Block &block) {
   }
   for (auto &ops : passes)
     lowerPass(ops);
+  return success();
 }
 
 struct VeFusePass : PassWrapper<VeFusePass, OperationPass<ModuleOp>> {
@@ -217,7 +225,8 @@ struct VeFusePass : PassWrapper<VeFusePass, OperationPass<ModuleOp>> {
   void runOnOperation() override {
     for (func::FuncOp func : getOperation().getOps<func::FuncOp>())
       for (Block &block : func.getBody())
-        fuseBlock(block);
+        if (failed(fuseBlock(block)))
+          return signalPassFailure();
   }
 };
 

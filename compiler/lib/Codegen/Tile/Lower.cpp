@@ -570,20 +570,24 @@ FailureOr<Val> Lowering::select(const Node &n, ArrayRef<int64_t> tileIndex) {
       return failure();
     return binary("mul", *y, constTile(1, -1));
   }
-  // select(x > -inf, x, -inf) (x < +inf, x, +inf; a NaN-skipping max or min's clean value) is one op on the key, no
-  // VRF: AbsMax (|a| > |b| ? a : b) with the bound where the tag fails, where x is NaN or the bound and the bound
-  // wins, and with 0 where it holds, where x does (shortcut: a -0.0 comes out +0.0).
+  // select(x > -inf, x, -inf) (x < +inf, x, +inf; a NaN-skipping max or min's clean value) is two logic ops on the
+  // key, exact for any bits (a NaN's payload included): where the tag fails (x is NaN or the bound m),
+  // (x | m) & m = m; where it holds, (x | 0) & ~0 = x. The second op carries no tags: it reads its pass's.
   if (n.args[1] == xs && !constFirst && fb.kind == Node::Const && std::isinf(fb.value) && fb.value == kn.value &&
       ((c.op == "cmp.ogt" && fb.value < 0) || (c.op == "cmp.olt" && fb.value > 0))) {
     std::string fails = tag->second;
     for (char &ch : fails)
       ch = ch == '1' ? '0' : ch == '0' ? '1' : ch;
-    AluSpec spec;
-    spec.method = "vector_clip";
-    spec.op = "ClipBinaryOpF32::AbsMax";
-    spec.branches = b.getArrayAttr({b.getArrayAttr({b.getStringAttr(fails), b.getF32FloatAttr(fb.value)}),
-                                    b.getArrayAttr({b.getStringAttr("all"), b.getF32FloatAttr(0.0)})});
-    return Val{x->kind, pass(x->dm, spec, cmps)};
+    auto logic = [&](Value in, StringRef op, float otherwise, ArrayAttr tags) {
+      AluSpec spec;
+      spec.method = "vector_logic";
+      spec.op = ("LogicBinaryOpF32::" + op).str();
+      spec.branches = b.getArrayAttr({b.getArrayAttr({b.getStringAttr(fails), b.getF32FloatAttr(fb.value)}),
+                                      b.getArrayAttr({b.getStringAttr("all"), b.getF32FloatAttr(otherwise)})});
+      return pass(in, spec, tags);
+    };
+    Value v = logic(x->dm, "BitOr", 0.0f, cmps);
+    return Val{x->kind, logic(v, "BitAnd", llvm::bit_cast<float>(~0u), ArrayAttr())};
   }
   // Otherwise each branch's value comes in under the tag: Max in Mode11 (op(b, b)) of a VRF tile or an
   // immediate, exact for any bits, so a NaN or infinity in the branch not taken cannot leak. Two tile branches

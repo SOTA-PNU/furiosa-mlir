@@ -1,11 +1,18 @@
 // RUN: furiosa-mlir-opt --furiosa-tile --furiosa-linalg-to-fopt %s | FileCheck %s
+// RUN: furiosa-mlir-opt --furiosa-tile --furiosa-linalg-to-fopt --furiosa-dma --furiosa-ve-fuse %s | FileCheck %s --check-prefix=FUSED
 
-// A max reduction's clean value (NaN skipped, as maxnumf does: x > -inf ? x : -inf, VGG16's 2x2 max pool) is one
-// op on the key, no VRF: AbsMax (|a| > |b| ? a : b) with -inf where the tag fails (x NaN or -inf: -inf wins) and 0
-// where it holds (x wins), then the reduction's max.
+// A max reduction's clean value (NaN skipped, as maxnumf does: x > -inf ? x : -inf, VGG16's 2x2 max pool) is two
+// logic ops on the key, exact for any NaN: where the tag fails (x NaN or -inf), (x | -inf) & -inf = -inf; where it
+// holds, (x | 0) & ~0 = x. The second reads the first's tags, in its pass, before the reduction's max.
 
 // CHECK-LABEL: func.func @maxpool2d_kernel
-// CHECK: fopt.ve "vector_clip" "ClipBinaryOpF32::AbsMax" {{.*}} {branches = {{\[\["0---", 0xFF800000 : f32\], \["all", 0.000000e\+00 : f32\]\]}}, tags = ["Greater(f32::NEG_INFINITY)"
+// CHECK: fopt.ve "vector_logic" "LogicBinaryOpF32::BitOr" {{.*}} {branches = {{\[\["0---", 0xFF800000 : f32\], \["all", 0.000000e\+00 : f32\]\]}}, tags = ["Greater(f32::NEG_INFINITY)"
+// CHECK-NEXT: fopt.ve "vector_logic" "LogicBinaryOpF32::BitAnd" {{.*}} {branches = {{\[\["0---", 0xFF800000 : f32\], \["all", 0xFFFFFFFF : f32\]\]}}}
+
+// FUSED: fopt.vector_tag_cmp ["Greater(f32::NEG_INFINITY)"
+// FUSED-NEXT: fopt.vector_alu "vector_logic" "LogicBinaryOpF32::BitOr"
+// FUSED-NEXT: fopt.vector_alu "vector_logic" "LogicBinaryOpF32::BitAnd"
+// FUSED-NEXT: fopt.vector_alu "vector_clip" "ClipBinaryOpF32::Max"
 #map = affine_map<(d0, d1, d2, d3) -> (0, d1 * 2, d2 * 2, d3)>
 #map1 = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
 module attributes {furiosa.launch = "{\22grid\22: [392, 1, 1], \22buffers\22: [{\22arg\22: 0, \22kind\22: \22activation\22, \22dtype\22: \22fp32\22, \22shape\22: [1, 224, 224, 64]}, {\22arg\22: 1, \22kind\22: \22activation\22, \22dtype\22: \22fp32\22, \22shape\22: [1, 112, 112, 64]}]}"} {

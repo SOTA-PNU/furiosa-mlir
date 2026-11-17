@@ -21,10 +21,10 @@ using namespace mlir::furiosa::fopt;
 /// A Rust f32 literal of `value`, exact: shortest round-trip decimal, subnormals included (the bits of an i32
 /// carried in an f32 stream); the MIR lowering takes literals and named constants, not calls.
 std::string mlir::furiosa::rustF32(float value) {
-  if (std::isnan(value))
+  if (std::isnan(value)) // a payload in a const block: vISA immediates are compile-time constants
     return llvm::bit_cast<uint32_t>(value) == 0x7fc00000u
                ? "f32::NAN"
-               : llvm::formatv("f32::from_bits({0:x})", llvm::bit_cast<uint32_t>(value)).str();
+               : llvm::formatv("const {{ f32::from_bits({0:x}) }", llvm::bit_cast<uint32_t>(value)).str();
   if (std::isinf(value))
     return value > 0 ? "f32::INFINITY" : "f32::NEG_INFINITY";
   llvm::SmallString<32> text;
