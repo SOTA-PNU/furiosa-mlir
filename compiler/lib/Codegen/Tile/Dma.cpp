@@ -422,6 +422,14 @@ FailureOr<Value> Stager::materialize(const Read &r, ArrayRef<unsigned> rowAxes, 
       int64_t radix = above / c;
       MapAttr e;
       if (innerAxis && a == *innerAxis && cq) {
+        // A windowed inner axis (a K slice of a longer dim): the digit splits into whole padded K blocks (an
+        // axis-less digit the window's offset selects) and the padded K digit itself.
+        if (radix > k->innerPad && radix % k->innerPad == 0) {
+          int64_t blocks = radix / k->innerPad;
+          dig[j].push_back({declare(tag + "D" + std::to_string(j) + "_" + std::to_string(dig[j].size()), blocks),
+                            blocks, c * k->innerPad, std::nullopt});
+          radix = k->innerPad;
+        }
         if (radix > k->innerPad)
           return fail("an inner contraction digit wider than its padded extent");
         e = radix == k->innerPad ? cq : cq.resize(radix);

@@ -119,7 +119,8 @@ variable; furiosa-opt keeps the loop), and its data movement abstract, as `fopt.
 tiles are cut from) and `fopt.read` (one tile of it in DM). `furiosa-dma` (lib/Codegen/Tile/Dma.cpp) makes the
 data-movement decisions and lowers both to HBM staging buffers and DMAs: padded copies and their fills (one copy
 shared by the stages of a buffer that differ only in their windows, such as unrolled taps), tap-major or
-row-major K for contraction operands, inner digits zero-padded in the source copy, the taps' DMAs as kept loops
+row-major K for contraction operands, inner digits zero-padded in the source copy (a K window of a longer dim,
+such as attention's P x V reading one key block of V, is one block of the padded K digit), the taps' DMAs as kept loops
 over affine tap classes. The crate writes each kernel's level before the pass as `<stem>.ftile.mlir`, next
 to the final `<stem>.fopt.mlir`.
 fp16 buffers live as f32 on the device (furiosa-opt has no f16): mapping a kernel to fopt widens its `f16` to
