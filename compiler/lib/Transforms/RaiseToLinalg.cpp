@@ -2205,6 +2205,25 @@ FailureOr<Value> Raiser::emitLoad(Gen &g, tt::LoadOp load, ArrayRef<Axis> env) {
   return elem;
 }
 
+/// The math-dialect op a libdevice call means, by its symbol (__nv_asinf, __nv_pow, ...), or "".
+static std::string libdeviceOp(tt::ExternElementwiseOp call) {
+  StringRef name = call.getSymbol();
+  if (!name.consume_front("__nv_"))
+    return "";
+  static const llvm::StringMap<StringRef> math = {
+      {"asin", "asin"},   {"acos", "acos"},   {"atan", "atan"},   {"atan2", "atan2"}, {"sinh", "sinh"},
+      {"cosh", "cosh"},   {"tanh", "tanh"},   {"asinh", "asinh"}, {"acosh", "acosh"}, {"atanh", "atanh"},
+      {"sin", "sin"},     {"cos", "cos"},     {"tan", "tan"},     {"exp", "exp"},     {"exp2", "exp2"},
+      {"expm1", "expm1"}, {"log", "log"},     {"log2", "log2"},   {"log10", "log10"}, {"log1p", "log1p"},
+      {"sqrt", "sqrt"},   {"rsqrt", "rsqrt"}, {"cbrt", "cbrt"},   {"erf", "erf"},     {"erfc", "erfc"},
+      {"pow", "powf"},    {"fabs", "absf"},   {"floor", "floor"}, {"ceil", "ceil"},   {"trunc", "trunc"},
+      {"round", "round"}, {"rint", "roundeven"}, {"fma", "fma"}};
+  auto it = math.find(name);
+  if (it == math.end() && name.consume_back("f")) // the fp32 variant: __nv_asinf
+    it = math.find(name);
+  return it == math.end() ? "" : ("math." + it->second).str();
+}
+
 FailureOr<Value> Raiser::emitElementwise(Gen &g, Operation *op, ArrayRef<Axis> env) {
   SmallVector<Value> operands;
   for (Value o : op->getOperands()) {
@@ -2229,6 +2248,12 @@ FailureOr<Value> Raiser::emitElementwise(Gen &g, Operation *op, ArrayRef<Axis> e
     return arith::BitcastOp::create(ob, loc, rt, operands[0]).getResult();
   if (isa<tt::MulhiUIOp>(op)) // the high half of the unsigned product (math.umulhi)
     return arith::MulUIExtendedOp::create(ob, loc, operands[0], operands[1]).getHigh();
+  if (auto call = dyn_cast<tt::ExternElementwiseOp>(op)) { // a libdevice function
+    OperationState state(loc, libdeviceOp(call));
+    state.addOperands(operands);
+    state.addTypes(rt);
+    return ob.create(state)->getResult(0);
+  }
   if (auto clamp = dyn_cast<tt::ClampFOp>(op)) {
     Value lo = arith::MaximumFOp::create(ob, loc, operands[0], operands[1]);
     return arith::MinimumFOp::create(ob, loc, lo, operands[2]).getResult();
@@ -2245,6 +2270,8 @@ static bool isElementwise(Operation *op) {
     return false;
   if (isa<tt::PreciseDivFOp, tt::PreciseSqrtOp, tt::FpToFpOp, tt::BitcastOp, tt::ClampFOp, tt::MulhiUIOp>(op))
     return true;
+  if (auto call = dyn_cast<tt::ExternElementwiseOp>(op))
+    return !libdeviceOp(call).empty();
   Dialect *d = op->getDialect();
   return d && (isa<arith::ArithDialect>(d) || isa<math::MathDialect>(d)) && !isa<arith::ConstantOp>(op);
 }

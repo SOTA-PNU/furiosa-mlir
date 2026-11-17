@@ -84,8 +84,9 @@ FURIOSA_VISIBLE_CHIPS=3 ../out/target/npu/release/characterize > npu3.jsonl
 
 L3 and L4 compare with the case's NPU tolerance, which allows for the dtype policy the NPU forces
 (no fp32 or fp16 contraction: dots run in bf16 with fp32 accumulation; fp16 buffers live as f32 on the
-device, and F16 is converted at the graph boundary). A match means
-`max|out - golden| <= atol + rtol * max|golden|` for every output.
+device, and F16 is converted at the graph boundary). A match means NaN exactly where golden has NaN
+(a function outside its domain) and `max|out - golden| <= atol + rtol * max|golden|` over the other
+elements, for every output; integers match exactly.
 
 ## The compiler under test
 

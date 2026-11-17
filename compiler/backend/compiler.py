@@ -85,7 +85,10 @@ class FuriosaBackend(BaseBackend):
         return {"min_dot_size": lambda lhs_type, rhs_type: (1, 1, 1)}
 
     def get_module_map(self) -> Dict[str, ModuleType]:
-        return {}
+        # libdevice calls keep their declarations (extern_elementwise of __nv_* symbols, no library is
+        # linked); the raising pass turns the ones with a math-dialect meaning into those ops.
+        from triton.language.extra.cuda import libdevice
+        return {"triton.language.extra.libdevice": libdevice}
 
     def load_dialects(self, ctx):
         furiosa.load_dialects(ctx)

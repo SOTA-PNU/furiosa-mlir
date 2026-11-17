@@ -85,9 +85,14 @@ def compare(out_path: Path, golden_path: Path, tol) -> Result:
             if not torch.equal(out, ref):
                 return Result("FAIL", f"{name}: {(out != ref).sum().item()} integer mismatches")
             continue
-        err = (out.float() - ref.float()).abs().max().item()
-        scale = ref.float().abs().max().item()
-        if not err <= tol.atol + tol.rtol * scale:  # also catches NaN
+        # NaN exactly where golden has it (asin outside [-1, 1], say); the other elements within tolerance.
+        o, r = out.float(), ref.float()
+        if not torch.equal(o.isnan(), r.isnan()):
+            return Result("FAIL", f"{name}: NaN where golden has a number, or the reverse")
+        o, r = o[~r.isnan()], r[~r.isnan()]
+        err = (o - r).abs().max().item() if r.numel() else 0.0
+        scale = r.abs().max().item() if r.numel() else 0.0
+        if not err <= tol.atol + tol.rtol * scale:  # also catches inf - inf
             return Result("FAIL", f"{name}: max err {err:.3g} > {tol.atol} + {tol.rtol}*{scale:.3g}")
         if scale and err / scale >= worst:
             worst, worst_name = err / scale, name

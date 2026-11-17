@@ -75,8 +75,8 @@ ULP = {"bfloat16": 2.0**-7, "float16": 2.0**-10}
 
 
 def compare(got: dict, want: dict, rtol: float, atol: float) -> tuple[bool, str]:
-    """harness/run.py's rule: integers exact; floats max|err| <= atol + rtol * max|golden|, NaN fails;
-    rtol is at least one ulp of the output dtype."""
+    """harness/run.py's rule: integers exact; floats NaN exactly where golden has it, elsewhere
+    max|err| <= atol + rtol * max|golden|; rtol is at least one ulp of the output dtype."""
     worst, worst_name = 0.0, ""
     for name, ref in want.items():
         if name not in got:
@@ -90,6 +90,9 @@ def compare(got: dict, want: dict, rtol: float, atol: float) -> tuple[bool, str]
                 return False, f"{name}: {mismatches} integer mismatches"
             continue
         o, r = out.astype(np.float64), ref.astype(np.float64)
+        if not np.array_equal(np.isnan(o), np.isnan(r)):
+            return False, f"{name}: NaN where golden has a number, or the reverse"
+        o, r = o[~np.isnan(r)], r[~np.isnan(r)]
         err = float(np.abs(o - r).max()) if r.size else 0.0
         scale = float(np.abs(r).max()) if r.size else 0.0
         tol = max(rtol, ULP.get(ref.dtype.name, 0.0))

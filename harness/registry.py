@@ -16,6 +16,7 @@ class Case:
     graph: Tol | None = None  # L1 over a whole graph (None: same as exact); see harness/README.md
     npu: Tol = Tol(rtol=2e-2, atol=1e-2)  # L3/L4: dots run in bf16 with fp32 accumulation on the NPU
     int_ranges: dict = field(default_factory=dict)  # integer input buffer -> [low, high)
+    float_ranges: dict = field(default_factory=dict)  # float input buffer -> [low, high), uniform (a function's domain)
     weights: str | None = None  # a loader in harness/weights.py; None means seeded random weights
     top1: str | None = None  # L3/L4: this output's per-row argmax must equal golden's
     seed: int = 0
@@ -34,6 +35,7 @@ CASES = {
     "tutorial_dropout": Case("harness/cases/tutorial_dropout.py"),
     "tutorial_fused_attention": Case("harness/cases/tutorial_fused_attention.py", exact=Tol(rtol=2e-3, atol=2e-3)),
     "tutorial_persistent_matmul": Case("harness/cases/tutorial_persistent_matmul.py", exact=Tol(rtol=2e-3, atol=2e-3)),
+    "tutorial_extern": Case("harness/cases/tutorial_extern.py", float_ranges={"x": (-1.0, 1.0)}),  # asin's domain
     # Held-out kernels, written apart from the corpus (harness/README.md). NPU tolerances: data movement
     # and max are exact; contractions allow twice the measured drift of rounding their operands to bf16
     # (bmm 0.34%, depthwise 0.32% of max|out|); a bf16 output allows one bf16 ulp at max|golden|; fp32

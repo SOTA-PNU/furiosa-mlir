@@ -34,6 +34,9 @@ def make(buf, case, generator, checkpoint):
             raise ValueError(f"integer buffer {buf.name} needs a range in harness/registry.py")
         low, high = case.int_ranges[buf.name]
         return torch.randint(low, high, buf.shape, generator=generator, device="cuda", dtype=dtype)
+    if buf.name in case.float_ranges:
+        low, high = case.float_ranges[buf.name]
+        return (low + (high - low) * torch.rand(buf.shape, generator=generator, device="cuda")).to(dtype)
     x = torch.randn(buf.shape, generator=generator, device="cuda", dtype=torch.float32)
     if buf.kind == "weight" and len(buf.shape) >= 2:
         fan_in = 1
