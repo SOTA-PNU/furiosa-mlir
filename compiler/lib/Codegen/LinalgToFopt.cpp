@@ -108,6 +108,50 @@ SmallVector<int64_t> writtenArgs(func::FuncOp func) {
   return written;
 }
 
+/// fp16 buffers live as f32 on the device (furiosa-opt has no f16, and every f16 is exact in f32; F16 converts at
+/// the graph boundary): the kernel's f16 tensors and scalars become f32, and the conversions between them vanish.
+void widenF16(func::FuncOp func) {
+  Type f32 = Float32Type::get(func.getContext());
+  auto widen = [&](Type t) -> Type {
+    if (t.isF16())
+      return f32;
+    if (auto rt = dyn_cast<RankedTensorType>(t); rt && rt.getElementType().isF16())
+      return rt.clone(f32);
+    return t;
+  };
+  bool any = false;
+  auto retype = [&](Value v) {
+    if (Type w = widen(v.getType()); w != v.getType()) {
+      v.setType(w);
+      any = true;
+    }
+  };
+  func.walk([&](Operation *op) {
+    for (Region &r : op->getRegions())
+      for (Block &b : r)
+        for (BlockArgument a : b.getArguments())
+          retype(a);
+    for (Value v : op->getResults())
+      retype(v);
+    if (auto c = dyn_cast<arith::ConstantOp>(op))
+      if (auto fa = dyn_cast<FloatAttr>(c.getValue()); fa && fa.getType().isF16())
+        c.setValueAttr(FloatAttr::get(f32, fa.getValueAsDouble()));
+  });
+  if (!any)
+    return;
+  SmallVector<Operation *> casts;
+  func.walk([&](Operation *op) {
+    if (isa<arith::ExtFOp, arith::TruncFOp>(op) && op->getOperand(0).getType() == op->getResult(0).getType())
+      casts.push_back(op);
+  });
+  for (Operation *op : casts) {
+    op->getResult(0).replaceAllUsesWith(op->getOperand(0));
+    op->erase();
+  }
+  SmallVector<Type> results = llvm::map_to_vector(func.getResultTypes(), widen);
+  func.setType(FunctionType::get(func.getContext(), func.getBody().getArgumentTypes(), results));
+}
+
 } // namespace
 
 ArrayRef<OpClass> mapping::opClasses() {
@@ -133,12 +177,14 @@ bool mapping::mapsOnCopy(func::FuncOp func, const OpClass &c) {
       (*scratch)->setAttr(attr.getName(), attr.getValue());
   auto copy = cast<func::FuncOp>(func->clone());
   scratch->push_back(copy);
+  widenF16(copy);
   ScopedDiagnosticHandler quiet(func.getContext(), [](Diagnostic &) { return success(); });
   RaisedKernel raised = raisedKernel(copy);
   return c.match(raised) && succeeded(c.map(raised));
 }
 
 LogicalResult mapping::mapKernel(func::FuncOp func) {
+  widenF16(func);
   RaisedKernel kernel = raisedKernel(func);
   SmallVector<const OpClass *> matching;
   for (const OpClass &c : opClasses())

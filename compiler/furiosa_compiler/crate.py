@@ -12,13 +12,15 @@ import json
 import math
 import re
 import shutil
+import struct
 import subprocess
 from pathlib import Path
 
 from triton._C.libtriton import furiosa
 
-RUST_DTYPES = {"fp32": "f32", "bf16": "bf16", "i32": "i32"}
-MLIR_DTYPES = {"f32": "f32", "bf16": "bf16", "i32": "i32"}  # element types of step temporaries
+# fp16 buffers live as f32 on the device (furiosa-opt has no f16); F16 is converted at the graph boundary.
+RUST_DTYPES = {"fp32": "f32", "bf16": "bf16", "i32": "i32", "fp16": "f32"}
+MLIR_DTYPES = {"f32": "f32", "bf16": "bf16", "i32": "i32", "f16": "f32"}  # element types of step temporaries
 ELEMENT_BYTES = {"fp32": 4, "bf16": 2, "i32": 4}
 
 CARGO_TOML = """\
@@ -41,6 +43,7 @@ path = "src/run_graph.rs"
 [dependencies]
 eyre = "0.6"
 furiosa-opt-std = "=0.10.0"
+half = "2"
 safetensors = "0.4"
 tokio = {{ version = "1.29", features = ["rt", "rt-multi-thread", "sync", "macros"] }}
 
@@ -117,6 +120,14 @@ impl Inputs {
     pub fn host<D: Stored + ScalarBytes + MaterializableScalar, E: M>(&self, name: &str) -> eyre::Result<HostTensor<D, E>> {
         let file = SafeTensors::deserialize(&self.0)?;
         let view = file.tensor(name).wrap_err_with(|| format!("buffer {name}"))?;
+        if view.dtype() == Dtype::F16 && D::DTYPE == Dtype::F32 {
+            // An fp16 buffer lives as f32 on the device: F16 widens exactly.
+            let wide: Vec<u8> = view.data().chunks_exact(2)
+                .flat_map(|h| half::f16::from_le_bytes([h[0], h[1]]).to_f32().to_le_bytes())
+                .collect();
+            let wide = TensorView::new(Dtype::F32, view.shape().to_vec(), &wide)?;
+            return HostTensor::from_safetensors(&wide).map_err(|e| eyre!("buffer {name}: {e:?}"));
+        }
         ensure!(view.dtype() == D::DTYPE, "buffer {name} is {:?}, expected {:?}", view.dtype(), D::DTYPE);
         HostTensor::from_safetensors(&view).map_err(|e| eyre!("buffer {name}: {e:?}"))
     }
@@ -132,6 +143,16 @@ impl Outputs {
         let bytes: Vec<u8> = tensor.into_buffer().into();
         assert_eq!(bytes.len(), shape.iter().product::<usize>() * size_of::<D>(), "{name}: shape {shape:?}");
         self.0.insert(name.to_owned(), (D::DTYPE, shape.to_vec(), bytes));
+    }
+
+    /// Stores an fp16 buffer (f32 on the device) as F16, rounded to nearest even.
+    pub fn put_f16<E: M>(&mut self, name: &str, shape: &[usize], tensor: HostTensor<f32, E>) {
+        let bytes: Vec<u8> = tensor.into_buffer().into();
+        assert_eq!(bytes.len(), shape.iter().product::<usize>() * 4, "{name}: shape {shape:?}");
+        let narrow = bytes.chunks_exact(4)
+            .flat_map(|f| half::f16::from_f32(f32::from_le_bytes([f[0], f[1], f[2], f[3]])).to_le_bytes())
+            .collect();
+        self.0.insert(name.to_owned(), (Dtype::F16, shape.to_vec(), narrow));
     }
 
     pub fn save(&self, path: &Path) -> eyre::Result<()> {
@@ -332,8 +353,9 @@ class RunGraph:
                     raise CrateError(f"graph {g}: output {buffer} is never written")
                 mapping = self.host_mapping(g, names, buffer, info["shape"])
                 shape = ", ".join(str(d) for d in info["shape"])
+                put = "put_f16" if info["dtype"] == "fp16" else "put"
                 lines.append(
-                    f"    files.put({json.dumps(buffer)}, &[{shape}], HbmTensor::<{dtype(buffer)}, m![1], {mapping}>"
+                    f"    files.{put}({json.dumps(buffer)}, &[{shape}], HbmTensor::<{dtype(buffer)}, m![1], {mapping}>"
                     f"::try_from({variable(buffer)}.alias(..)?)?.to_host::<{mapping}>(&mut device.pdma).await?);"
                 )
         lines.append("    Ok(())")
@@ -439,7 +461,10 @@ def build_crate(result: dict, out: Path, crate: Path) -> Path:
     for symbol, plan in plans.items():
         for k, const in enumerate(plan.get("consts", [])):
             (crate / "src" / "consts").mkdir(exist_ok=True)
-            (crate / "src" / "consts" / f"{symbol}_{k}.bin").write_bytes(base64.b64decode(const["data"]))
+            data = base64.b64decode(const["data"])
+            if const["dtype"] == "f16":  # an f16 table lives as f32 on the device too
+                data = struct.pack(f"<{len(data) // 2}f", *struct.unpack(f"<{len(data) // 2}e", data))
+            (crate / "src" / "consts" / f"{symbol}_{k}.bin").write_bytes(data)
     (crate / "src" / "run_graph.rs").write_text(run_graph)
     # Formatting is cosmetic: skip it if the toolchain's rustfmt is unavailable.
     subprocess.run(["cargo", "fmt"], cwd=crate, capture_output=True)
