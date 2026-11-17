@@ -22,7 +22,7 @@ from harness.golden import GOLDEN
 from harness.registry import CASES
 from tests.harness import ROOT
 
-LEVELS = ["L0", "L1", "L2", "L3", "L4"]
+LEVELS = ["L0", "L1", "L2a", "L2", "L3", "L4"]
 OUT = ROOT / "harness" / "out"
 NPU = 3  # the only NPU the harness may open
 TOOLS = ROOT / ".tools" / "bin"
@@ -229,13 +229,15 @@ def judge(name: str, level: str, impl: str) -> Result:
         return Result("SKIP", f"no {impl} crate")
     failed = crate / "CODEGEN_FAILED"
     if failed.exists():  # the compiler wrote a crate that only carries its codegen diagnostic
-        if level != "L2":
+        if level not in ("L2a", "L2"):
             return Result("SKIP", "L2 failed: codegen left kernels unmapped")
         lines = failed.read_text().strip().replace(str(ROOT) + "/", "").splitlines()
         # One line per failing kernel (or step of one): "<symbol>[ step k (...)]: reason".
         unmapped = {line.split(":")[0].split(" ")[0] for line in lines if line.strip()}
         total = len(json.loads((OUT / name / "compiler" / "graph.json").read_text())["kernels"])
         return Result("FAIL", f"codegen: {len(unmapped)}/{total} kernels unmapped; {lines[0][:300]}")
+    if level == "L2a":  # every kernel mapped and the crate written: seconds, no cargo build
+        return Result("PASS")
     if level == "L2":
         exe, log = build_run_graph(crate, npu=True)
         code = 0 if exe else 1

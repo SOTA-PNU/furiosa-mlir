@@ -46,6 +46,7 @@ files are always the canonical host layout.
 |---|---|---|---|
 | L0 `ttir` | `harness/out/<case>/<case>.triton.mlir` | `scripts/dump_mlir.py` succeeds | triton |
 | L1 `raised` | raised `linalg` module | it runs on MLIR's CPU path and matches golden (exact dtype) | compiler (not yet) |
+| L2a `codegen` | the crate | the compiler mapped every kernel and wrote the crate (no `CODEGEN_FAILED`); seconds, no build | compiler |
 | L2 `compile` | the crate | `cargo furiosa-opt build --bin run_graph` succeeds: furiosa-opt accepts every mapping | furiosa-opt |
 | L3 `cpu` | the crate | plain `cargo run --bin run_graph` (furiosa-opt's CPU backend) matches golden | furiosa-opt |
 | L4 `npu` | the crate | the NPU build on npu3 matches golden | an idle npu3 |
