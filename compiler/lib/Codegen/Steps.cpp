@@ -839,6 +839,7 @@ void copyReturnedArguments(func::FuncOp kernel) {
 LogicalResult mlir::furiosa::splitSteps(ModuleOp module) {
   // The mapping oracle builds fopt kernels; steps add tensor and linalg ops to a kernel that may have had none.
   module.getContext()->loadDialect<fopt::FoptDialect, tensor::TensorDialect, linalg::LinalgDialect>();
+  guardNaNs(module);
   SmallVector<func::FuncOp> kernels;
   for (auto func : module.getOps<func::FuncOp>())
     if (func.isPublic() && !func->hasAttr(kStepsAttr))

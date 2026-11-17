@@ -25,6 +25,7 @@
 #include "Dma.h"
 #include "Plan.h"
 
+#include "furiosa/Codegen/Codegen.h"
 #include "furiosa/Codegen/Fopt.h"
 
 #include <cmath>
@@ -522,12 +523,7 @@ static std::optional<std::pair<std::string, std::string>> tagOf(StringRef pred, 
   else
     return std::nullopt;
   std::string bits = (q == "lt" || q == "gt" || q == "eq") ? "1---" : "0---";
-  llvm::SmallString<16> lit;
-  llvm::APFloat(float(k)).toString(lit, 0, 0);
-  std::string s(lit);
-  if (s.find_first_of(".eE") == std::string::npos)
-    s += ".0";
-  return std::make_pair(base + "(" + s + "f32)", bits);
+  return std::make_pair(base + "(" + mlir::furiosa::rustF32(float(k)) + ")", bits);
 }
 
 FailureOr<Val> Lowering::select(const Node &n, ArrayRef<int64_t> tileIndex) {
@@ -573,6 +569,21 @@ FailureOr<Val> Lowering::select(const Node &n, ArrayRef<int64_t> tileIndex) {
     if (failed(y))
       return failure();
     return binary("mul", *y, constTile(1, -1));
+  }
+  // select(x > -inf, x, -inf) (x < +inf, x, +inf; a NaN-skipping max or min's clean value) is one op on the key, no
+  // VRF: AbsMax (|a| > |b| ? a : b) with the bound where the tag fails, where x is NaN or the bound and the bound
+  // wins, and with 0 where it holds, where x does (shortcut: a -0.0 comes out +0.0).
+  if (n.args[1] == xs && !constFirst && fb.kind == Node::Const && std::isinf(fb.value) && fb.value == kn.value &&
+      ((c.op == "cmp.ogt" && fb.value < 0) || (c.op == "cmp.olt" && fb.value > 0))) {
+    std::string fails = tag->second;
+    for (char &ch : fails)
+      ch = ch == '1' ? '0' : ch == '0' ? '1' : ch;
+    AluSpec spec;
+    spec.method = "vector_clip";
+    spec.op = "ClipBinaryOpF32::AbsMax";
+    spec.branches = b.getArrayAttr({b.getArrayAttr({b.getStringAttr(fails), b.getF32FloatAttr(fb.value)}),
+                                    b.getArrayAttr({b.getStringAttr("all"), b.getF32FloatAttr(0.0)})});
+    return Val{x->kind, pass(x->dm, spec, cmps)};
   }
   // Otherwise each branch's value comes in under the tag: Max in Mode11 (op(b, b)) of a VRF tile or an
   // immediate, exact for any bits, so a NaN or infinity in the branch not taken cannot leak. Two tile branches

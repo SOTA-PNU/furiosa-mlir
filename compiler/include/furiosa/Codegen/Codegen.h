@@ -57,6 +57,13 @@ FailureOr<std::string> foptSignature(ModuleOp module);
 /// (lib/Codegen/Normalize.cpp).
 void normalizeKernels(ModuleOp module, function_ref<bool(linalg::GenericOp)> mapsAlone = {});
 
+/// maxnumf/minnumf (tl.maximum's default, relu, tl.max) take the other operand where one is NaN, as on the GPU,
+/// while the Vector Engine's max and min propagate NaN: x > -inf (x < +inf for min) is false exactly where x is NaN
+/// or the bound, where the bound loses to anything. So a value cleans to clean(x) = x > -inf ? x : -inf, and
+/// maxnumf(x, c) = maximumf(clean(x), c) for a number c (relu), a reduction's combiner maximumf(acc, clean(v)) (a
+/// row of NaN alone reduces to -inf). Runs on every kernel, before any is mapped whole (lib/Codegen/Normalize.cpp).
+void guardNaNs(ModuleOp module);
+
 /// Takes contractions apart into the 2-D form op classes map: computed factors become producers, a non-zero
 /// start is added after, batch dims split into slices, dims collapse (lib/Codegen/Contract.cpp).
 /// `mapsAlone` says whether a batched contraction maps as a step of its own, so it need not be unbatched.
