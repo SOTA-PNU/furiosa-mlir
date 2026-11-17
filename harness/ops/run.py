@@ -31,7 +31,12 @@ def run_case(key: str, stage: str, timeout: int) -> dict:
         return {"key": key, "status": "ERROR", "detail": f"timed out after {timeout}s"}
     line = next((l for l in reversed(proc.stdout.splitlines()) if l.startswith('{"key"')), None)
     if line:
-        return json.loads(line)
+        result = json.loads(line)
+        # The compiler's own diagnostic beats "PassManager::run failed".
+        cause = next((l.split("error: ", 1)[1] for l in proc.stderr.splitlines() if "error: furiosa" in l), None)
+        if result["status"] == "ERROR" and cause:
+            result["detail"] = f"{cause} | {result['detail']}"
+        return result
     tail = (proc.stderr.strip().splitlines() or ["no output"])[-1]
     return {"key": key, "status": "ERROR", "detail": f"exited {proc.returncode}: {tail[:300]}"}
 
@@ -47,7 +52,7 @@ def markdown(results: list[dict], stage: str) -> str:
         cell[1] += 1
         cell[0] += r["status"] == "PASS"
         if r["status"] != "PASS":
-            causes[(r["status"], r["detail"].split(": ")[0][:60] if r["status"] == "ERROR" else "accuracy")].append(r)
+            causes[(r["status"], r["detail"].split(" | ")[0][:80] if r["status"] == "ERROR" else "accuracy")].append(r)
     lines = [f"# Operator matrix ({stage})", "",
              f"PASS {counts['PASS']}, FAIL {counts['FAIL']}, ERROR {counts['ERROR']} of {len(results)} cases.", "",
              "Each cell: shapes passing / shapes tested (✓ when all pass).", "",

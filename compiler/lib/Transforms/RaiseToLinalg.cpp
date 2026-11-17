@@ -2071,16 +2071,17 @@ FailureOr<Value> Raiser::emitLoad(Gen &g, tt::LoadOp load, ArrayRef<Axis> env) {
   Value src = flatOf(versionAt(load, arg), arg);
   Value elem = tensor::ExtractOp::create(ob, loc, src, ValueRange{i});
   if (on) {
-    Attribute otherAttr;
-    if (Value other = load.getOther()) {
-      auto c = other.getDefiningOp<arith::ConstantOp>();
-      if (!c)
-        return load.emitError("furiosa: load `other` is not a constant"), failure();
-      otherAttr = c.getValue();
+    Value other;
+    if (Value o = load.getOther(); o && !o.getDefiningOp<arith::ConstantOp>()) {
+      auto v = emit(g, o, env); // any value of the load's shape
+      if (failed(v))
+        return failure();
+      other = *v;
+    } else {
+      OpBuilder::InsertionGuard guard(b);
+      b.setInsertionPoint(ob.getInsertionBlock(), ob.getInsertionPoint());
+      other = constantOf(elem.getType(), o ? o.getDefiningOp<arith::ConstantOp>().getValue() : Attribute());
     }
-    OpBuilder::InsertionGuard guard(b);
-    b.setInsertionPoint(ob.getInsertionBlock(), ob.getInsertionPoint());
-    Value other = constantOf(elem.getType(), otherAttr);
     elem = arith::SelectOp::create(ob, loc, on, elem, other);
   }
   return elem;

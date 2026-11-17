@@ -84,8 +84,9 @@ def binary_kernel(x_ptr, y_ptr, out_ptr, R: tl.constexpr, C: tl.constexpr, BR: t
 
 @triton.jit
 def reduce_kernel(x_ptr, out_ptr, R: tl.constexpr, C: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr,
-                  OP: tl.constexpr):
-    """Reduces each row (along C); masked lanes hold the reduction's identity."""
+                  OP: tl.constexpr, LO: tl.constexpr, HI: tl.constexpr):
+    """Reduces each row (along C); masked lanes hold the reduction's identity (LO/HI: the dtype's
+    lowest/highest value, -inf/inf for floats)."""
     r = tl.arange(0, BR)[:, None]
     c = tl.arange(0, BC)[None, :]
     m = (r < R) & (c < C)
@@ -93,16 +94,16 @@ def reduce_kernel(x_ptr, out_ptr, R: tl.constexpr, C: tl.constexpr, BR: tl.const
         x = tl.load(x_ptr + r * C + c, mask=m, other=0)
         y = tl.sum(x, axis=1)
     elif OP == 1:
-        x = tl.load(x_ptr + r * C + c, mask=m, other=-float("inf"))
+        x = tl.load(x_ptr + r * C + c, mask=m, other=LO)
         y = tl.max(x, axis=1)
     elif OP == 2:
-        x = tl.load(x_ptr + r * C + c, mask=m, other=float("inf"))
+        x = tl.load(x_ptr + r * C + c, mask=m, other=HI)
         y = tl.min(x, axis=1)
     elif OP == 3:
-        x = tl.load(x_ptr + r * C + c, mask=m, other=-float("inf"))
+        x = tl.load(x_ptr + r * C + c, mask=m, other=LO)
         y = tl.argmax(x, axis=1)
     elif OP == 4:
-        x = tl.load(x_ptr + r * C + c, mask=m, other=float("inf"))
+        x = tl.load(x_ptr + r * C + c, mask=m, other=HI)
         y = tl.argmin(x, axis=1)
     else:
         x = tl.load(x_ptr + r * C + c, mask=m, other=0)

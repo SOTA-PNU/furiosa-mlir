@@ -106,7 +106,11 @@ def build(case: Case):
             ref = {"sum": lambda: xs.sum(-1), "max": lambda: xs.amax(-1), "min": lambda: xs.amin(-1),
                    "argmax": lambda: xs.argmax(-1), "argmin": lambda: xs.argmin(-1)}[case.op]()
         out = torch.empty(rows, dtype=torch.int32 if case.op in ("argmax", "argmin") else x.dtype)
-        return (K.reduce_kernel, (1,), dict(x_ptr=x, out_ptr=out, OP=K.REDUCE.index(case.op), **blk),
+        if x.dtype.is_floating_point:
+            lo, hi = -float("inf"), float("inf")
+        else:
+            lo, hi = torch.iinfo(x.dtype).min, torch.iinfo(x.dtype).max
+        return (K.reduce_kernel, (1,), dict(x_ptr=x, out_ptr=out, OP=K.REDUCE.index(case.op), LO=lo, HI=hi, **blk),
                 {"out_ptr": (ref, xs.abs().sum(-1))}, "sum")
     if case.group == "scan":
         if case.op == "cumprod":
