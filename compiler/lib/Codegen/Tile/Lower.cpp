@@ -1532,7 +1532,10 @@ FailureOr<Val> Lowering::select(const Node &n, ArrayRef<int64_t> tileIndex) {
       return failure();
     return binary("mul", *y, constTile(1, -1));
   }
-  // Otherwise a * s + b * (1 - s) with s = select(c, 1, 0): exact for finite branches.
+  // Otherwise a * s + b * (1 - s) with s = select(c, 1, 0): exact for finite branches (an infinite one would
+  // give inf * 0 = NaN on the other side).
+  if ((ta.kind == Node::Const && !std::isfinite(ta.value)) || (fb.kind == Node::Const && !std::isfinite(fb.value)))
+    return fail("a select between a tile and an infinite constant");
   auto a = evaluate(n.args[1], tileIndex);
   auto bb = evaluate(n.args[2], tileIndex);
   if (failed(a) || failed(bb))
