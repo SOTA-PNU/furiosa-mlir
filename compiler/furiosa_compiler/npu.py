@@ -86,7 +86,9 @@ def build_run_graph(crate: Path, exe: Path, npu: bool = True) -> Path:
     """Builds the crate's run_graph for npu3 (cargo furiosa-opt) or the CPU emulation (cargo) in a target slot
     and copies it to `exe`: every crate's binary is uplifted to target/release/run_graph, and a crate with the name
     of another in the slot would share its deps/ binary, so the copy is resolved while the slot is held."""
-    env = dict(os.environ, FURIOSA_VISIBLE_CHIPS=NPU, PATH=f"{ROOT / '.tools' / 'bin'}:{os.environ['PATH']}")
+    # The pinned furiosa-opt tools: .tools/bin in a checkout, bin/ in a binary package.
+    env = dict(os.environ, FURIOSA_VISIBLE_CHIPS=NPU,
+               PATH=f"{ROOT / '.tools' / 'bin'}:{ROOT / 'bin'}:{os.environ['PATH']}")
     env.setdefault("LIBCLANG_PATH", "/usr/lib/llvm-18/lib")
     cmd = (["cargo", "furiosa-opt", "build"] if npu else ["cargo", "build"])
     cmd += ["--release", "--bin", "run_graph", "--message-format=json-render-diagnostics"]
