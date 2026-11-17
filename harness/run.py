@@ -111,7 +111,10 @@ def crate_dir(name: str, impl: str) -> Path:
 
 
 def compiler_env() -> dict:
-    return dict(os.environ, PYTHONPATH=str(ROOT / "compiler"))
+    # HARNESS_TRITON: a copy of the Triton package to run against, so a long run keeps one compiler while the
+    # shared libtriton is relinked (harness/README.md, Operator matrix).
+    paths = [os.environ["HARNESS_TRITON"]] if os.environ.get("HARNESS_TRITON") else []
+    return dict(os.environ, PYTHONPATH=os.pathsep.join(paths + [str(ROOT / "compiler")]))
 
 
 def compiler_cmd(*args, exe: Path = COMPILER_PY) -> list:

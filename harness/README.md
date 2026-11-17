@@ -162,7 +162,8 @@ compiler/.venv/bin/python -m harness.ops.case reduce.argmax.int8.2x7x33 --stage 
 The npu stage of all cases takes hours. To keep one compiler under it while others relink, run it against a copy of
 the Triton package: `cp -a third_party/triton/python/triton <snap>/triton` (replace `backends/furiosa`, a symlink,
 with a copy of `compiler/backend`), then `PYTHONPATH=<snap>:compiler compiler/.venv/bin/python -m harness.ops.run ...`
-(the backend finds `furiosa_compiler` next to its own file, which the copy moves).
+(the backend finds `furiosa_compiler` next to its own file, which the copy moves). `harness.run` takes the same
+copy through `HARNESS_TRITON=<snap>`.
 
 Each run writes `harness/out/ops/<stage>.{json,md}`: an operator x dtype table and the failures grouped
 by the compiler's diagnostic. At the raise stage (raised IR on the CPU JIT) 905 of the 907 cases pass (int32
