@@ -107,6 +107,7 @@ private:
   int64_t kTile = 0; // the K extent of one contraction pass (KF when K is not tiled)
   SmallVector<unsigned> rows;
   std::optional<unsigned> col;              // the column axis
+  std::optional<unsigned> unitCol;          // the column is synthetic (no even output axis)
   int64_t colLocalSize = 1, colPad = kLanes; // local columns, and padded to whole packets
   std::optional<Digit> colBlock, colLocalD;
   int64_t colExtent = 0; // the column axis padded to whole column tiles (0: no padding)
@@ -569,6 +570,13 @@ LogicalResult Lowering::planLayout() {
     for (auto [a, v] : votes)
       if (llvm::is_contained(p.out, a) && !(p.axes[a].size % 2) && (v > votes[best] || p.axes[best].size % 2))
         best = a;
+    if (p.axes[best].size % 2) {
+      // No even output axis (DMA rows are 8-byte units): a synthetic column of two equal lanes that every read
+      // broadcasts over; the store keeps the first.
+      unitCol = p.axes.size();
+      p.axes.push_back({2, false});
+      best = *unitCol;
+    }
     col = best;
     for (unsigned a : p.out)
       if (a != best)
@@ -1821,14 +1829,20 @@ LogicalResult Lowering::emit() {
     DmToHbmViewOp::create(b, loc(), convert(v->dm, p.outType),
                           tileDigits(view(outCanonical, true), outParts, tileAt(layout, index), true));
   }
-  // The relayout into the written buffer's own layout (a padded column read back as the column).
+  // The relayout into the written buffer's own layout (a padded column read back as the column; of a synthetic
+  // column, the first lane).
   Value out = allocHbm(pairOf(outDims), p.outType);
   if (colExtent) {
     SmallVector<MapAttr> asColumn = canonical(rows, true);
     asColumn.push_back(ax(*col).padTo(colExtent));
     outCanonical = reshapeHbm(outCanonical, pairOf(asColumn));
   }
-  copy(view(outCanonical, false), view(out, true));
+  SmallVector<MapAttr> lanes(outParts);
+  if (unitCol)
+    lanes.back() = kb.axis("U" + std::to_string(fresh++), colPad);
+  copy(unitCol ? tileDigits(view(reshapeHbm(outCanonical, pairOf(lanes)), false), lanes, {{lanes.back(), 0}}, false)
+               : view(outCanonical, false),
+       view(out, true));
   kb.finish({out});
   return success();
 }
