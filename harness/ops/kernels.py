@@ -16,7 +16,7 @@ ATOMIC = ["atomic_add", "atomic_max", "atomic_min", "atomic_and", "atomic_or", "
 # The rest of lowlevel-api-test's operator list (cpu_gpu.py), one kernel per group as above.
 EXTRA = ["reduce_or", "topk", "map_elementwise", "squeeze_ravel", "broadcast", "rand", "randn", "randint", "rand4x",
          "randn4x", "randint4x", "associative_scan", "reduce_keep_dims", "join", "split", "interleave", "cat",
-         "swizzle2d", "umulhi", "gather", "histogram", "maximum_nan", "atomic_xchg_old", "atomic_add_old", "atomic_cas_old",
+         "swizzle2d", "umulhi", "gather", "gather_data", "histogram", "maximum_nan", "atomic_xchg_old", "atomic_add_old", "atomic_cas_old",
          "device_print", "device_assert", "range_loop"]
 
 
@@ -325,22 +325,24 @@ def extra_kernel(x_ptr, y_ptr, out_ptr, R: tl.constexpr, C: tl.constexpr, OP: tl
     elif OP == 19:
         index = tl.broadcast_to(((tl.arange(0, C) + 1) % C)[None, :], (R, C))
         out = tl.gather(x, index, axis=1)
-    elif OP == 20:
+    elif OP == 20:  # indices that are data
+        out = tl.gather(x, tl.abs(x) % C, axis=1)
+    elif OP == 21:
         out = x * 0 + tl.histogram(tl.ravel(x), C)[None, :]
-    elif OP == 21:  # NaN propagates in the left half, is ignored in the right
+    elif OP == 22:  # NaN propagates in the left half, is ignored in the right
         all_ = tl.maximum(x, y, propagate_nan=tl.PropagateNan.ALL)
         none = tl.maximum(x, y, propagate_nan=tl.PropagateNan.NONE)
         out = tl.where(c < C // 2, all_, none)
-    elif OP == 22:  # the old values; x_ptr receives y
+    elif OP == 23:  # the old values; x_ptr receives y
         out = tl.atomic_xchg(x_ptr + offs, y)
-    elif OP == 23:
+    elif OP == 24:
         out = tl.atomic_add(x_ptr + offs, y)
-    elif OP == 24:  # y where x is 0 (every other element), x elsewhere; out the old values
+    elif OP == 25:  # y where x is 0 (every other element), x elsewhere; out the old values
         out = tl.atomic_cas(x_ptr + offs, x * 0 + (offs % 2 == 0).to(x.dtype) * x, y)
-    elif OP == 25:
+    elif OP == 26:
         tl.device_print("x", x)
         out = x
-    elif OP == 26:
+    elif OP == 27:
         tl.device_assert(x == x, "x is not NaN")
         out = x
     else:

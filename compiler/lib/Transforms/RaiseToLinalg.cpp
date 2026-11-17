@@ -2524,17 +2524,48 @@ FailureOr<Value> Raiser::emit(Gen &g, Value v, ArrayRef<Axis> env) {
     bool symbolic = false; // a program id or loop counter: not a function of the axes alone
     if (same)
       ix->expr.walk([&](AffineExpr e) { symbolic |= isa<AffineSymbolExpr>(e); });
-    if (!same || symbolic || ix->kind != Sym::Int || !ix->data.empty())
-      return def->emitError("furiosa: a gather whose indices are not the same function of its axes in every instance "
-                            "is not raised yet"),
-             failure();
-    SmallVector<Axis> senv(env.begin(), env.end());
     unsigned axis = ga.getAxisAttr().getInt();
-    senv[axis] = Axis{};
-    senv[axis].kind = Axis::Expr;
-    senv[axis].expr = ix->expr;
-    senv[axis].of.assign(env.begin(), env.end());
-    out = emit(g, ga.getSrc(), senv);
+    if (same && !symbolic && ix->kind == Sym::Int && ix->data.empty()) {
+      SmallVector<Axis> senv(env.begin(), env.end());
+      senv[axis] = Axis{};
+      senv[axis].kind = Axis::Expr;
+      senv[axis].expr = ix->expr;
+      senv[axis].of.assign(env.begin(), env.end());
+      out = emit(g, ga.getSrc(), senv);
+    } else {
+      // Indices that are data: the source built once over its own axes, read at the index.
+      SmallVector<int64_t> shape = shapeOf(ga.getSrc().getType());
+      Gen own;
+      own.coordPos.assign(g.coordPos.size(), -1);
+      own.lo.assign(shape.size(), 0);
+      own.extent.assign(shape.begin(), shape.end());
+      own.anchor = g.anchor;
+      auto src = parallelGeneric(own, getElementTypeOrSelf(ga.getSrc().getType()), [&](Gen &gg) {
+        SmallVector<Axis> ownEnv(shape.size());
+        for (auto [d, a] : llvm::enumerate(ownEnv)) {
+          a.kind = Axis::Iter;
+          a.dim = d;
+        }
+        return emit(gg, ga.getSrc(), ownEnv);
+      });
+      auto index = emit(g, ga.getIndices(), env);
+      if (failed(src) || failed(index))
+        return failure();
+      SmallVector<Value> at;
+      for (unsigned k = 0; k < env.size(); ++k) {
+        if (k != axis) {
+          auto i = axisValue(g, def, env, k);
+          if (failed(i))
+            return failure();
+          at.push_back(*i);
+          continue;
+        }
+        Value i = arith::IndexCastOp::create(*g.ob, loc, g.ob->getIndexType(), *index); // out of range: clamped
+        i = arith::MaxSIOp::create(*g.ob, loc, i, arith::ConstantIndexOp::create(*g.ob, loc, 0));
+        at.push_back(arith::MinSIOp::create(*g.ob, loc, i, arith::ConstantIndexOp::create(*g.ob, loc, shape[k] - 1)));
+      }
+      out = tensor::ExtractOp::create(*g.ob, loc, *src, at).getResult();
+    }
   } else if (auto me = dyn_cast<tt::MapElementwiseOp>(def)) {
     out = emitMapElementwise(g, me, env);
   } else if (auto branch = dyn_cast<scf::IfOp>(def)) {

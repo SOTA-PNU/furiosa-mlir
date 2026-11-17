@@ -21,7 +21,7 @@ DOTS = [(64, 64, 64), (16, 64, 32), (128, 256, 64)]
 EXTRA_DTYPES = {"reduce_or": ["int32"], "squeeze_ravel": ALL, "rand": ["float32"], "randn": ["float32"],
                 "randint": ["int32"], "rand4x": ["float32"], "randn4x": ["float32"], "randint4x": ["int32"],
                 "join": ALL, "split": ALL, "interleave": ALL, "cat": ALL, "swizzle2d": ["int32"],
-                "umulhi": ["int32"], "histogram": ["int32"], "maximum_nan": ["float32"], "atomic_cas_old": ["int32"],
+                "umulhi": ["int32"], "gather_data": ["int32"], "histogram": ["int32"], "maximum_nan": ["float32"], "atomic_cas_old": ["int32"],
                 "device_print": ["float32"], "device_assert": ["float32"], "range_loop": ["float32"]}
 
 
@@ -292,6 +292,8 @@ def _build_extra(case: Case, rows: int, c: int, dt: str, g):
         ref = torch.from_numpy(((a * b) >> np.uint64(32)).astype(np.uint32).view(np.int32).copy())
     elif op == "gather":
         ref = xs[:, (torch.arange(c) + 1) % c]
+    elif op == "gather_data":
+        ref = torch.gather(xs, 1, xs.abs() % c)
     elif op == "histogram":
         ref = torch.bincount(x.flatten().long(), minlength=c)[None, :].expand(rows, c)
     elif op == "maximum_nan":
