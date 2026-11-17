@@ -7,7 +7,9 @@
 // way. Elementwise ops never read the padding; a reduction reads it, so an input it reduces pads with its
 // identity (an i32 one, its bits: INT_MIN for a max). A read padded past its last column (tensor.pad: a masked
 // load's `other`) holds its own columns, the scratch filled with the pad first. One column (14 x 1) moves no whole
-// packet: its 14 elements regroup into one row. A row value stored as bf16 crosses one 8-byte unit (4 bf16).
+// packet: its 14 elements regroup into one row. A row value stored as bf16 crosses one 8-byte unit (4 bf16). A
+// reduction of a computed term pads the term's input when the term folds that padding to the identity: the NaN
+// guard clean(x) = x > -inf ? x : -inf keeps -inf, so a max pads its bf16 input with -inf.
 
 // CHECK-LABEL: func.func @add
 // CHECK-SAME: !fopt.hbm<i32, <"1">, <"R{14}, H{48} = 33">>
@@ -38,6 +40,9 @@
 // CHECK: fopt.tile {{.*}} index <"H{16}"> len 14 start 0
 // CHECK-LABEL: func.func @bf16_rows
 // CHECK: fopt.to_hbm {{.*}} -> !fopt.hbm<bf16, <"1">, <"R{14}, 1 # 4">>
+// CHECK-LABEL: func.func @guarded_max
+// CHECK: fopt.memset %{{.*}}, 0xFF800000 : !fopt.dm<bf16
+// CHECK: fopt.vector_intra_slice_reduce "Max"
 // CHECK-LABEL: func.func @scalar_cast
 // CHECK: fopt.vector_intra_slice_reduce "Max"
 // CHECK: fopt.to_hbm {{.*}} -> !fopt.hbm<bf16, <"1">, <"R{1}, 1 # 4">>
@@ -113,6 +118,20 @@ module {
       linalg.yield %s : bf16
     } -> tensor<14xbf16>
     return %r : tensor<14xbf16>
+  }
+  func.func @guarded_max(%x: tensor<14x33xbf16>, %o: tensor<14xf32>) -> tensor<14xf32> attributes {furiosa.written = [1]} {
+    %ninf = arith.constant 0xFF800000 : f32
+    %e = tensor.empty() : tensor<14xf32>
+    %f = linalg.fill ins(%ninf : f32) outs(%e : tensor<14xf32>) -> tensor<14xf32>
+    %r = linalg.generic {indexing_maps = [#id, #row], iterator_types = ["parallel", "reduction"]} ins(%x : tensor<14x33xbf16>) outs(%f : tensor<14xf32>) {
+    ^bb0(%a: bf16, %acc: f32):
+      %w = arith.extf %a : bf16 to f32
+      %c = arith.cmpf ogt, %w, %ninf : f32
+      %clean = arith.select %c, %w, %ninf : f32
+      %m = arith.maximumf %clean, %acc : f32
+      linalg.yield %m : f32
+    } -> tensor<14xf32>
+    return %r : tensor<14xf32>
   }
   func.func @scalar_cast(%x: tensor<1x1024xf32>, %o: tensor<1xbf16>) -> tensor<1xbf16> attributes {furiosa.written = [1]} {
     %ninf = arith.constant 0xFF800000 : f32

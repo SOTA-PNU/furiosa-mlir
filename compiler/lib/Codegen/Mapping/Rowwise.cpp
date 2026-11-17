@@ -61,7 +61,8 @@ Shape join(Shape a, Shape b) {
 struct Node {
   enum Kind { Input, Const, Op, Reduce } kind;
   Shape shape = Shape::Scalar;
-  int arg = -1;            // Input: pointer-argument index
+  int arg = -1;            // Input: pointer-argument index; Reduce of a computed term: the input whose padding
+                           // with the identity the term folds to the identity (-1: none)
   Type type;               // Input: the buffer's element type
   unsigned rows = 0;       // Input: the row dims it varies along (bit i: row dim i), broadcast along the others
   bool col = false;        // Input: whether it varies along the columns
@@ -104,6 +105,33 @@ struct Dag {
 };
 
 /// Folds the kernel's generics into one DAG; `why` explains a kernel outside the class.
+/// What body value `v` folds to when block argument `arg` holds `c` (the ops' own folders), or null.
+Attribute foldWith(Value v, BlockArgument arg, Attribute c) {
+  llvm::DenseMap<Value, Attribute> known{{arg, c}};
+  std::function<Attribute(Value)> eval = [&](Value x) -> Attribute {
+    if (auto it = known.find(x); it != known.end())
+      return it->second;
+    Attribute a;
+    if (matchPattern(x, m_Constant(&a)))
+      return known[x] = a;
+    Operation *op = x.getDefiningOp();
+    if (!op || op->getNumResults() != 1 || op->getBlock() != arg.getOwner())
+      return {};
+    SmallVector<Attribute> ins;
+    for (Value o : op->getOperands()) {
+      if (!(a = eval(o)))
+        return {};
+      ins.push_back(a);
+    }
+    SmallVector<OpFoldResult> out;
+    if (failed(op->fold(ins, out)) || out.size() != 1)
+      return {};
+    Attribute r = dyn_cast<Attribute>(out[0]);
+    return known[x] = r ? r : eval(cast<Value>(out[0]));
+  };
+  return eval(v);
+}
+
 FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &why) {
   Dag dag;
   auto ret = cast<func::ReturnOp>(func.getBody().front().getTerminator());
@@ -694,6 +722,37 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
       n.op = op;
       n.integer = StringRef(op).ends_with("I");
       n.args = {*t};
+      // A computed term of one input (clean(x) = x > -inf ? x : -inf) whose identity padding it folds to the
+      // identity: padded rows pad that input.
+      SmallVector<BlockArgument> leaves;
+      std::function<void(Value)> collect = [&](Value v) {
+        if (auto b = dyn_cast<BlockArgument>(v); b && b.getOwner() == &body) {
+          if (!llvm::is_contained(leaves, b))
+            leaves.push_back(b);
+        } else if (Operation *d = v.getDefiningOp(); d && d->getBlock() == &body) {
+          for (Value o : d->getOperands())
+            collect(o);
+        }
+      };
+      collect(term);
+      Attribute start;
+      if (fill)
+        matchPattern(fill.getInputs()[0], m_Constant(&start));
+      if (dag.nodes[*t].kind != Node::Input && leaves.size() == 1 && leaves[0] != acc && start &&
+          scalar.count(leaves[0]) && dag.nodes[scalar[leaves[0]]].kind == Node::Input) {
+        Type at = leaves[0].getType();
+        Attribute pad;
+        if (auto fa = dyn_cast<FloatAttr>(start); fa && isa<FloatType>(at)) {
+          llvm::APFloat v = fa.getValue();
+          bool lost;
+          v.convert(cast<FloatType>(at).getFloatSemantics(), llvm::APFloat::rmNearestTiesToEven, &lost);
+          pad = FloatAttr::get(at, v);
+        } else if (isa<IntegerAttr>(start) && at == cast<IntegerAttr>(start).getType()) {
+          pad = start;
+        }
+        if (pad && foldWith(term, leaves[0], pad) == start)
+          n.arg = scalar[leaves[0]];
+      }
       n.shape = Shape::Row;
       result = dag.add(n);
     } else {
@@ -1457,6 +1516,8 @@ LogicalResult Planner::declare(func::FuncOp func, ArrayRef<int64_t> written) {
     if (!pad || n.kind != Node::Reduce)
       continue;
     int in = n.args[0];
+    if (dag.nodes[in].kind != Node::Input && n.arg >= 0)
+      in = n.arg; // the input whose identity padding the reduced term folds to the identity
     auto bits = [](int32_t v) { return llvm::bit_cast<float>(v); };
     float id = n.op == "Add" ? 0.0f : n.op == "Max" ? -INFINITY : n.op == "Min" ? INFINITY : n.op == "AddI" ? 0.0f
                : n.op == "MaxI" ? bits(INT32_MIN) : bits(INT32_MAX);
