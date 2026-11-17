@@ -12,7 +12,7 @@ npu stage) against GPU goldens.
 - A widened i1 is a select; a reduction no class maps reads its input broadcast over the loops it lacks:
   `tl.histogram` on npu3 (ccb3f49).
 - A read whose address wraps (a mod or floordiv one loop decides) splits at the wrap into box copies: `tl.gather`
-  by a rotated index on npu3 (0af780b).
+  by a rotated index on npu3 (0af780b; 3c04413 fixes a dangling operand list in it).
 - In a generic no class maps, a select one loop decides splits even when its sides are computed: `tl.maximum`'s
   NaN-propagating mode exact on npu3 (ab5dce9).
 
