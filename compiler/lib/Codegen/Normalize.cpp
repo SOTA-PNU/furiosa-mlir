@@ -81,6 +81,8 @@ AffineExpr affineIndex(Value v, Block &body, MLIRContext *ctx) {
     return a - b;
   if (isa<arith::MulIOp>(op) && (isa<AffineConstantExpr>(a) || isa<AffineConstantExpr>(b)))
     return a * b;
+  if (auto c = dyn_cast<AffineConstantExpr>(b); isa<arith::FloorDivSIOp>(op) && c && c.getValue() > 0)
+    return a.floorDiv(c);
   return {};
 }
 
@@ -738,12 +740,22 @@ void treeReductions(ModuleOp module) {
     Value init = g.getDpsInits()[0];
     Value fresh = tensor::EmptyOp::create(b, loc, cast<RankedTensorType>(init.getType()).getShape(), et);
     AffineMap outId = AffineMap::getMultiDimIdentityMap(outRank, ctx);
+    // An init that fills the combiner's neutral element (x ^ 0) leaves the total as it is.
+    auto fill = init.getDefiningOp<linalg::FillOp>();
+    std::optional<TypedAttr> neutral = arith::getNeutralElement(comb);
+    Attribute filled;
+    bool keep = !fill || !neutral || !matchPattern(fill.getInputs()[0], m_Constant(&filled)) || filled != *neutral;
+    SmallVector<Value> ins{cur};
+    SmallVector<AffineMap> totalMaps{AffineMap::get(outRank, 0, read, ctx), outId};
+    if (keep) {
+      ins.push_back(init);
+      totalMaps.push_back(outId);
+    }
     auto total = linalg::GenericOp::create(
-        b, loc, TypeRange{init.getType()}, ValueRange{cur, init}, ValueRange{fresh},
-        ArrayRef<AffineMap>{AffineMap::get(outRank, 0, read, ctx), outId, outId},
+        b, loc, TypeRange{init.getType()}, ins, ValueRange{fresh}, totalMaps,
         SmallVector<utils::IteratorType>(outRank, utils::IteratorType::parallel),
         [&](OpBuilder &nb, Location l, ValueRange args) {
-          linalg::YieldOp::create(nb, l, combined(nb, l, args[0], args[1]));
+          linalg::YieldOp::create(nb, l, keep ? combined(nb, l, args[0], args[1]) : args[0]);
         });
     g.getResult(0).replaceAllUsesWith(total.getResult(0));
     g.erase();
@@ -858,7 +870,36 @@ void splitIndexSelects(ModuleOp module, function_ref<bool(linalg::GenericOp)> ma
       if (sel)
         break;
     }
-    if (!sel || (mapsAlone && mapsAlone(g)))
+    // Else (with the oracle) a read whose address wraps, a mod or floordiv by a constant of a linear term one loop
+    // decides (tl.gather by (j + 1) % C): the runs are where the quotient holds, over which the read is linear.
+    for (OpOperand *in : sel || !mapsAlone ? ArrayRef<OpOperand *>{} : g.getDpsInputOperands())
+      for (AffineExpr e : g.getMatchingIndexingMap(in).getResults())
+        e.walk([&](AffineExpr x) {
+          auto bin = dyn_cast<AffineBinaryOpExpr>(x);
+          auto c = bin ? dyn_cast<AffineConstantExpr>(bin.getRHS()) : AffineConstantExpr();
+          FailureOr<std::pair<int64_t, std::map<unsigned, int64_t>>> lin = failure();
+          if (c && c.getValue() > 0 && runs.empty() &&
+              (x.getKind() == AffineExprKind::Mod || x.getKind() == AffineExprKind::FloorDiv))
+            lin = linearForm(bin.getLHS());
+          for (auto [d, coef] : succeeded(lin) ? lin->second : std::map<unsigned, int64_t>{}) {
+            SmallVector<std::pair<int64_t, bool>> found;
+            bool uniform = coef != 0;
+            for (int64_t v = 0, last = 0; v < ranges[d] && uniform; ++v) {
+              auto at = *lin;
+              at.first += coef * v;
+              at.second.erase(d);
+              auto [lo, hi] = span(at, ranges);
+              int64_t q = llvm::divideFloorSigned(lo, c.getValue());
+              uniform = q == llvm::divideFloorSigned(hi, c.getValue());
+              if (uniform && (found.empty() || q != last))
+                found.push_back({v, false});
+              last = q;
+            }
+            if (uniform && found.size() > 1 && runs.empty())
+              k = d, runs = found;
+          }
+        });
+    if (runs.empty() || (mapsAlone && mapsAlone(g)))
       continue;
     OpBuilder b(g);
     Location loc = g.getLoc();
@@ -909,9 +950,11 @@ void splitIndexSelects(ModuleOp module, function_ref<bool(linalg::GenericOp)> ma
           Value shifted = arith::AddIOp::create(ib, loc, index, arith::ConstantIndexOp::create(ib, loc, start));
           index.getResult().replaceAllUsesExcept(shifted, shifted.getDefiningOp());
         }
-      auto pieceSel = cast<arith::SelectOp>(map.lookup(sel.getResult()).getDefiningOp());
-      pieceSel.getResult().replaceAllUsesWith(run.second ? pieceSel.getTrueValue() : pieceSel.getFalseValue());
-      pieceSel.erase();
+      if (sel) {
+        auto pieceSel = cast<arith::SelectOp>(map.lookup(sel.getResult()).getDefiningOp());
+        pieceSel.getResult().replaceAllUsesWith(run.second ? pieceSel.getTrueValue() : pieceSel.getFalseValue());
+        pieceSel.erase();
+      }
       SmallVector<Operation *> ops;
       for (Operation &op : pb.without_terminator())
         ops.push_back(&op);
@@ -1233,6 +1276,11 @@ void expandMath(ModuleOp module) {
 void mlir::furiosa::normalizeKernels(ModuleOp module, function_ref<bool(linalg::GenericOp)> mapsAlone) {
   expandMath(module);
   nestSelectKeys(module);
+  // Affine reads become inputs first: one that wraps splits like a select.
+  SmallVector<linalg::GenericOp> reading;
+  module.walk([&](linalg::GenericOp g) { reading.push_back(g); });
+  for (linalg::GenericOp g : reading)
+    promoteExtracts(g);
   splitIndexSelects(module, mapsAlone);
   selectionReductions(module);
   treeReductions(module);
