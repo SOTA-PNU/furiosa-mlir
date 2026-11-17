@@ -751,16 +751,27 @@ FailureOr<Program> mlir::furiosa::tile::analyze(func::FuncOp func, ArrayRef<int6
     why = "the stored value is not a generic's result";
     return failure();
   }
-  if (llvm::any_of(last.getIteratorTypesArray(), [](auto t) { return t != utils::IteratorType::parallel; })) {
-    why = "the last generic reduces";
-    return failure();
-  }
-  for (int64_t e : last.getStaticLoopRanges())
-    folder.dim(e, false);
-  unsigned numOut = folder.extents.size();
-  SmallVector<AffineExpr> outIdx;
+  // The output dims: the last generic's dims, or, when it reduces (a contraction stored as it is), the dims its
+  // output map projects to (generic() makes the reduction dims fresh reduction axes).
   AffineMap lastOut = last.getMatchingIndexingMap(last.getDpsInitOperand(cast<OpResult>(v).getResultNumber()));
-  outIdx = SmallVector<AffineExpr>(lastOut.getResults());
+  SmallVector<AffineExpr> rootIdx;
+  SmallVector<int64_t> ranges = last.getStaticLoopRanges();
+  if (llvm::all_of(last.getIteratorTypesArray(), [](auto t) { return t == utils::IteratorType::parallel; })) {
+    for (int64_t e : ranges)
+      folder.dim(e, false);
+    rootIdx = SmallVector<AffineExpr>(lastOut.getResults());
+  } else {
+    for (AffineExpr e : lastOut.getResults()) {
+      auto d = dyn_cast<AffineDimExpr>(e);
+      if (!d) {
+        why = "a reducing last generic whose output map is not a projection";
+        return failure();
+      }
+      rootIdx.push_back(getAffineDimExpr(folder.dim(ranges[d.getPosition()], false), ctx));
+    }
+  }
+  unsigned numOut = folder.extents.size();
+  SmallVector<AffineExpr> outIdx(rootIdx);
   // Through the reshapes, outermost last: the written buffer's indices over the output dims.
   for (Operation *op : llvm::reverse(reshapes)) {
     SmallVector<AffineExpr> next;
@@ -797,8 +808,7 @@ FailureOr<Program> mlir::furiosa::tile::analyze(func::FuncOp func, ArrayRef<int6
   SmallVector<AffineExpr> dims;
   for (unsigned d = 0; d < numOut; ++d)
     dims.push_back(getAffineDimExpr(d, ctx));
-  auto root = folder.generic(last, cast<OpResult>(v).getResultNumber(), SmallVector<AffineExpr>(lastOut.getResults()),
-                             std::nullopt);
+  auto root = folder.generic(last, cast<OpResult>(v).getResultNumber(), rootIdx, std::nullopt);
   if (failed(root))
     return failure();
   // generic() bound the last generic's dims to its own output map's results; re-express the root at the dims.
