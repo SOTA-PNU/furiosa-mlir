@@ -411,6 +411,12 @@ public:
   std::map<std::string, unsigned> memo;
   /// Index values with a known expression over the dims (tile loops' induction variables).
   llvm::DenseMap<Value, AffineExpr> bound;
+  /// The generic loop each reduction dim iterates (for the tiling pass).
+  std::map<unsigned, std::pair<Operation *, unsigned>> reductionLoop;
+  /// K loops (furiosa-tile) being folded: the loop of each iteration argument; the dims tiles split, as (tile
+  /// dim, dim in the tile, tile size), merged once the Program is built.
+  llvm::DenseMap<Value, scf::ForOp> kLoopOf;
+  SmallVector<std::tuple<unsigned, unsigned, int64_t>> tiled;
 
   /// An index operand (a constant, a bound value, or an affine.apply of those) as an expression over the dims.
   FailureOr<AffineExpr> indexExpr(OpFoldResult ofr) {
@@ -488,10 +494,26 @@ public:
       n.read = reads.size() - 1;
       return add(n);
     }
+    if (auto it = kLoopOf.find(tensor); it != kLoopOf.end())
+      return valueAt(it->second.getInitArgs()[0], idx, fill);
     Operation *op = tensor.getDefiningOp();
     if (!op) {
       why = "a tensor that is neither an argument nor an op result";
       return failure();
+    }
+    if (auto loop = dyn_cast<scf::ForOp>(op)) {
+      // A K loop (furiosa-tile): one tile of a generic's reduction dim per iteration, accumulated in its
+      // iteration argument. generic() gives that dim a tile dim alongside it.
+      std::optional<int64_t> lb = getConstantIntValue(loop.getLowerBound()),
+                             ub = getConstantIntValue(loop.getUpperBound()),
+                             step = getConstantIntValue(loop.getStep());
+      if (!lb || !ub || !step || *lb != 0 || *ub % *step || loop.getNumRegionIterArgs() != 1 ||
+          !loop->hasAttr("furiosa.tile_dim")) {
+        why = "an scf.for that is not a K tile loop";
+        return failure();
+      }
+      kLoopOf[loop.getRegionIterArgs()[0]] = loop;
+      return valueAt(loop.getBody()->getTerminator()->getOperand(0), idx, fill);
     }
     if (auto pad = dyn_cast<tensor::PadOp>(op)) {
       llvm::APFloat value(0.0f);
@@ -618,8 +640,22 @@ public:
         dims[d] = getAffineConstantExpr(0, ctx);
         continue;
       }
+      // A dim a K loop around this generic tiles: the loop's tile dim (the iteration) comes first.
+      Value init = g.getDpsInits()[r];
+      for (auto it = kLoopOf.find(init); it != kLoopOf.end(); it = kLoopOf.find(it->second.getInitArgs()[0])) {
+        scf::ForOp loop = it->second;
+        if (loop->getAttrOfType<IntegerAttr>("furiosa.tile_dim").getInt() != int64_t(d))
+          continue;
+        int64_t step = *getConstantIntValue(loop.getStep()), ub = *getConstantIntValue(loop.getUpperBound());
+        unsigned kt = dim(ub / step, true);
+        fresh.push_back(kt);
+        reductionLoop[kt] = {g.getOperation(), d};
+        bound[loop.getInductionVar()] = getAffineDimExpr(kt, ctx) * step;
+        tiled.push_back({kt, unsigned(extents.size()), step});
+      }
       unsigned fd = dim(ranges[d], true);
       fresh.push_back(fd);
+      reductionLoop[fd] = {g.getOperation(), d};
       dims[d] = getAffineDimExpr(fd, ctx);
     }
     Block &body = g.getRegion().front();
@@ -780,8 +816,7 @@ FailureOr<Program> mlir::furiosa::tile::analyze(func::FuncOp func, ArrayRef<int6
   // at the loops' offsets. Each tiled dim gets two dims, the tile index (with the output dims) and the index in
   // the tile (after them); the axes merge back into one once the Program is built (mergeTiles).
   SmallVector<AffineExpr> rootIdx, outIdx;
-  SmallVector<std::tuple<unsigned, unsigned, int64_t>> tiled; // (tile dim, inner dim, tile size)
-  if (auto loop = v.getDefiningOp<scf::ForOp>()) {
+  if (auto loop = v.getDefiningOp<scf::ForOp>(); loop && !loop->hasAttr("furiosa.tile_dim")) {
     SmallVector<scf::ForOp> loops;
     tensor::InsertSliceOp insert;
     while (loop) {
@@ -844,9 +879,16 @@ FailureOr<Program> mlir::furiosa::tile::analyze(func::FuncOp func, ArrayRef<int6
       folder.bound[loops[*loopOf[j]].getInductionVar()] = d * t;
       rootIdx.push_back(getAffineDimExpr(in, ctx));
       outIdx.push_back(d * t + getAffineDimExpr(in, ctx));
-      tiled.push_back({outer[j], in, t});
+      folder.tiled.push_back({outer[j], in, t});
     }
     v = insert.getSource();
+  }
+  // K loops (furiosa-tile) around the stored generic: it reduces across their iterations (generic() below).
+  while (auto k = v.getDefiningOp<scf::ForOp>()) {
+    if (!k->hasAttr("furiosa.tile_dim") || k.getNumRegionIterArgs() != 1)
+      break;
+    folder.kLoopOf[k.getRegionIterArgs()[0]] = k;
+    v = k.getBody()->getTerminator()->getOperand(0);
   }
   auto last = v.getDefiningOp<linalg::GenericOp>();
   if (!last) {
@@ -1043,7 +1085,8 @@ FailureOr<Program> mlir::furiosa::tile::analyze(func::FuncOp func, ArrayRef<int6
       }
     return a;
   };
-  for (auto [dt, di, t] : tiled) {
+  p.reductionLoop = folder.reductionLoop;
+  for (auto [dt, di, t] : folder.tiled) {
     std::optional<unsigned> at = axisOfDim(dt), ai = axisOfDim(di);
     if (!at)
       continue; // one tile
@@ -1082,9 +1125,11 @@ FailureOr<Program> mlir::furiosa::tile::analyze(func::FuncOp func, ArrayRef<int6
     llvm::erase(p.out, *ai);
     for (unsigned &a : p.out)
       a = shift(a);
-    for (Node &n : p.nodes)
+    for (Node &n : p.nodes) {
+      llvm::erase(n.axes, *ai);
       for (unsigned &a : n.axes)
         a = shift(a);
+    }
     for (auto &[a, k] : p.loopTiles)
       a = shift(a);
     p.axes.erase(p.axes.begin() + *ai);

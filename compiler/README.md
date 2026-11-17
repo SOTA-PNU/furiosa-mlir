@@ -107,7 +107,9 @@ the tables.
 progressive lowering: each kernel the tiled class maps is tiled by that class's plan (Tile/Plan.h, the cost
 model holding the NPU's capacities: TRF lanes, the DM budget, intra-slice accumulators, slices, lanes) into
 `scf.for` loops over its output rows (upstream TilingInterface tile and fuse; pads and buffers stay whole and
-are sliced), and mapping to fopt folds the loops back into the plan's tile digits. Codegen maps this stage. L1
+are sliced) and K loops over its contraction's reduction dims (`furiosa.tile_dim` names the dim; a K tile is
+whole taps or part of the inner axis), and mapping to fopt folds the loops back into the plan's tile digits and
+K tiles. Codegen maps this stage. L1
 runs `linalg.mlir`, `structured.mlir`, `steps.mlir` and `tiled.mlir`.
 fp16 buffers live as f32 on the device (furiosa-opt has no f16): mapping a kernel to fopt widens its `f16` to
 `f32` and drops the conversions between them, and the crate converts F16 at the graph boundary (exactly in,

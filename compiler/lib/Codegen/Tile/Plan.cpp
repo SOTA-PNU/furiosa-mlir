@@ -510,12 +510,57 @@ LogicalResult Plan::plan() {
     if (expect != 1)
       return fail("a store that does not cover its buffer");
   }
-  // Tile loops the kernel already has (furiosa-tile tiled it by this plan) must be the plan's tiles.
-  for (auto [a, t] : p.loopTiles)
+  // Tile loops the kernel already has (furiosa-tile tiled it by this plan) must be the plan's tiles: row tiles
+  // its tile digits, K loops its K tiles.
+  SmallVector<std::pair<unsigned, int64_t>> kLoops;
+  for (auto [a, t] : p.loopTiles) {
+    if (p.axes[a].reduction) {
+      kLoops.push_back({a, t});
+      continue;
+    }
     if (!llvm::any_of(tileD, [&, a = a, t = t](const Digit &d) {
           return d.axis == a && d.place == t && d.place * d.size == extentOf(a);
         }))
       return fail("a tile loop that is not one of the plan's tiles");
+  }
+  if (!kLoops.empty()) {
+    auto k = kAxisTiles();
+    llvm::sort(kLoops);
+    if (k)
+      llvm::sort(*k);
+    if (!k || *k != kLoops)
+      return fail("K tile loops that are not the plan's K tiles");
+  }
   return success();
 }
 
+
+std::optional<SmallVector<std::pair<unsigned, int64_t>>> Plan::kAxisTiles() {
+  if (!gemm || kTiles() == 1)
+    return std::nullopt;
+  int64_t numTaps = 1;
+  for (unsigned a : kl.taps)
+    numTaps *= p.axes[a].size;
+  int64_t ip = kl.innerPad, inner = kl.inner ? p.axes[*kl.inner].size : 1;
+  SmallVector<std::pair<unsigned, int64_t>> tiles;
+  if (kTile % ip == 0) {
+    // m whole taps per tile: the innermost taps whose sizes multiply to m, the outer ones one at a time.
+    if (kl.tapPad != numTaps)
+      return std::nullopt;
+    int64_t m = kTile / ip, prod = 1;
+    int i = kl.taps.size();
+    while (i > 0 && prod < m)
+      prod *= p.axes[kl.taps[--i]].size;
+    if (prod != m)
+      return std::nullopt;
+    for (int j = 0; j < i; ++j)
+      tiles.push_back({kl.taps[j], 1});
+  } else {
+    if (!kl.inner || ip != inner || ip % kTile)
+      return std::nullopt;
+    for (unsigned a : kl.taps)
+      tiles.push_back({a, 1});
+    tiles.push_back({*kl.inner, kTile});
+  }
+  return tiles;
+}

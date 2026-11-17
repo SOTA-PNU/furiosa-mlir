@@ -63,6 +63,10 @@ public:
   LogicalResult plan();
   /// The planned tile digits (rows, and the column's when its tiles pad), most significant first.
   ArrayRef<Digit> tiles() const { return tileD; }
+  /// The planned K tiles as tile sizes of the contraction's reduction axes, {axis, size} per tiled axis: whole
+  /// taps (the outer taps one at a time) or a part of the inner axis (every tap one at a time). Nothing when K is
+  /// not tiled, or not by whole axes (padded taps or inner).
+  std::optional<SmallVector<std::pair<unsigned, int64_t>>> kAxisTiles();
 
 protected:
   func::FuncOp func;

@@ -12,6 +12,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -77,6 +78,8 @@ struct Program {
   SmallVector<int64_t> dimExtent;
   SmallVector<unsigned> outLoop;
   Operation *rootOp = nullptr;
+  /// The generic loop each reduction dim iterates.
+  std::map<unsigned, std::pair<Operation *, unsigned>> reductionLoop;
   /// Tile loops the kernel already has (furiosa-tile): axis `first` tiled by `second`, its loop's step.
   SmallVector<std::pair<unsigned, int64_t>> loopTiles;
 
