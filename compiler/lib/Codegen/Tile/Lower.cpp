@@ -7,7 +7,8 @@
 //  - Reads are made dense in HBM first, in that canonical digit layout. HBM-to-HBM DMAs are byte-granular, so
 //    any stride, window, padding, permutation or broadcast costs one DMA per tap: a windowed read (a contraction
 //    axis added to an output axis, as in convolutions) copies one tap per DMA out of a filled, padded copy of
-//    its buffer. Each tile then moves to DM with one aligned DMA.
+//    its buffer, into a tap-major [taps, rows, inner] buffer (one contiguous block per tap). Each tile then
+//    moves to DM with one aligned DMA.
 //  - A contraction runs on the Contraction Engine: the stream operand's rows over slices and time, the TRF
 //    operand's columns over lanes (and slices, by block), K in the packet and time. f32 operands are cast to
 //    bf16 as they are fetched and accumulate in f32 (the dtype policy).
@@ -198,6 +199,53 @@ private:
   }
   /// The K of one contraction pass.
   MapAttr kLocal() { return kTiles() == 1 ? kf : kf.modulo(kTile); }
+  /// Whether a contraction operand's taps each sit alone in a buffer dim (a weight's kernel position, no window).
+  bool windowFree(const Read &r) {
+    return !kl.taps.empty() && llvm::all_of(kl.taps, [&](unsigned a) {
+      int dims = 0;
+      for (const Lin &l : r.index)
+        if (l.uses(a)) {
+          if (l.terms.size() != 1)
+            return false;
+          ++dims;
+        }
+      return dims == 1;
+    });
+  }
+  /// A windowed operand is tap-major in HBM, [taps, rows, inner], so each tap's DMA writes one contiguous block
+  /// (the NPU compiler's cost grows superlinearly in the contiguous runs an HBM destination has), when its inner
+  /// run is a whole 8-byte DMA unit (each tile's move to DM puts K innermost).
+  bool tapMajorRead(const Read &r) {
+    return !kl.taps.empty() && !windowFree(r) && kl.innerPad * r.type.getIntOrFloatBitWidth() >= 64;
+  }
+  /// A tap-major operand's K digits before and after the rows, and the digits K tile `kIndex` selects; a K tile
+  /// is whole taps or part of the inner axis.
+  struct KSplit {
+    SmallVector<MapAttr> hi, lo;
+    SmallVector<std::pair<MapAttr, int64_t>> at;
+  };
+  KSplit kSplit(int64_t kIndex) {
+    int64_t ip = kl.innerPad, kt = kTiles() > 1 ? kTile : kl.size();
+    KSplit s;
+    if (kt % ip == 0) {
+      if (kTiles() > 1) {
+        s.hi.push_back(kf.stride(kTile));
+        s.at.push_back({kf.stride(kTile), kIndex});
+      }
+      MapAttr inTile = kTiles() > 1 ? kf.modulo(kTile) : kf;
+      if (kt > ip)
+        s.hi.push_back(ip == 1 ? inTile : inTile.stride(ip));
+      if (ip > 1)
+        s.lo.push_back(kf.modulo(ip));
+    } else {
+      int64_t per = ip / kTile;
+      s.hi = {kf.stride(ip)};
+      s.lo = {kf.modulo(ip).stride(kTile), kf.modulo(kTile)};
+      s.at = {{s.hi[0], kIndex / per}, {s.lo[0], kIndex % per}};
+    }
+    return s;
+  }
+  std::set<void *> tapMajor; // tap-major operands (HBM tensors, by value)
   MapAttr colLocal() {
     if (!col)
       return kb.one().padTo(colPad);
@@ -269,7 +317,12 @@ private:
              int64_t kIndex = 0) {
     auto parts = canonical(axes, false);
     auto at = tileAt(axes, tileIndex);
-    if (withK) {
+    if (withK && tapMajor.count(hbm.getAsOpaquePointer())) {
+      KSplit s = kSplit(kIndex);
+      parts.insert(parts.begin(), s.hi.begin(), s.hi.end());
+      llvm::append_range(parts, s.lo);
+      llvm::append_range(at, s.at);
+    } else if (withK) {
       llvm::append_range(parts, kParts());
       if (kTiles() > 1)
         at.push_back({kf.stride(kTile), kIndex});
@@ -547,10 +600,18 @@ LogicalResult Lowering::planLayout() {
     // Among the K tiles (multiples of 32 dividing K) and lane-group widths that fit a TRF lane on at most 256
     // column blocks, the one with the fewest passes: row tiles x (K tiles + their adds + the epilogue).
     int64_t kf = kl.size();
+    // Tap-major operands (windowed reads) take K tiles of whole taps or of part of the inner axis.
+    SmallVector<unsigned> operands = {gemm->stream, gemm->trf};
+    llvm::append_range(operands, gemm->streamExtras);
+    llvm::append_range(operands, gemm->trfExtras);
+    bool tapMajorK = llvm::any_of(operands, [&](unsigned r) { return tapMajorRead(p.reads[r]); });
+    auto kTileFits = [&](int64_t t) {
+      return kf % t == 0 && (!tapMajorK || t % kl.innerPad == 0 || kl.innerPad % t == 0);
+    };
     colLocalSize = 0;
     int64_t bestCost = INT64_MAX;
     for (int64_t t = kf; t >= 32; t -= 32) {
-      if (kf % t)
+      if (!kTileFits(t))
         continue;
       int64_t maxGroups = kTrfLaneBytes / (2 * t);
       if (maxGroups < 1)
@@ -580,7 +641,7 @@ LogicalResult Lowering::planLayout() {
       // More columns than 256 blocks of whole lane groups: tiles of 256 blocks, the last one padded. The K tile
       // and lane groups fill a TRF lane.
       for (int64_t t = kf; t >= 32; t -= 32)
-        if (kf % t == 0 && kTrfLaneBytes / (2 * t) >= 1) {
+        if (kTileFits(t) && kTrfLaneBytes / (2 * t) >= 1) {
           kTile = t;
           colLocalSize = std::min<int64_t>(kTrfLaneBytes / (2 * t), 128 / kLanes) * kLanes;
           break;
@@ -835,18 +896,19 @@ FailureOr<Value> Lowering::materialize(const Read &r, ArrayRef<unsigned> rowAxes
   // Taps that are each alone in a buffer dim (no window: a weight's kernel position) move in one DMA as axes of
   // their own, then into the padded K layout in a second one, instead of one DMA per tap.
   SmallVector<unsigned> peeled;
-  bool windowFree = !taps.empty() && llvm::all_of(taps, [&](unsigned a) {
-    int dims = 0;
-    for (const Lin &l : r.index)
-      if (l.uses(a)) {
-        if (l.terms.size() != 1)
-          return false;
-        ++dims;
-      }
-    return dims == 1;
-  });
+  bool windowFree = k && this->windowFree(r);
   if (windowFree)
     std::swap(peeled, taps);
+  bool major = k && tapMajorRead(r);
+  // A tap-major operand's padded inner digit is read from a copy of the buffer padded with zeros in that dim
+  // (one more DMA, at most as many runs), so each tap's destination stays one block with no holes.
+  std::optional<unsigned> innerDim;
+  if (major && innerAxis && innerSize < k->innerPad && r.fill.value_or(0.0) == 0.0)
+    for (unsigned j = 0; j < nd; ++j)
+      if (r.index[j].offset == 0 && r.index[j].terms.size() == 1 && r.index[j].terms[0].first == *innerAxis &&
+          r.index[j].terms[0].second == 1)
+        innerDim = j;
+  int64_t innerLen = innerDim ? k->innerPad : innerSize;
 
   // Per dim: the low padding, the extent (every tap's window inside, divisible by its coefficients) and the
   // terms that are not taps, by decreasing coefficient.
@@ -865,6 +927,8 @@ FailureOr<Value> Lowering::materialize(const Read &r, ArrayRef<unsigned> rowAxes
     llvm::sort(rem[j], [](auto x, auto y) { return x.second > y.second; });
     low[j] = lo < 0 ? -lo : 0;
     extent[j] = std::max(hi + 1, r.shape[j]) + low[j];
+    if (innerDim == j)
+      extent[j] = k->innerPad;
     if (!rem[j].empty())
       extent[j] = roundUp(extent[j], rem[j].front().second);
   }
@@ -973,7 +1037,7 @@ FailureOr<Value> Lowering::materialize(const Read &r, ArrayRef<unsigned> rowAxes
   } else if (k) {
     if (k->tapPad > 1) {
       tq = kb.axis(tag + "TQ", k->tapPad);
-      dstParts.push_back(tq);
+      dstParts.insert(major ? dstParts.begin() : dstParts.end(), tq);
     }
     if (cq)
       dstParts.push_back(cq);
@@ -982,7 +1046,7 @@ FailureOr<Value> Lowering::materialize(const Read &r, ArrayRef<unsigned> rowAxes
   int64_t numTaps = 1;
   for (unsigned a : taps)
     numTaps *= p.axes[a].size;
-  if (k && !windowFree && (k->tapPad > numTaps || k->innerPad > innerSize))
+  if (k && !windowFree && (k->tapPad > numTaps || k->innerPad > innerLen))
     fill(dst, 0.0);
 
   // Every tap's view starts (one per source digit) and its index into the taps axis.
@@ -999,7 +1063,7 @@ FailureOr<Value> Lowering::materialize(const Read &r, ArrayRef<unsigned> rowAxes
         int64_t start = off / g.coeff;
         if (i > 0)
           start %= g.radix;
-        int64_t len = !g.axis ? 1 : (innerAxis && *g.axis == *innerAxis) ? innerSize : p.axes[*g.axis].size;
+        int64_t len = !g.axis ? 1 : (innerAxis && *g.axis == *innerAxis) ? innerLen : p.axes[*g.axis].size;
         if (start + len > g.radix)
           return fail("a window that carries across digits");
         st.push_back(start);
@@ -1013,7 +1077,7 @@ FailureOr<Value> Lowering::materialize(const Read &r, ArrayRef<unsigned> rowAxes
   SmallVector<int64_t> lens, radix;
   for (auto &ds : dig)
     for (auto &g : ds) {
-      lens.push_back(!g.axis ? 1 : (innerAxis && *g.axis == *innerAxis) ? innerSize : p.axes[*g.axis].size);
+      lens.push_back(!g.axis ? 1 : (innerAxis && *g.axis == *innerAxis) ? innerLen : p.axes[*g.axis].size);
       radix.push_back(g.radix);
     }
   // The taps split into classes (a residue of each tap axis modulo its period) in which every start is affine in
@@ -1132,7 +1196,7 @@ FailureOr<Value> Lowering::materialize(const Read &r, ArrayRef<unsigned> rowAxes
         *llvm::find(dc, tq) = kb.one().padTo(k->tapPad, PadKind::Bottom);
         d = tileAt(d, tq, 1, baseIndex, indexSlopes, pairOf(dc));
       }
-      if (cq && innerSize < k->innerPad) {
+      if (cq && innerLen < k->innerPad) {
         *llvm::find(dc, cq) = cq.resize(innerSize).padTo(k->innerPad, PadKind::Bottom);
         d = tileView(d, cq, innerSize, 0, pairOf(dc));
       }
@@ -1170,9 +1234,17 @@ FailureOr<Value> Lowering::materialize(const Read &r, ArrayRef<unsigned> rowAxes
   }
 
   SmallVector<MapAttr> canon = canonical(rowAxes, false);
-  if (k)
+  if (major) {
+    KSplit s = kSplit(0);
+    canon.insert(canon.begin(), s.hi.begin(), s.hi.end());
+    llvm::append_range(canon, s.lo);
+  } else if (k) {
     llvm::append_range(canon, kParts());
-  return reshapeHbm(dst, pairOf(canon));
+  }
+  Value out = reshapeHbm(dst, pairOf(canon));
+  if (major)
+    tapMajor.insert(out.getAsOpaquePointer());
+  return out;
 }
 
 //===----------------------------------------------------------------------===//
