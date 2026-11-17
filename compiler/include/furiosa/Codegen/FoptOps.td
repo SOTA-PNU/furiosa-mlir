@@ -386,6 +386,12 @@ def Fopt_GatherOp : Fopt_Op<"gather", [Pure]> {
   let hasVerifier = 1;
 }
 
+def Fopt_VectorReinterpretOp : Fopt_StageOp<"vector_reinterpret"> {
+  let summary = ".vector_reinterpret::<D>() (the stream's bits reread as the result's 32-bit element type)";
+  let arguments = (ins Fopt_Stream:$input);
+  let assemblyFormat = "$input attr-dict `:` qualified(type($input)) `->` qualified(type($result))";
+}
+
 def Fopt_VectorFxpOp : Fopt_StageOp<"vector_fxp"> {
   let summary = ".vector_fxp(FxpBinaryOp::<op>, imm) (an i32 ALU op with an immediate)";
   let arguments = (ins Fopt_Stream:$input, StrAttr:$op, I32Attr:$imm);

@@ -532,6 +532,14 @@ LogicalResult VectorFpDivOp::verify() {
 
 LogicalResult VectorStashOp::verify() { return verifyVectorStage(*this, getInput().getType(), getResult().getType()); }
 
+LogicalResult VectorReinterpretOp::verify() {
+  if (failed(verifyVectorInput(*this, getInput().getType())) || failed(verifyVectorInput(*this, getResult().getType())))
+    return failure();
+  if (failed(verifySamePlacement(*this, getInput().getType(), getResult().getType())))
+    return failure();
+  return verifyStreamUse(*this);
+}
+
 LogicalResult VectorIntraSliceReduceOp::verify() {
   if (failed(verifyOpName(*this, getOp(), {"Add", "Max", "Min"})))
     return failure();

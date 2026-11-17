@@ -54,6 +54,16 @@ std::optional<Contraction> asContraction(linalg::GenericOp g) {
   };
   c.a = strip(mul.getLhs());
   c.b = strip(mul.getRhs());
+  // A square (x * x, say a sum of squares) is a reduction of one operand, not a contraction of two.
+  auto read = [&](Value v) -> std::pair<Value, AffineMap> {
+    auto arg = dyn_cast<BlockArgument>(v);
+    if (!arg || arg.getOwner() != &body || arg.getArgNumber() >= g.getNumDpsInputs())
+      return {v, AffineMap()};
+    OpOperand *in = g.getDpsInputOperand(arg.getArgNumber());
+    return {in->get(), g.getMatchingIndexingMap(in)};
+  };
+  if (read(c.a) == read(c.b))
+    return std::nullopt;
   return c;
 }
 
@@ -448,7 +458,7 @@ void collapse(linalg::GenericOp g) {
 
 } // namespace
 
-void mlir::furiosa::normalizeContractions(ModuleOp module) {
+void mlir::furiosa::normalizeContractions(ModuleOp module, function_ref<bool(linalg::GenericOp)> mapsAlone) {
   SmallVector<linalg::GenericOp> generics;
   module.walk([&](linalg::GenericOp g) {
     if (asContraction(g))
@@ -461,7 +471,9 @@ void mlir::furiosa::normalizeContractions(ModuleOp module) {
     if (c)
       g = materializeFactor(g, c->b);
     g = splitInit(g);
-    unbatch(g);
+    // A batched contraction some op class maps as a step of its own keeps its batch dims.
+    if (!mapsAlone || !mapsAlone(g))
+      unbatch(g);
   }
   // The inputs a materialized factor no longer reads go (upstream patterns), leaving x and w.
   RewritePatternSet patterns(module.getContext());

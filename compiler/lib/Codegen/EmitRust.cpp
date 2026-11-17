@@ -11,11 +11,29 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/JSON.h"
 
 using namespace mlir;
 using namespace mlir::furiosa;
 using namespace mlir::furiosa::fopt;
+
+/// A Rust f32 literal of `value`, exact: shortest round-trip decimal, subnormals included (the bits of an i32
+/// carried in an f32 stream); the MIR lowering takes literals and named constants, not calls.
+std::string mlir::furiosa::rustF32(float value) {
+  if (std::isnan(value))
+    return llvm::bit_cast<uint32_t>(value) == 0x7fc00000u
+               ? "f32::NAN"
+               : llvm::formatv("f32::from_bits({0:x})", llvm::bit_cast<uint32_t>(value)).str();
+  if (std::isinf(value))
+    return value > 0 ? "f32::INFINITY" : "f32::NEG_INFINITY";
+  llvm::SmallString<32> text;
+  llvm::APFloat(value).toString(text, /*FormatPrecision=*/0, /*FormatMaxPadding=*/0);
+  std::string s(text);
+  if (s.find_first_of(".eE") == std::string::npos)
+    s += ".0";
+  return s + "f32";
+}
 
 namespace {
 
@@ -57,19 +75,6 @@ std::string rustType(Type type) {
                ", " + m(t.getSlice()) + ", " + m(t.getElement()) + ">";
       })
       .Default([](Type) { return std::string(); });
-}
-
-std::string rustF32(float value) {
-  if (std::isnan(value))
-    return "f32::NAN";
-  if (std::isinf(value))
-    return value > 0 ? "f32::INFINITY" : "f32::NEG_INFINITY";
-  llvm::SmallString<32> text;
-  llvm::APFloat(value).toString(text, /*FormatPrecision=*/0, /*FormatMaxPadding=*/0);
-  std::string s(text);
-  if (s.find_first_of(".eE") == std::string::npos)
-    s += ".0";
-  return s + "f32";
 }
 
 bool isKeyword(StringRef name) {
@@ -312,8 +317,12 @@ FailureOr<std::string> Emitter::chain(Value stream) {
               return success();
             })
             .Case([&](VectorIntraSliceReduceOp o) {
-              out << "\n.vector_intra_slice_reduce::<" << o.getAxis() << ", " << tp() << ">(IntraSliceReduceOpF32::"
-                  << o.getOp() << ")";
+              out << "\n.vector_intra_slice_reduce::<" << o.getAxis() << ", " << tp() << ">(IntraSliceReduceOp"
+                  << (st.getElementType().isInteger(32) ? "I32::" : "F32::") << o.getOp() << ")";
+              return success();
+            })
+            .Case([&](VectorReinterpretOp) {
+              out << "\n.vector_reinterpret::<" << (st.getElementType().isInteger(32) ? "i32" : "f32") << ">()";
               return success();
             })
             .Case([&](VectorFinalOp) {

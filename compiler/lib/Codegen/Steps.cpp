@@ -46,25 +46,6 @@ bool isUnit(Operation *op) {
   return !isCheap(op) && !isa<func::ReturnOp, func::CallOp>(op) && op->getNumResults() > 0;
 }
 
-/// `v` as a tensor of type `t` with the same elements in row-major order (collapse to 1-D, expand back).
-Value reshapeTo(OpBuilder &b, Location loc, Value v, RankedTensorType t) {
-  auto from = cast<RankedTensorType>(v.getType());
-  if (from == t)
-    return v;
-  auto all = [](int64_t rank) {
-    ReassociationIndices r;
-    for (int64_t d = 0; d < rank; ++d)
-      r.push_back(d);
-    return SmallVector<ReassociationIndices>{r};
-  };
-  if (from.getRank() != 1)
-    v = tensor::CollapseShapeOp::create(b, loc, RankedTensorType::get({from.getNumElements()}, from.getElementType()), v,
-                                        all(from.getRank()));
-  if (t.getRank() != 1)
-    v = tensor::ExpandShapeOp::create(b, loc, t, v, all(t.getRank()));
-  return v;
-}
-
 /// The value a reshape chain starts from.
 Value throughReshapes(Value v) {
   while (v.getDefiningOp() && isReshape(v.getDefiningOp()))
@@ -120,6 +101,37 @@ bool mapsWhole(func::FuncOp func) {
     (void)mapKernel(copy);
   }
   return false;
+}
+
+/// Whether some op class maps `g` as a step of its own: its inputs as buffers, a fill init kept.
+bool mapsAlone(linalg::GenericOp g) {
+  OpBuilder b(g.getContext());
+  Location loc = g.getLoc();
+  SmallVector<Value> ins(g.getDpsInputs());
+  SmallVector<Type> types;
+  for (Value v : ins)
+    types.push_back(v.getType());
+  types.push_back(g.getResultTypes()[0]);
+  auto func = func::FuncOp::create(b, loc, "alone", b.getFunctionType(types, g.getResultTypes()));
+  func->setAttr("furiosa.written", b.getI64ArrayAttr({int64_t(ins.size())}));
+  Block *body = func.addEntryBlock();
+  b.setInsertionPointToStart(body);
+  IRMapping map;
+  for (auto [v, arg] : llvm::zip(ins, body->getArguments()))
+    map.map(v, arg);
+  Value init = g.getDpsInits()[0];
+  if (auto fill = init.getDefiningOp<linalg::FillOp>(); fill && fill.getInputs()[0].getDefiningOp<arith::ConstantOp>()) {
+    b.clone(*fill.getInputs()[0].getDefiningOp(), map);
+    b.clone(*fill.getOutputs()[0].getDefiningOp(), map);
+    b.clone(*fill, map);
+  } else {
+    map.map(init, body->getArgument(ins.size()));
+  }
+  Operation *copy = b.clone(*g, map);
+  func::ReturnOp::create(b, loc, copy->getResults());
+  bool ok = mapsWhole(func);
+  func.erase();
+  return ok;
 }
 
 /// A step: the unit ops it owns (it produces their values for the other steps), and those of other steps it
@@ -690,8 +702,10 @@ LogicalResult mlir::furiosa::splitSteps(ModuleOp module) {
   // contraction mapped whole would split into a step per batch).
   if (llvm::all_of(kernels, mapsWhole))
     return success();
+  if (failed(unrollKeptLoops(module)))
+    return failure();
   normalizeKernels(module);
-  normalizeContractions(module);
+  normalizeContractions(module, mapsAlone);
   // Reads the normalization rewrote alike (each operand gets its own reshape and box) become one again.
   PassManager pm(module.getContext());
   pm.addPass(createCSEPass());

@@ -9,6 +9,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Verifier.h"
 
 using namespace mlir;
 using namespace mlir::furiosa;
@@ -169,6 +170,9 @@ const OpClass *mapping::matchClass(RaisedKernel &kernel) {
 
 RaisedKernel mapping::raisedKernel(func::FuncOp func) { return {func, argNames(func), writtenArgs(func)}; }
 
+/// A launch passes the device and the kernel's parameters as one tuple, which furiosa-opt takes up to 24 long.
+static constexpr unsigned kMaxParams = 23;
+
 bool mapping::mapsOnCopy(func::FuncOp func, const OpClass &c) {
   OpBuilder b(func.getContext());
   OwningOpRef<ModuleOp> scratch = ModuleOp::create(b, func.getLoc());
@@ -180,7 +184,11 @@ bool mapping::mapsOnCopy(func::FuncOp func, const OpClass &c) {
   widenF16(copy);
   ScopedDiagnosticHandler quiet(func.getContext(), [](Diagnostic &) { return success(); });
   RaisedKernel raised = raisedKernel(copy);
-  return c.match(raised) && succeeded(c.map(raised));
+  if (!c.match(raised) || failed(c.map(raised)))
+    return false;
+  // A class whose mapping does not verify does not map the kernel (codegen would fail on it).
+  auto kernel = scratch->lookupSymbol<func::FuncOp>(func.getName());
+  return kernel && kernel.getNumArguments() <= kMaxParams && succeeded(verify(kernel));
 }
 
 LogicalResult mapping::mapKernel(func::FuncOp func) {
@@ -200,10 +208,21 @@ LogicalResult mapping::mapKernel(func::FuncOp func) {
   }
   // A class's match is a quick filter: the first of several matching classes that maps the kernel (tried on a
   // copy) maps it; the last one tried explains a failure.
+  ModuleOp module = func->getParentOfType<ModuleOp>();
+  StringRef name = func.getName();
+  const OpClass *chosen = matching.back();
   for (const OpClass *c : ArrayRef(matching).drop_back())
-    if (mapsOnCopy(func, *c))
-      return c->map(kernel);
-  return matching.back()->map(kernel);
+    if (mapsOnCopy(func, *c)) {
+      chosen = c;
+      break;
+    }
+  Location loc = func.getLoc();
+  if (failed(chosen->map(kernel)))
+    return failure();
+  if (auto mapped = module.lookupSymbol<func::FuncOp>(name); mapped && mapped.getNumArguments() > kMaxParams)
+    return emitError(loc) << chosen->name << ": " << mapped.getNumArguments() << " parameters, more than the "
+                          << kMaxParams << " a launch passes";
+  return success();
 }
 
 namespace {

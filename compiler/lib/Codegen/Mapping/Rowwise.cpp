@@ -19,6 +19,7 @@
 //  - A single row (R = 1) may come rank-reduced: rank-0 row values and constant-0 row indices.
 
 #include "Mapping.h"
+#include "furiosa/Codegen/Codegen.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Math/IR/Math.h"
@@ -52,6 +53,10 @@ Shape join(Shape a, Shape b) {
   return Shape::Full; // Row x Col, or either with Full
 }
 
+/// The element type a buffer streams as: an i32's bits ride in f32 streams (selects move them, the i32 reduces
+/// reread them).
+Type bitsAsF32(Type t) { return t.isInteger(32) ? Float32Type::get(t.getContext()) : t; }
+
 /// A node of the folded expression DAG.
 struct Node {
   enum Kind { Input, Const, Op, Reduce } kind;
@@ -61,7 +66,9 @@ struct Node {
   unsigned rows = 0;       // Input: the row dims it varies along (bit i: row dim i), broadcast along the others
   bool col = false;        // Input: whether it varies along the columns
   float value = 0;         // Const
-  std::string op;          // Op: add, sub, mul, div, max, min, exp, sqrt, neg, ...; Reduce: Add, Max, Min
+  std::string op;          // Op: add, sub, mul, div, max, min, exp, sqrt, neg, select, eqkey, ...; Reduce: Add, Max,
+                           // Min, MinI, MaxI (i32)
+  std::string cmp;         // Op select: the tag comparison its key (args[0]) passes where it takes args[1]
   SmallVector<int> args;   // Op / Reduce operands
 };
 
@@ -76,7 +83,7 @@ struct Dag {
   /// reads the buffers again), and the DAG keeps one of each.
   int add(Node n) {
     std::string key = std::to_string(int(n.kind)) + "|" + std::to_string(n.arg) + "|" +
-                      std::to_string(llvm::bit_cast<uint32_t>(n.value)) + "|" + n.op + "|" + std::to_string(int(n.shape)) +
+                      std::to_string(llvm::bit_cast<uint32_t>(n.value)) + "|" + n.op + "|" + n.cmp + "|" + std::to_string(int(n.shape)) +
                       "|" + std::to_string(n.rows) + "|" + std::to_string(n.col);
     for (int a : n.args)
       key += "," + std::to_string(a);
@@ -102,7 +109,7 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
     auto t = cast<RankedTensorType>(result.getType());
     if (!full || t.getRank() > full.getRank())
       full = t;
-    dag.outTypes.push_back(t.getElementType());
+    dag.outTypes.push_back(bitsAsF32(t.getElementType()));
   }
   for (Value result : ret.getOperands()) {
     auto t = cast<RankedTensorType>(result.getType());
@@ -121,8 +128,8 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
       reducer = g;
   bool sameShapes = llvm::all_of(ret.getOperands(), [&](Value v) { return v.getType() == ret.getOperand(0).getType(); });
   bool onlyRows = sameShapes && reducer;
-  if (!onlyRows && full.getRank() < 2) {
-    why = "expected a [rows..., columns] output";
+  if (!onlyRows && full.getRank() < 1) {
+    why = "expected a [rows..., columns] output (a single row when 1-D)";
     return failure();
   }
   if (onlyRows) {
@@ -231,12 +238,12 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
       Node n{Node::Input};
       n.shape = *shape;
       n.arg = arg.getArgNumber();
-      n.type = cast<RankedTensorType>(t.getType()).getElementType();
+      n.type = bitsAsF32(cast<RankedTensorType>(t.getType()).getElementType());
       n.rows = read->rows;
       n.col = read->col;
       return dag.add(n);
     }
-    // A fill is a constant.
+    // A fill is a constant (an i32 one, its bits).
     if (auto fill = t.getDefiningOp<linalg::FillOp>()) {
       llvm::APFloat f(0.0f);
       if (matchPattern(fill.getInputs()[0], m_ConstantFloat(&f))) {
@@ -244,6 +251,11 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
         f.convert(llvm::APFloat::IEEEsingle(), llvm::APFloat::rmNearestTiesToEven, &lost);
         Node n{Node::Const};
         n.value = f.convertToFloat();
+        return dag.add(n);
+      }
+      if (APInt i; matchPattern(fill.getInputs()[0], m_ConstantInt(&i)) && i.getBitWidth() == 32) {
+        Node n{Node::Const};
+        n.value = llvm::bit_cast<float>(uint32_t(i.getZExtValue()));
         return dag.add(n);
       }
     }
@@ -285,6 +297,7 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
       scalar[body.getArgument(in->getOperandNumber())] = *n;
     }
     Value acc = body.getArgument(g.getNumDpsInputs());
+    std::function<FailureOr<int>(arith::SelectOp)> selectNode;
     std::function<FailureOr<int>(Value)> node = [&](Value v) -> FailureOr<int> {
       if (auto it = scalar.find(v); it != scalar.end())
         return it->second;
@@ -296,6 +309,11 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
         n.value = f.convertToFloat();
         return scalar[v] = dag.add(n);
       }
+      if (APInt i; matchPattern(v, m_ConstantInt(&i)) && i.getBitWidth() == 32) {
+        Node n{Node::Const};
+        n.value = llvm::bit_cast<float>(uint32_t(i.getZExtValue()));
+        return scalar[v] = dag.add(n);
+      }
       if (v == acc) {
         why = "the accumulator is read outside the reduction's combine";
         return failure();
@@ -304,6 +322,12 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
       if (!op || op->getBlock() != &body) {
         why = "a body value defined outside the body";
         return failure();
+      }
+      if (auto sel = dyn_cast<arith::SelectOp>(op)) {
+        auto n = selectNode(sel);
+        if (failed(n))
+          return failure();
+        return scalar[v] = *n;
       }
       std::string name = llvm::TypeSwitch<Operation *, std::string>(op)
                              .Case<arith::AddFOp>([](auto) { return "add"; })
@@ -357,6 +381,56 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
         n.shape = join(n.shape, dag.nodes[a].shape);
       return scalar[v] = dag.add(n);
     };
+    // select(x <pred> y, a, b) takes a where its key passes the tag comparison: x itself against a constant y
+    // (the tag unit compares with immediates); x - y > 0 (< 0) for a strict order, exact since IEEE subtraction
+    // keeps the sign and equal infinities give NaN, false either way; for equality the key (x + 0) ^ (y + 0),
+    // zero exactly when the bits match once -0 is +0, a NaN x kept nonzero (eqkey's own tag).
+    selectNode = [&](arith::SelectOp sel) -> FailureOr<int> {
+      auto c = sel.getCondition().getDefiningOp<arith::CmpFOp>();
+      if (!c || c->getBlock() != &body) {
+        why = "a select whose condition is not a float comparison in the body";
+        return failure();
+      }
+      auto x = node(c.getLhs()), y = node(c.getRhs()), a = node(sel.getTrueValue()), f = node(sel.getFalseValue());
+      if (failed(x) || failed(y) || failed(a) || failed(f))
+        return failure();
+      using P = arith::CmpFPredicate;
+      P pred = c.getPredicate();
+      if (dag.nodes[*x].kind == Node::Const) {
+        std::swap(x, y);
+        pred = pred == P::OGT ? P::OLT : pred == P::OLT ? P::OGT : pred;
+      }
+      auto opNode = [&](StringRef name, SmallVector<int> args) {
+        Node n{Node::Op};
+        n.op = name.str();
+        n.args = args;
+        for (int a : args)
+          n.shape = join(n.shape, dag.nodes[a].shape);
+        return dag.add(n);
+      };
+      Node n{Node::Op};
+      n.op = "select";
+      int key;
+      if (dag.nodes[*y].kind == Node::Const && (pred == P::OGT || pred == P::OLT || pred == P::OEQ)) {
+        std::string k = rustF32(dag.nodes[*y].value);
+        key = *x;
+        n.cmp = (pred == P::OGT ? "Greater(" : pred == P::OLT ? "Less(" : "Equal(") + k + ")";
+      } else if (pred == P::OGT || pred == P::OLT) {
+        key = opNode("sub", {*x, *y});
+        n.cmp = pred == P::OGT ? "Greater(0.0f32)" : "Less(0.0f32)";
+      } else if (pred == P::OEQ) {
+        int zero = dag.add(Node{Node::Const});
+        key = opNode("eqkey", {opNode("add", {*x, zero}), opNode("add", {*y, zero})});
+        n.cmp = "Equal(0i32)"; // the key is committed as i32 (see commit)
+      } else {
+        why = "no exact Vector Engine comparison for predicate " + arith::stringifyCmpFPredicate(pred).str();
+        return failure();
+      }
+      n.args = {key, *a, *f};
+      for (int arg : n.args)
+        n.shape = join(n.shape, dag.nodes[arg].shape);
+      return dag.add(n);
+    };
     Value yielded = cast<linalg::YieldOp>(body.getTerminator()).getOperand(0);
     int result;
     if (reduction) {
@@ -376,9 +450,15 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
       llvm::APFloat init(0.0f);
       bool identity = fill && matchPattern(fill.getInputs()[0], m_ConstantFloat(&init)) &&
                       ((op == "Add" && init.isZero()) || (op == "Max" && init.isInfinity() && init.isNegative()) ||
-                       (op == "Min" && init.isInfinity() && !init.isNegative()));
+                       (op == "Min" && init.isInfinity() && !init.isNegative()) ||
+                       (init.isNaN() && isa<arith::MaxNumFOp, arith::MinNumFOp>(comb))); // maxnum's identity
+      if (APInt i; isa<arith::MinSIOp, arith::MaxSIOp>(comb)) {
+        op = isa<arith::MinSIOp>(comb) ? "MinI" : "MaxI";
+        identity = fill && matchPattern(fill.getInputs()[0], m_ConstantInt(&i)) && i.getBitWidth() == 32 &&
+                   (op == "MinI" ? i.isMaxSignedValue() : i.isMinSignedValue());
+      }
       if (op.empty() || !identity) {
-        why = "a reduction must be add/max/min from its identity";
+        why = "a reduction must be add/max/min (or i32 min/max) from its identity";
         return failure();
       }
       auto t = node(term);
@@ -485,7 +565,7 @@ void rewriteSigmoid(Dag &dag) {
 }
 
 /// A planned VE op: its stage, the ALU it takes, and how it reads its other operand.
-enum Stage { Tag = 0, Narrow = 4, Fp = 5, Reduce = 6, FpDiv = 7, Widen = 8, Clip = 10 };
+enum Stage { Tag = 0, Logic = 1, Narrow = 4, Fp = 5, Reduce = 6, FpDiv = 7, Widen = 8, Clip = 10 };
 
 class Planner {
 public:
@@ -624,6 +704,7 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
     bool stash = false; // the off-path operand is the streamed value itself
     bool reversed = false; // the streamed value is the second operand (c - x, c / x)
     bool zip = false;      // the off-path operand is a second input of the leaf's type, interleaved with it
+    int operand2 = -1;     // a select's false value
   };
   SmallVector<Step> path;
   int leaf = node;
@@ -636,6 +717,21 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
     if (n.kind == Node::Reduce) {
       path.push_back({leaf});
       leaf = n.args[0];
+      continue;
+    }
+    // A select streams its key, an equality key its first operand of the key's shape (it is symmetric).
+    if (n.op == "select" || n.op == "eqkey") {
+      Step step{leaf};
+      int key = n.args[0], other = n.args[1];
+      if (n.op == "eqkey" && dag.nodes[key].shape != n.shape)
+        std::swap(key, other);
+      if (dag.nodes[key].shape != n.shape)
+        return fail(func, "a select whose key does not vary along its result"), failure();
+      step.operand = other;
+      if (n.op == "select")
+        step.operand2 = n.args[2];
+      path.push_back(step);
+      leaf = key;
       continue;
     }
     Shape want = n.shape;
@@ -667,7 +763,7 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
       return fail(func, "an op combines more than two values of the streamed shape"), failure();
     if (!other.empty()) {
       step.operand = other[0];
-      step.reversed = n.args[0] != streamed[0];
+      step.reversed = n.args[0] != streamed[0] && (n.op == "sub" || n.op == "div"); // the others commute
     }
     path.push_back(step);
     leaf = streamed[0];
@@ -707,9 +803,10 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
 
   // VRF operands are loaded before the pass (their own passes come first).
   for (const Step &s : path)
-    if (s.operand >= 0 && dag.nodes[s.operand].kind != Node::Const && !s.zip)
-      if (failed(vrfOf(s.operand, func)))
-        return failure();
+    for (int o : {s.operand, s.operand2})
+      if (o >= 0 && dag.nodes[o].kind != Node::Const && !s.zip)
+        if (failed(vrfOf(o, func)))
+          return failure();
   bool zipFirst = !path.empty() && path[0].zip && leafNode.kind == Node::Input;
 
   // Stream state.
@@ -721,12 +818,24 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
   auto time = [&]() { return row ? kb.one() : (way4 ? fullTime4 : fullTime8); };
   auto packet = [&]() { return row ? rowPacket(way4 ? 4 : 8) : (way4 ? fullPacket4 : fullPacket8); };
   Value s;
-  auto begin = [&](Value dm, Type et) {
+  // The tag comparisons a pass starting at `st` needs: a select's, or an equality key's ordered test.
+  auto tagsOf = [&](const Step &st) -> ArrayAttr {
+    Node &n = dag.nodes[st.node];
+    if (n.op == "select")
+      return b.getStrArrayAttr({n.cmp, "False", "False", "False"});
+    if (n.op == "eqkey")
+      return b.getStrArrayAttr({"Less(f32::INFINITY)", "Equal(f32::INFINITY)", "False", "False"});
+    return {};
+  };
+  bool tagged = false; // the pass began with the tags of the op it is at
+  // An i32 stream (an equality key) is tagged as i32, then reread as f32 bits.
+  auto begin = [&](Value dm, Type et, ArrayAttr tags) {
+    Type vt = et.isInteger(32) ? et : f32();
     if (row) {
       MapAttr held = cast<DmTensorType>(dm.getType()).getElement();
-      s = BeginOp::create(b, loc, stream(f32(), kb.one(), held), dm, ContextKind::Main);
-      s = FetchOp::create(b, loc, stream(f32(), kb.one(), held), s);
-      s = CollectOp::create(b, loc, stream(f32(), kb.one(), rowPacket(8)), s);
+      s = BeginOp::create(b, loc, stream(vt, kb.one(), held), dm, ContextKind::Main);
+      s = FetchOp::create(b, loc, stream(vt, kb.one(), held), s);
+      s = CollectOp::create(b, loc, stream(vt, kb.one(), rowPacket(8)), s);
     } else {
       bool bf16 = et.isBF16();
       int64_t p = bf16 ? 16 : 8;
@@ -734,10 +843,16 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
       s = FetchOp::create(b, loc, stream(et, H.stride(p), H.modulo(p)), s);
       if (bf16)
         s = FetchCastOp::create(b, loc, stream(f32(), H.stride(p), H.modulo(p)), s);
-      s = CollectOp::create(b, loc, stream(f32(), fullTime8, fullPacket8), s);
+      s = CollectOp::create(b, loc, stream(vt, fullTime8, fullPacket8), s);
     }
-    s = VectorInitOp::create(b, loc, stream(f32(), time(), packet()), s);
-    s = VectorIntraSliceTagOp::create(b, loc, stream(f32(), time(), packet()), s);
+    s = VectorInitOp::create(b, loc, stream(vt, time(), packet()), s);
+    if (tags)
+      s = VectorTagCmpOp::create(b, loc, stream(vt, time(), packet()), s, tags);
+    else
+      s = VectorIntraSliceTagOp::create(b, loc, stream(vt, time(), packet()), s);
+    if (vt != f32())
+      s = VectorReinterpretOp::create(b, loc, stream(f32(), time(), packet()), s);
+    tagged = bool(tags);
     stage = Tag;
     way4 = false;
     alus.clear();
@@ -765,8 +880,13 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
   // Ends the pass: commits the current value (node `at`) to DM.
   auto commit = [&](int at, Type cast) -> Value {
     toWay8();
-    s = VectorFinalOp::create(b, loc, stream(f32(), time(), packet()), s);
     Type et = f32();
+    // An equality key leaves as i32: the tag unit flushes subnormal f32s (verified on npu3), not i32s.
+    if (dag.nodes[at].op == "eqkey") {
+      et = IntegerType::get(ctx, 32);
+      s = VectorReinterpretOp::create(b, loc, stream(et, time(), packet()), s);
+    }
+    s = VectorFinalOp::create(b, loc, stream(et, time(), packet()), s);
     MapAttr trim = row ? rowPacket(8) : fullPacket8;
     if (cast && !cast.isF32()) {
       et = cast;
@@ -809,7 +929,7 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
     alus.clear();
     pair = true;
   } else {
-    begin(source, sourceType);
+    begin(source, sourceType, path.empty() ? ArrayAttr() : tagsOf(path[0]));
   }
   int current = leaf;
   for (size_t i = 0; i < path.size(); ++i) {
@@ -820,7 +940,7 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
     int need;            // stage
     bool needWay4 = true;
     std::string alu, veOp;
-    enum { FpBinary, FpUnary, Div, ClipBin, ReduceOp, FpZip, ClipZip } form;
+    enum { FpBinary, FpUnary, Div, ClipBin, ReduceOp, FpZip, ClipZip, Select, EqKey } form;
     float negImm = 0;
     if (st.zip && i == 0 && zipFirst) {
       bool clip = op == "max" || op == "min";
@@ -830,6 +950,10 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
              : op == "max" ? "Max" : "Min";
       if (!clip && op != "add" && op != "sub" && op != "mul" && op != "div")
         return fail(func, "no Vector Engine zip for '" + op + "'"), failure();
+    } else if (n.op == "select" || n.op == "eqkey") {
+      // Logic ops right after the tags the pass began with (Way8).
+      need = Logic, needWay4 = false, alu = n.op == "select" ? "LogicSelect" : "LogicXor";
+      form = n.op == "select" ? Select : EqKey;
     } else if (n.kind == Node::Reduce) {
       need = Reduce, alu = "ReduceAccTree", form = ReduceOp, veOp = n.op;
     } else if (op == "sin" || op == "cos") {
@@ -877,13 +1001,14 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
     bool sameStageAllowed = need == Fp || need == Clip;
     bool breakHere = need < stage || (need == stage && !sameStageAllowed) || alus.count(alu) ||
                      (needWay4 && stage > Narrow && !way4) || (form == ReduceOp && (row || pair)) ||
-                     (pair && st.stash); // pair mode has neither the stash nor the intra-slice reducer
+                     (pair && st.stash) || // pair mode has neither the stash nor the intra-slice reducer
+                     ((form == Select || form == EqKey) && (!tagged || stage != Tag || !alus.empty()));
     if (breakHere) {
       if (current == leaf && i == 0)
         return fail(func, "an op cannot start a pass"), failure();
       Value dm = commit(current, Type());
       row = dag.nodes[current].shape == Shape::Row;
-      begin(dm, f32());
+      begin(dm, cast<DmTensorType>(dm.getType()).getElementType(), tagsOf(st));
       pair = false;
       // Retry this step in the new pass.
       --i;
@@ -900,7 +1025,8 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
     FloatAttr imm;
     Value vrf;
     UnitAttr stash;
-    if (form != ReduceOp && form != FpUnary && form != FpZip && form != ClipZip && !(op == "neg")) {
+    if (form != ReduceOp && form != FpUnary && form != FpZip && form != ClipZip && form != Select && form != EqKey &&
+        !(op == "neg")) {
       operandOf(st, imm, vrf, stash);
       if (clipSub)
         imm = b.getF32FloatAttr(-dag.nodes[st.operand].value);
@@ -926,10 +1052,48 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
     case ClipZip:
       s = VectorClipZipOp::create(b, loc, stream(f32(), time(), packet()), s, b.getStringAttr(veOp));
       break;
-    case ReduceOp:
+    case ReduceOp: {
+      // An i32 reduce rereads the bits as i32 and leaves them in the f32 stream again.
+      bool i32 = veOp == "MinI" || veOp == "MaxI";
+      Type it = IntegerType::get(ctx, 32);
+      if (i32)
+        s = VectorReinterpretOp::create(b, loc, stream(it, time(), packet()), s);
       row = true;
-      s = VectorIntraSliceReduceOp::create(b, loc, stream(f32(), time(), packet()), s, b.getStringAttr(veOp),
-                                           b.getStringAttr("H"));
+      s = VectorIntraSliceReduceOp::create(b, loc, stream(i32 ? it : f32(), time(), packet()), s,
+                                           b.getStringAttr(i32 ? veOp.substr(0, 3) : veOp), b.getStringAttr("H"));
+      if (i32)
+        s = VectorReinterpretOp::create(b, loc, stream(f32(), time(), packet()), s);
+      break;
+    }
+    case Select: {
+      // cond ? a : b, bit-exact: clear the key, OR in a where the tag holds, XOR in b where it does not (an rf
+      // slot comes last, so "rf where it holds" is written "0 where it does not, else rf").
+      auto logic = [&](StringRef op, FloatAttr imm, ArrayAttr branches, Value vrf) {
+        s = VectorAluOp::create(b, loc, stream(f32(), time(), packet()), s, b.getStringAttr("vector_logic"),
+                                b.getStringAttr(("LogicBinaryOpF32::" + op).str()), StringAttr(), imm, vrf, UnitAttr(),
+                                branches);
+      };
+      auto slot = [&](StringRef bits, Attribute v) { return b.getArrayAttr({b.getStringAttr(bits), v}); };
+      FloatAttr zero = b.getF32FloatAttr(0);
+      logic("BitAnd", zero, {}, {});
+      Node &a = dag.nodes[st.operand], &f = dag.nodes[st.operand2];
+      if (a.kind == Node::Const)
+        logic("BitOr", {}, b.getArrayAttr({slot("1---", b.getF32FloatAttr(a.value)), slot("all", zero)}), {});
+      else
+        logic("BitOr", {}, b.getArrayAttr({slot("0---", zero), slot("all", b.getStringAttr("rf"))}), vrfs.at(st.operand));
+      if (f.kind == Node::Const)
+        logic("BitXor", {}, b.getArrayAttr({slot("1---", zero), slot("all", b.getF32FloatAttr(f.value))}), {});
+      else
+        logic("BitXor", {}, b.getArrayAttr({slot("1---", zero), slot("all", b.getStringAttr("rf"))}), vrfs.at(st.operand2));
+      break;
+    }
+    case EqKey:
+      // x ^ y where x is ordered (tag bit 0 or 1), x itself (nonzero) where it is NaN.
+      s = VectorAluOp::create(b, loc, stream(f32(), time(), packet()), s, b.getStringAttr("vector_logic"),
+                              b.getStringAttr("LogicBinaryOpF32::BitXor"), StringAttr(), FloatAttr(), vrfs.at(st.operand),
+                              UnitAttr(),
+                              b.getArrayAttr({b.getArrayAttr({b.getStringAttr("00--"), b.getF32FloatAttr(0)}),
+                                              b.getArrayAttr({b.getStringAttr("all"), b.getStringAttr("rf")})}));
       break;
     }
     stage = need;
@@ -1175,7 +1339,9 @@ LogicalResult map(RaisedKernel &kernel) {
   if (llvm::all_of(dag.nodes, [&](const Node &n) {
         return n.kind == Node::Const || (n.shape == Shape::Full && (n.kind != Node::Input || n.rows == allRows));
       })) {
-    constexpr int64_t kRow = 1024;
+    // Each input may be a VRF operand of some pass: rows short enough for all of them at once.
+    int64_t inputs = llvm::count_if(dag.nodes, [](const Node &n) { return n.kind == Node::Input; });
+    int64_t kRow = std::min<int64_t>(1024, kVrfBytes / 4 / std::max<int64_t>(inputs, 2) / 16 * 16);
     int64_t total = dag.r * dag.h;
     for (int64_t h = std::min(total, kRow); h >= 16 && (dag.h > kRow || dag.h % 16); --h)
       if (total % h == 0 && h % 16 == 0) {

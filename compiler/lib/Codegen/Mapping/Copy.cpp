@@ -3,7 +3,8 @@
 // `tensor.extract_slice %src`, the source's tile view copied whole into the written buffer. Static offsets,
 // unit strides; reshapes around the buffers move no data, so the box is described in the slice's own shape.
 // An insert into a zero fill (a padded read) writes the box into the fresh written buffer, which starts as
-// zeros. A linalg.transpose of a buffer is one DMA between the two layouts.
+// zeros; an insert into a table (a padding constant) copies the table into the written buffer first. A
+// linalg.transpose of a buffer is one DMA between the two layouts.
 
 #include "Mapping.h"
 
@@ -32,6 +33,7 @@ struct Copy {
   RankedTensorType whole; // the sliced (inserted-into or extracted-from) tensor, in the slice's shape
   BlockArgument from, to; // source and destination buffers
   bool insert;
+  BlockArgument seed;     // insert: a read-only destination (a table) copied whole into `to` first
 };
 
 FailureOr<Copy> find(RaisedKernel &kernel) {
@@ -52,6 +54,11 @@ FailureOr<Copy> find(RaisedKernel &kernel) {
     if (!c.to && fill && matchPattern(fill.getInputs()[0], m_AnyZeroFloat()) &&
         fill.getOutputs()[0].getDefiningOp<tensor::EmptyOp>())
       c.to = func.getArgument(kernel.written[0]);
+    if (c.to && int64_t(c.to.getArgNumber()) != kernel.written[0] &&
+        cast<RankedTensorType>(c.to.getType()) == cast<RankedTensorType>(func.getArgument(kernel.written[0]).getType())) {
+      c.seed = c.to;
+      c.to = func.getArgument(kernel.written[0]);
+    }
     if (insert.getSourceType().getRank() != insert.getDestType().getRank())
       return failure();
   } else if (auto extract = result.getDefiningOp<tensor::ExtractSliceOp>()) {
@@ -149,10 +156,16 @@ LogicalResult map(RaisedKernel &kernel) {
   // insert: the source is the box, the destination the whole; extract: the other way round.
   MapAttr fromMap = c.insert ? boxMap : wholeMap, toMap = c.insert ? wholeMap : boxMap;
   unsigned from = kb.input(c.from.getArgNumber(), et, fromMap);
+  std::optional<unsigned> seed;
+  if (c.seed)
+    seed = kb.input(c.seed.getArgNumber(), et, wholeMap);
   unsigned to = kb.inout(c.to.getArgNumber(), et, toMap);
   kb.beginBody();
   OpBuilder &b = kb.builder();
   Location loc = kb.loc();
+  if (seed)
+    HbmToHbmViewOp::create(b, loc, ViewOp::create(b, loc, HbmViewType::get(ctx, et, kb.chip(), wholeMap, false), kb.param(*seed)),
+                           ViewOp::create(b, loc, HbmViewType::get(ctx, et, kb.chip(), wholeMap, true), kb.param(to)));
   Value src = ViewOp::create(b, loc, HbmViewType::get(ctx, et, kb.chip(), fromMap, false), kb.param(from));
   Value dst = ViewOp::create(b, loc, HbmViewType::get(ctx, et, kb.chip(), toMap, true), kb.param(to));
   // The whole side is tiled down to the box, one dimension at a time.

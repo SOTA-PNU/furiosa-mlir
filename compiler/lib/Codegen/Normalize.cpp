@@ -8,10 +8,13 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/AffineExprVisitor.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Matchers.h"
+#include "mlir/IR/PatternMatch.h"
 #include "mlir/Transforms/RegionUtils.h"
 
 #include <map>
@@ -128,7 +131,7 @@ linalg::GenericOp promoteExtracts(linalg::GenericOp g) {
 }
 
 /// Rewrites input `i` of `g` to a projected read when its map's results are mixed-radix combinations.
-void delinearize(linalg::GenericOp g, unsigned i) {
+void delinearizeRead(linalg::GenericOp g, unsigned i) {
   OpOperand *operand = g.getDpsInputOperand(i);
   AffineMap map = g.getMatchingIndexingMap(operand);
   if (map.isProjectedPermutation())
@@ -335,15 +338,106 @@ void dropCarriers(linalg::GenericOp g) {
   }
 }
 
+/// A generic that only copies a value another linalg op computed into an output of as many elements, in the
+/// same order, is a reshape: it moves no data (the producer writes where the copy would have).
+void copiesToReshapes(ModuleOp module) {
+  SmallVector<linalg::GenericOp> copies;
+  module.walk([&](linalg::GenericOp g) {
+    if (g.getNumDpsInputs() != 1 || g.getNumDpsInits() != 1 || g.getNumReductionLoops() ||
+        !g.getDpsInputs()[0].getDefiningOp<linalg::LinalgOp>())
+      return;
+    Block &body = g.getRegion().front();
+    if (&body.front() != body.getTerminator() || body.getTerminator()->getOperand(0) != body.getArgument(0))
+      return;
+    auto in = cast<RankedTensorType>(g.getDpsInputs()[0].getType());
+    auto out = cast<RankedTensorType>(g.getResultTypes()[0]);
+    if (in.getNumElements() != out.getNumElements() || !g.getIndexingMapsArray()[1].isIdentity())
+      return;
+    int last = -1;
+    for (AffineExpr e : g.getIndexingMapsArray()[0].getResults()) {
+      auto d = dyn_cast<AffineDimExpr>(e);
+      if (!d || int(d.getPosition()) <= last)
+        return; // as many elements, read in order: the loops the input skips are unit ones
+      last = d.getPosition();
+    }
+    copies.push_back(g);
+  });
+  for (linalg::GenericOp g : copies) {
+    OpBuilder b(g);
+    g.getResult(0).replaceAllUsesWith(
+        furiosa::reshapeTo(b, g.getLoc(), g.getDpsInputs()[0], cast<RankedTensorType>(g.getResultTypes()[0])));
+    g.erase();
+  }
+}
+
+/// A full reduction over more than kRow elements reduces in two levels (upstream splitReduction): rows of at
+/// most kRow first, then their partials, so no op class holds one long row. Rows and partials both come in
+/// multiples of 16 (the row-wise class's row granule).
+void splitLongReductions(ModuleOp module) {
+  constexpr int64_t kRow = 1024;
+  SmallVector<linalg::GenericOp> todo;
+  module.walk([&](linalg::GenericOp g) {
+    if (g.getNumLoops() == 1 && g.getNumReductionLoops() == 1 && g.getNumDpsInits() == 1 &&
+        cast<RankedTensorType>(g.getResultTypes()[0]).getRank() == 0 && g.getStaticLoopRanges()[0] > kRow)
+      todo.push_back(g);
+  });
+  IRRewriter rewriter(module.getContext());
+  for (linalg::GenericOp g : todo) {
+    int64_t n = g.getStaticLoopRanges()[0], row = 0;
+    for (int64_t parts = 16; parts * 16 <= n && !row; parts += 16)
+      if (n % parts == 0 && (n / parts) % 16 == 0 && n / parts <= kRow)
+        row = n / parts;
+    if (!row)
+      continue;
+    rewriter.setInsertionPoint(g);
+    (void)linalg::splitReduction(rewriter, cast<linalg::LinalgOp>(g.getOperation()), [&](linalg::LinalgOp) {
+      return linalg::SplitReductionOptions{n / row, 0, false};
+    });
+  }
+}
+
+/// A padded tensor that only boxes are cut from (structure's masked tiles) is the source inserted into a constant
+/// of the padding value, which the copy steps map: one copy into the padded tensor, whose extent the boxes
+/// then divide (the NPU tiles an axis only in windows that grow into a divisor of it).
+void padsToInserts(ModuleOp module) {
+  SmallVector<tensor::PadOp> pads;
+  module.walk([&](tensor::PadOp pad) {
+    Attribute c;
+    Value padding = pad.getConstantPaddingValue();
+    if (padding && matchPattern(padding, m_Constant(&c)) && !ShapedType::isDynamicShape(pad.getStaticLow()) &&
+        pad.getResultType().hasStaticShape() && !pad.getResult().use_empty() &&
+        llvm::all_of(pad->getUsers(), [](Operation *u) { return isa<tensor::ExtractSliceOp>(u); }))
+      pads.push_back(pad);
+  });
+  for (tensor::PadOp pad : pads) {
+    OpBuilder b(pad);
+    Location loc = pad.getLoc();
+    Attribute c;
+    matchPattern(pad.getConstantPaddingValue(), m_Constant(&c));
+    SmallVector<OpFoldResult> low, sizes, ones;
+    for (auto [d, l] : llvm::enumerate(pad.getStaticLow())) {
+      low.push_back(b.getIndexAttr(l));
+      sizes.push_back(b.getIndexAttr(pad.getSourceType().getDimSize(d)));
+      ones.push_back(b.getIndexAttr(1));
+    }
+    Value filled = arith::ConstantOp::create(b, loc, DenseElementsAttr::get(pad.getResultType(), c));
+    pad.replaceAllUsesWith(tensor::InsertSliceOp::create(b, loc, pad.getSource(), filled, low, sizes, ones).getResult());
+    pad.erase();
+  }
+}
+
 } // namespace
 
 void mlir::furiosa::normalizeKernels(ModuleOp module) {
+  copiesToReshapes(module);
+  splitLongReductions(module);
+  padsToInserts(module);
   SmallVector<linalg::GenericOp> generics;
   module.walk([&](linalg::GenericOp g) { generics.push_back(g); });
   for (linalg::GenericOp g : generics) {
     g = promoteExtracts(g);
     for (unsigned i = 0; i < g.getNumDpsInputs(); ++i) {
-      delinearize(g, i);
+      delinearizeRead(g, i);
       maskToPad(g, i);
     }
     dropCarriers(g);
@@ -361,4 +455,26 @@ void mlir::furiosa::normalizeKernels(ModuleOp module) {
           erased = true;
         }
     }
+}
+
+Value mlir::furiosa::reshapeTo(OpBuilder &b, Location loc, Value v, RankedTensorType t) {
+  auto from = cast<RankedTensorType>(v.getType());
+  if (from == t)
+    return v;
+  auto all = [](int64_t rank) {
+    ReassociationIndices r;
+    for (int64_t d = 0; d < rank; ++d)
+      r.push_back(d);
+    return rank ? SmallVector<ReassociationIndices>{r} : SmallVector<ReassociationIndices>{};
+  };
+  if (from.getRank() == 0)
+    return tensor::ExpandShapeOp::create(b, loc, t, v, all(0));
+  if (t.getRank() == 0)
+    return tensor::CollapseShapeOp::create(b, loc, t, v, all(0));
+  if (from.getRank() != 1)
+    v = tensor::CollapseShapeOp::create(b, loc, RankedTensorType::get({from.getNumElements()}, from.getElementType()), v,
+                                        all(from.getRank()));
+  if (t.getRank() != 1)
+    v = tensor::ExpandShapeOp::create(b, loc, t, v, all(t.getRank()));
+  return v;
 }

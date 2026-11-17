@@ -1,6 +1,8 @@
 #ifndef FURIOSA_CODEGEN_CODEGEN_H
 #define FURIOSA_CODEGEN_CODEGEN_H
 
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/Pass/Pass.h"
@@ -8,6 +10,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <memory>
+#include <string>
 
 namespace mlir::furiosa {
 
@@ -29,7 +32,18 @@ void normalizeKernels(ModuleOp module);
 
 /// Takes contractions apart into the 2-D form op classes map: computed factors become producers, a non-zero
 /// start is added after, batch dims split into slices, dims collapse (lib/Codegen/Contract.cpp).
-void normalizeContractions(ModuleOp module);
+/// `mapsAlone` says whether a batched contraction maps as a step of its own, so it need not be unbatched.
+void normalizeContractions(ModuleOp module, function_ref<bool(linalg::GenericOp)> mapsAlone = {});
+
+/// A Rust f32 literal of `value`, exact (lib/Codegen/EmitRust.cpp).
+std::string rustF32(float value);
+
+/// `v` as type `t`: the same elements in row-major order, through collapse/expand_shape (moves no data).
+Value reshapeTo(OpBuilder &b, Location loc, Value v, RankedTensorType t);
+
+/// Unrolls the kernels' top-level scf.for loops into host-launched iterations, then structures their reads
+/// (lib/Codegen/Loops.cpp).
+LogicalResult unrollKeptLoops(ModuleOp module);
 
 /// Evaluates every value of a linalg.generic body that depends only on the iteration indices at compile time,
 /// over the dims it reads, and replaces it with a constant tensor input (lib/Codegen/Hoist.cpp).

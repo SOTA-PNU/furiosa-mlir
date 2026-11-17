@@ -4,6 +4,7 @@ add_triton_library(FuriosaCodegen
   EmitRust.cpp
   Hoist.cpp
   LinalgToFopt.cpp
+  Loops.cpp
   Mapping/Contraction.cpp
   Mapping/Copy.cpp
   Mapping/Elementwise.cpp
@@ -29,7 +30,9 @@ add_triton_library(FuriosaCodegen
     MLIRParser
     MLIRPass
     MLIRSCFDialect
+    MLIRSCFUtils
     MLIRSupport
     MLIRTensorDialect
     MLIRTransforms
+    FuriosaTransforms
 )
