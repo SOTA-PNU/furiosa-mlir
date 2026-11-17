@@ -36,6 +36,10 @@ npu stage) against GPU goldens.
   npu3 as on the GPU: a NaN guard runs before the whole-kernel check, at no measured run-time cost (vgg16 3.05 s,
   resnet101 2.21 s either way). Still open: two computed operands (an attention running max) keep the engine's
   NaN-propagating max, and an all-NaN row reduces to -inf (30e9144).
+- Row-wise row tiles run as one device loop (a 1x256x256 cumsum was a 350 KB kernel past furiosa-opt's 128 dynamic
+  indices); the Splitter refuses a step past 256 DMA statements (furiosa-opt's compile time grows superlinearly in
+  them). cumsum and cumprod at 1x256x256, cumprod at 1024 lanes, flip at 4x32x128 and 1x256x256 pass on npu3;
+  the matrix at 8f7ce01 plus this change: 879 of 907 (5a5c85f).
 
 ## 1.1.0 (2026-11-17, release/1.1.0)
 
