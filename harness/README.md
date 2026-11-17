@@ -134,6 +134,30 @@ The compiler must handle Triton code it has never seen, so it may not recognise 
   whether the compiler generalizes. A held-out failure is fixed only by a general mechanism that the
   corpus also exercises; a change that only a held-out case motivates does not count.
 
+## Operator matrix (harness/ops)
+
+The model corpus says whether whole networks run; the operator matrix says which Triton operators,
+dtypes and shapes do, case by case. It follows SOTA-PNU/lowlevel-api-test (default shape [1, 64, 64],
+floats `allclose(rtol=1e-2, atol=1e-2)`, integers exact): 771 cases over
+
+- operators: unary math (abs ... sqrt_rn), binary arithmetic, reductions (sum, max, min, argmax, argmin,
+  xor_sum), scans and orderings (cumsum, cumprod, flip, sort, softmax), casts and constructors, shape ops
+  (trans, reshape, expand_dims, broadcast_to, permute), tl.dot, tensor descriptors, program ids, atomics;
+- dtypes: float32, float16, bfloat16, int32, int8 (float8_e4m3fn for dot); fp16/bf16 math functions
+  compute in fp32, as Triton requires;
+- shapes [B, R, C]: [1, 64, 64], [1, 1, 1024], [4, 32, 128], [2, 7, 33] (masked), [1, 256, 256]; dot
+  [M, N, K] = [64, 64, 64], [16, 64, 32], [128, 256, 64].
+
+```
+compiler/.venv/bin/python -m harness.ops.run --stage raise --jobs 16   # raised IR on the CPU JIT (triage, ~3 min)
+compiler/.venv/bin/python -m harness.ops.run --stage npu --jobs 8      # kernel[grid] on npu3: the verdict
+compiler/.venv/bin/python -m harness.ops.case reduce.argmax.int8.2x7x33 --stage npu   # one case
+```
+
+Each run writes `harness/out/ops/<stage>.{json,md}`: an operator x dtype table and the failures grouped
+by the compiler's diagnostic. At the raise stage every case passes except fp8 dot (the CPU JIT cannot
+lower fp8 conversions; the NPU stage decides) and atomics (not raised yet).
+
 ## Running
 
 ```
