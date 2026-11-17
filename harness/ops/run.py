@@ -9,6 +9,8 @@ harness/out/ops/<stage>.json and <stage>.md: which dtypes, shapes and operators 
 
 import argparse
 import json
+import os
+import signal
 import subprocess
 import sys
 from collections import defaultdict
@@ -22,23 +24,36 @@ OUT = ROOT / "harness" / "out" / "ops"
 COLUMNS = FLOATS + ["int32", "int8", "float8_e4m3fn"]
 
 
+def sh(cmd: list, timeout: int):
+    """(exit code, stdout, stderr), or a None code on timeout. Its own session, killed whole on timeout: a
+    grandchild left running would keep the build lock and stall every later case (it did)."""
+    proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.communicate()
+        return None, "", ""
+    return proc.returncode, out, err
+
+
 def run_case(key: str, stage: str, timeout: int) -> dict:
     # Shared build lock: never load a libtriton that compiler/build.sh is relinking.
     cmd = [str(ROOT / "compiler" / "with-build-lock.sh"), sys.executable, "-m", "harness.ops.case", key, "--stage", stage]
-    try:
-        proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
+    code, out, err = sh(cmd, timeout)
+    if code is None:
         return {"key": key, "status": "ERROR", "detail": f"timed out after {timeout}s"}
-    line = next((l for l in reversed(proc.stdout.splitlines()) if l.startswith('{"key"')), None)
+    line = next((l for l in reversed(out.splitlines()) if l.startswith('{"key"')), None)
     if line:
         result = json.loads(line)
         # The compiler's own diagnostic beats "PassManager::run failed".
-        cause = next((l.split("error: ", 1)[1] for l in proc.stderr.splitlines() if "error: furiosa" in l), None)
+        cause = next((l.split("error: ", 1)[1] for l in err.splitlines() if "error: furiosa" in l), None)
         if result["status"] == "ERROR" and cause:
             result["detail"] = f"{cause} | {result['detail']}"
         return result
-    tail = (proc.stderr.strip().splitlines() or ["no output"])[-1]
-    return {"key": key, "status": "ERROR", "detail": f"exited {proc.returncode}: {tail[:300]}"}
+    tail = (err.strip().splitlines() or ["no output"])[-1]
+    return {"key": key, "status": "ERROR", "detail": f"exited {code}: {tail[:300]}"}
 
 
 def markdown(results: list[dict], stage: str) -> str:

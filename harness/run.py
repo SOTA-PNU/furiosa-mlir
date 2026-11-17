@@ -9,6 +9,7 @@ import fcntl
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -54,11 +55,17 @@ def cargo_env(target: str | None, npu: bool) -> dict:
 
 
 def sh(cmd, cwd, env=None, timeout=3600):
+    # Its own session, killed whole on timeout: a grandchild left running would keep what it holds (the
+    # build lock compiler/with-build-lock.sh takes, say) and stall every other run.
+    proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            start_new_session=True)
     try:
-        proc = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
+        out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.communicate()
         return 124, f"timed out after {timeout}s"
-    return proc.returncode, (proc.stdout + proc.stderr)
+    return proc.returncode, out + err
 
 
 def tail(log: str, n: int = 3) -> str:
