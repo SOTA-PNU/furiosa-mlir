@@ -363,9 +363,12 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
         n.shape = join(n.shape, dag.nodes[arg].shape);
       return dag.add(n);
     };
+    llvm::DenseSet<Value> bad; // values already found unmappable: a DAG revisits them through every user
     std::function<FailureOr<int>(Value)> node = [&](Value v) -> FailureOr<int> {
       if (auto it = scalar.find(v); it != scalar.end())
         return it->second;
+      if (bad.contains(v))
+        return failure();
       llvm::APFloat f(0.0f);
       if (matchPattern(v, m_ConstantFloat(&f))) {
         bool lost;
@@ -391,8 +394,10 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
       }
       if (auto sel = dyn_cast<arith::SelectOp>(op)) {
         auto n = selectNode(sel);
-        if (failed(n))
+        if (failed(n)) {
+          bad.insert(v);
           return failure();
+        }
         return scalar[v] = *n;
       }
       std::string name = llvm::TypeSwitch<Operation *, std::string>(op)
@@ -442,8 +447,10 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
       SmallVector<int> args;
       for (Value o : op->getOperands()) {
         auto a = node(o);
-        if (failed(a))
+        if (failed(a)) {
+          bad.insert(v);
           return failure();
+        }
         args.push_back(*a);
       }
       // Casts: an extension of an input is the f32 fetch; the final truncation is the output cast; an index cast
