@@ -1,6 +1,6 @@
 [project]
 name = "furiosa-mlir"
-version = "0.1.0"
+version = "1.0.0"
 description = "Models written in pure Triton, and their Triton-dialect MLIR, as workloads for the Furiosa MLIR stack"
 requires-python = ">=3.12"
 # Model files and scripts/dump_mlir.py need nothing but Triton.
