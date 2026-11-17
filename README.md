@@ -19,6 +19,7 @@ compiler/.venv/bin/python -m harness.ops.run --stage npu --jobs 8 # the operator
 - `docs/usage.md`: compiling, running and tracing models (`furiosa compile | run | trace`), debugging the stages,
   the binary package (`scripts/package.sh`) and the Docker playground (`docker/`).
 - `playground/`: kernels and a notebook to start from.
+- `CHANGELOG.md`: the versions (releases on `release/X.Y.Z` branches, tagged `vX.Y.Z`; main is the next `.dev0`).
 - `harness/`: the corpus (micro kernels, Triton's own tutorials verbatim, held-out kernels, the models), golden
   data from the GPU, levels L0 (TTIR) to L4 (npu3), and the operator matrix modeled on SOTA-PNU/lowlevel-api-test
   (harness/README.md).
