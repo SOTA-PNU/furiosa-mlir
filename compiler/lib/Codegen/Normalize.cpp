@@ -19,6 +19,7 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Transforms/RegionUtils.h"
 
+#include <cmath>
 #include <map>
 
 using namespace mlir;
@@ -639,23 +640,139 @@ void selectionReductions(ModuleOp module) {
   }
 }
 
-/// Math ops the Vector Engine lacks, in ones it has: fma(a, b, c) = a*b + c (rounded twice) and log2(x) =
-/// ln(x) * log2(e) (within the engine's ln ulp budget, not bit-exact).
+/// A reduction whose combiner the Vector Engine cannot reduce (products, bitwise xor/and/or) becomes a tree of
+/// elementwise ops: its terms over the whole iteration space, then the two halves along the reduced dim combined
+/// until one element is left, combined with the init last. The combiner is associative and commutative, so the
+/// order does not matter (beyond rounding, for products).
+void treeReductions(ModuleOp module) {
+  SmallVector<linalg::GenericOp> generics;
+  module.walk([&](linalg::GenericOp g) { generics.push_back(g); });
+  for (linalg::GenericOp g : generics) {
+    if (g.getNumDpsInits() != 1 || g.getNumReductionLoops() != 1)
+      continue;
+    Block &body = *g.getBody();
+    Value out = body.getArgument(g.getNumDpsInputs());
+    Operation *comb = cast<linalg::YieldOp>(body.getTerminator()).getOperand(0).getDefiningOp();
+    if (!comb || !isa<arith::MulFOp, arith::MulIOp, arith::XOrIOp, arith::AndIOp, arith::OrIOp>(comb) ||
+        !out.hasOneUse() || (comb->getOperand(0) != out && comb->getOperand(1) != out))
+      continue;
+    Value term = comb->getOperand(0) == out ? comb->getOperand(1) : comb->getOperand(0);
+    unsigned r = 0;
+    for (auto [d, it] : llvm::enumerate(g.getIteratorTypesArray()))
+      if (it == utils::IteratorType::reduction)
+        r = d;
+    SmallVector<int64_t> extents = g.getStaticLoopRanges();
+    // shortcut: halves need a power-of-two extent; pad with the combiner's identity to take other extents.
+    if (llvm::any_of(extents, ShapedType::isDynamic) || !llvm::isPowerOf2_64(extents[r]))
+      continue;
+    AffineMap outMap = g.getIndexingMapsArray().back();
+    OpBuilder b(g);
+    Location loc = g.getLoc();
+    MLIRContext *ctx = g.getContext();
+    Type et = getElementTypeOrSelf(g.getResult(0).getType());
+    unsigned rank = extents.size();
+    SmallVector<utils::IteratorType> parallel(rank, utils::IteratorType::parallel);
+    auto combined = [&](OpBuilder &nb, Location l, Value a, Value c) -> Value {
+      IRMapping m;
+      m.map(comb->getOperand(0), a);
+      m.map(comb->getOperand(1), c);
+      return nb.clone(*comb, m)->getResult(0);
+    };
+    // The terms, one per point of the iteration space (laid out in loop order).
+    SmallVector<AffineMap> maps(g.getIndexingMapsArray());
+    maps.back() = AffineMap::getMultiDimIdentityMap(rank, ctx);
+    Value cur = tensor::EmptyOp::create(b, loc, extents, et);
+    auto terms = linalg::GenericOp::create(
+        b, loc, TypeRange{cur.getType()}, g.getDpsInputs(), ValueRange{cur}, maps, parallel,
+        [&](OpBuilder &nb, Location l, ValueRange args) {
+          IRMapping m;
+          for (unsigned i = 0; i < g.getNumDpsInputs(); ++i)
+            m.map(body.getArgument(i), args[i]);
+          for (Operation &op : body.without_terminator())
+            if (&op != comb)
+              nb.clone(op, m);
+          linalg::YieldOp::create(nb, l, m.lookupOrDefault(term));
+        });
+    cur = terms.getResult(0);
+    // Halves combined until one element is left along the reduced dim.
+    AffineMap id = AffineMap::getMultiDimIdentityMap(rank, ctx);
+    for (int64_t len = extents[r]; len > 1; len /= 2) {
+      SmallVector<int64_t> half(extents), at(rank, 0), ones(rank, 1);
+      half[r] = len / 2;
+      auto box = [&]() {
+        return tensor::ExtractSliceOp::create(b, loc, cur, getAsIndexOpFoldResult(ctx, at),
+                                              getAsIndexOpFoldResult(ctx, half), getAsIndexOpFoldResult(ctx, ones))
+            .getResult();
+      };
+      Value lo = box();
+      at[r] = len / 2;
+      Value hi = box();
+      Value into = tensor::EmptyOp::create(b, loc, half, et);
+      cur = linalg::GenericOp::create(b, loc, TypeRange{into.getType()}, ValueRange{lo, hi}, ValueRange{into},
+                                      ArrayRef<AffineMap>{id, id, id}, parallel,
+                                      [&](OpBuilder &nb, Location l, ValueRange args) {
+                                        linalg::YieldOp::create(nb, l, combined(nb, l, args[0], args[1]));
+                                      })
+                .getResult(0);
+    }
+    // The total, combined with the init, over the output's dims.
+    unsigned outRank = outMap.getNumResults();
+    SmallVector<AffineExpr> read;
+    for (unsigned d = 0; d < rank; ++d) {
+      std::optional<unsigned> at = outMap.getResultPosition(getAffineDimExpr(d, ctx));
+      read.push_back(d == r ? getAffineConstantExpr(0, ctx) : getAffineDimExpr(at.value_or(0), ctx));
+    }
+    Value init = g.getDpsInits()[0];
+    Value fresh = tensor::EmptyOp::create(b, loc, cast<RankedTensorType>(init.getType()).getShape(), et);
+    AffineMap outId = AffineMap::getMultiDimIdentityMap(outRank, ctx);
+    auto total = linalg::GenericOp::create(
+        b, loc, TypeRange{init.getType()}, ValueRange{cur, init}, ValueRange{fresh},
+        ArrayRef<AffineMap>{AffineMap::get(outRank, 0, read, ctx), outId, outId},
+        SmallVector<utils::IteratorType>(outRank, utils::IteratorType::parallel),
+        [&](OpBuilder &nb, Location l, ValueRange args) {
+          linalg::YieldOp::create(nb, l, combined(nb, l, args[0], args[1]));
+        });
+    g.getResult(0).replaceAllUsesWith(total.getResult(0));
+    g.erase();
+  }
+}
+
+/// Math ops the Vector Engine lacks, in ones it has: fma(a, b, c) = a*b + c (rounded twice), log2(x) =
+/// ln(x) * log2(e) (within the engine's ln ulp budget, not bit-exact), and floor/ceil from the nearest integer t
+/// (the engine converts to integers rounding to nearest): floor = t - (t > x), ceil = t + (t < x), exact for any
+/// integer t within 1 of x; values beyond 2^(mantissa bits) are integers already and pass through (the
+/// conversion would saturate).
 void expandMath(ModuleOp module) {
   SmallVector<Operation *> ops;
   module.walk([&](Operation *op) {
-    if (isa<math::FmaOp, math::Log2Op>(op) && isa<FloatType>(op->getResult(0).getType()))
+    if (isa<math::FmaOp, math::Log2Op, math::FloorOp, math::CeilOp>(op) && isa<FloatType>(op->getResult(0).getType()))
       ops.push_back(op);
   });
   for (Operation *op : ops) {
     OpBuilder b(op);
     Location loc = op->getLoc();
-    Value v;
-    if (auto fma = dyn_cast<math::FmaOp>(op))
+    auto ft = cast<FloatType>(op->getResult(0).getType());
+    auto constant = [&](double v) { return arith::ConstantOp::create(b, loc, b.getFloatAttr(ft, v)).getResult(); };
+    Value v, x = op->getOperand(0);
+    if (auto fma = dyn_cast<math::FmaOp>(op)) {
       v = arith::AddFOp::create(b, loc, arith::MulFOp::create(b, loc, fma.getA(), fma.getB()), fma.getC());
-    else
-      v = arith::MulFOp::create(b, loc, math::LogOp::create(b, loc, op->getOperand(0)),
-                                arith::ConstantOp::create(b, loc, b.getFloatAttr(op->getResult(0).getType(), 1.4426950408889634)));
+    } else if (isa<math::Log2Op>(op)) {
+      v = arith::MulFOp::create(b, loc, math::LogOp::create(b, loc, x), constant(1.4426950408889634));
+    } else {
+      bool floor = isa<math::FloorOp>(op);
+      using P = arith::CmpFPredicate;
+      Value t = math::RoundOp::create(b, loc, x);
+      // shortcut: the engine compares t with x through t - x, which flushes subnormals, so floor of a negative
+      // subnormal gives -0 (not -1); compare the operands themselves if such inputs matter.
+      Value past = arith::CmpFOp::create(b, loc, floor ? P::OGT : P::OLT, t, x);
+      Value step = arith::SelectOp::create(b, loc, past, constant(1.0), constant(0.0));
+      Value near = floor ? arith::SubFOp::create(b, loc, t, step).getResult()
+                         : arith::AddFOp::create(b, loc, t, step).getResult();
+      double integral = std::ldexp(1.0, int(APFloat::semanticsPrecision(ft.getFloatSemantics())) - 1);
+      Value low = arith::CmpFOp::create(b, loc, P::OLT, x, constant(-integral));
+      Value high = arith::CmpFOp::create(b, loc, P::OGT, x, constant(integral));
+      v = arith::SelectOp::create(b, loc, high, x, arith::SelectOp::create(b, loc, low, x, near));
+    }
     op->getResult(0).replaceAllUsesWith(v);
     op->erase();
   }
@@ -666,6 +783,7 @@ void expandMath(ModuleOp module) {
 void mlir::furiosa::normalizeKernels(ModuleOp module) {
   expandMath(module);
   selectionReductions(module);
+  treeReductions(module);
   copiesToReshapes(module);
   splitLongReductions(module);
   padsToInserts(module);

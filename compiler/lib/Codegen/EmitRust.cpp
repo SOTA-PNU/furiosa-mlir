@@ -319,6 +319,10 @@ FailureOr<std::string> Emitter::chain(Value stream) {
               out << "\n.vector_stash()";
               return success();
             })
+            .Case([&](VectorFpToFxpOp o) {
+              out << "\n.vector_fp_to_fxp(" << o.getIntWidth() << ")";
+              return success();
+            })
             .Case([&](VectorFxpToFpOp o) {
               out << "\n.vector_fxp_to_fp(" << o.getIntWidth() << ")";
               return success();

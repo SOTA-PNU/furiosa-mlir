@@ -587,11 +587,15 @@ void Splitter::run(bool single) {
         Group merged = groups[g];
         bool move = readers.size() == 1 && readers.front() == g;
         if (move) {
+          // An op the consumer recomputed (a dup) moves in as its own: a group holds each op once.
+          llvm::erase_if(merged.dups, [&](Operation *op) { return llvm::is_contained(groups[p].ops, op); });
           llvm::append_range(merged.ops, groups[p].ops);
         } else {
           if (llvm::all_of(groups[p].ops, [&](Operation *op) { return groups[g].contains(op); }))
             continue;
-          llvm::append_range(merged.dups, groups[p].ops);
+          for (Operation *op : groups[p].ops)
+            if (!merged.contains(op))
+              merged.dups.push_back(op);
         }
         for (Operation *op : groups[p].dups)
           if (!merged.contains(op))
@@ -622,6 +626,7 @@ void Splitter::run(bool single) {
           for (Value r : op->getResults())
             consumers(r, readers);
         if (readers.size() == 1 && readers.front() == g) {
+          llvm::erase_if(merged.dups, [&](Operation *op) { return llvm::is_contained(groups[p].ops, op); });
           llvm::append_range(merged.ops, groups[p].ops);
           moved.push_back(p);
         } else {

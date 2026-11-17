@@ -41,7 +41,7 @@ bool isIndexOnly(Value v, Block &body, llvm::DenseMap<Value, bool> &memo) {
       only = op->hasTrait<OpTrait::ConstantLike>(); // a constant captured from outside the generic
     else if (isa<linalg::IndexOp>(op) || op->hasTrait<OpTrait::ConstantLike>())
       only = true;
-    else if (op->getNumRegions() == 0 && op->getNumResults() == 1 && isPure(op))
+    else if (op->getNumRegions() == 0 && op->getNumResults() >= 1 && isPure(op))
       only = llvm::all_of(op->getOperands(), [&](Value o) { return isIndexOnly(o, body, memo); });
   }
   return memo[v] = only;
@@ -128,6 +128,15 @@ private:
             .Case([&](arith::AddIOp) { return I(in[0].i + in[1].i); })
             .Case([&](arith::SubIOp) { return I(in[0].i - in[1].i); })
             .Case([&](arith::MulIOp) { return I(in[0].i * in[1].i); })
+            .Case([&](arith::MulUIExtendedOp) -> FailureOr<Scalar> {
+              // The 2w-bit unsigned product: the low w bits, or (the second result) the high ones.
+              unsigned w = ty(0).getIntOrFloatBitWidth();
+              if (w > 32)
+                return failure();
+              uint64_t mask = w == 32 ? 0xffffffffull : (1ull << w) - 1;
+              uint64_t product = (uint64_t(in[0].i) & mask) * (uint64_t(in[1].i) & mask);
+              return I(int64_t(cast<OpResult>(v).getResultNumber() ? product >> w : product));
+            })
             .Case([&](arith::DivSIOp) -> FailureOr<Scalar> {
               if (!in[1].i)
                 return failure();
@@ -214,6 +223,7 @@ private:
             .Case([&](arith::SelectOp) { return in[0].i ? FailureOr<Scalar>(in[1]) : FailureOr<Scalar>(in[2]); })
             .Case([&](math::FloorOp) { return F(std::floor(in[0].f)); })
             .Case([&](math::CeilOp) { return F(std::ceil(in[0].f)); })
+            .Case([&](math::RoundOp) { return F(std::round(in[0].f)); })
             .Case([&](math::TruncOp) { return F(std::trunc(in[0].f)); })
             .Case([&](math::AbsFOp) { return F(std::fabs(in[0].f)); })
             .Case([&](math::FmaOp) {
@@ -315,16 +325,17 @@ linalg::GenericOp hoist(linalg::GenericOp generic) {
   // (not a constant, not an index unless it only computes data: an index addresses).
   SmallVector<Value> frontier;
   for (Operation &op : body) {
-    if (op.getNumResults() != 1 || op.hasTrait<OpTrait::ConstantLike>() || isa<linalg::IndexOp>(op))
+    if (op.hasTrait<OpTrait::ConstantLike>() || isa<linalg::IndexOp>(op))
       continue;
-    Value v = op.getResult(0);
-    Type t = v.getType();
-    if ((t.isIndex() && !onlyData(v)) || !t.isIntOrIndexOrFloat() || !isIndexOnly(v, body, memo))
-      continue;
-    if (llvm::any_of(v.getUsers(), [&](Operation *user) {
-          return user->getNumResults() != 1 || !isIndexOnly(user->getResult(0), body, memo);
-        }))
-      frontier.push_back(v);
+    for (Value v : op.getResults()) {
+      Type t = v.getType();
+      if ((t.isIndex() && !onlyData(v)) || !t.isIntOrIndexOrFloat() || !isIndexOnly(v, body, memo))
+        continue;
+      if (llvm::any_of(v.getUsers(), [&](Operation *user) {
+            return user->getNumResults() == 0 || !isIndexOnly(user->getResult(0), body, memo);
+          }))
+        frontier.push_back(v);
+    }
   }
   if (frontier.empty())
     return generic;

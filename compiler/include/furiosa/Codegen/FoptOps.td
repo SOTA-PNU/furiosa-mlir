@@ -398,6 +398,13 @@ def Fopt_VectorFxpToFpOp : Fopt_StageOp<"vector_fxp_to_fp"> {
   let assemblyFormat = "$input `,` $int_width attr-dict `:` qualified(type($input)) `->` qualified(type($result))";
 }
 
+def Fopt_VectorFpToFxpOp : Fopt_StageOp<"vector_fp_to_fxp"> {
+  let summary = ".vector_fp_to_fxp(int_width) (f32 to i32 fixed point with 31 - int_width fraction bits, rounding to "
+                "nearest, ties away from zero, saturating; 31: integers)";
+  let arguments = (ins Fopt_Stream:$input, I32Attr:$int_width);
+  let assemblyFormat = "$input `,` $int_width attr-dict `:` qualified(type($input)) `->` qualified(type($result))";
+}
+
 def Fopt_VectorFxpOp : Fopt_StageOp<"vector_fxp"> {
   let summary = ".vector_fxp(FxpBinaryOp::<op>, imm) (an i32 ALU op with an immediate)";
   let arguments = (ins Fopt_Stream:$input, StrAttr:$op, I32Attr:$imm);

@@ -356,6 +356,11 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
     Value acc = body.getArgument(g.getNumDpsInputs());
     std::function<FailureOr<int>(arith::SelectOp)> selectNode;
     std::function<FailureOr<int>(arith::SelectOp, arith::CmpIOp)> intSelectNode;
+    auto addSelect = [&](Node n) -> int {
+      for (int arg : n.args)
+        n.shape = join(n.shape, dag.nodes[arg].shape);
+      return dag.add(n);
+    };
     std::function<FailureOr<int>(Value)> node = [&](Value v) -> FailureOr<int> {
       if (auto it = scalar.find(v); it != scalar.end())
         return it->second;
@@ -417,6 +422,7 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
                              .Case<arith::OrIOp>([](auto) { return "ori"; })
                              .Case<math::AbsIOp>([](auto) { return "absi"; })
                              .Case<arith::IndexCastOp>([](auto) { return "ext"; })
+                             .Case<math::RoundOp>([](math::RoundOp r) { return r.getType().isF32() ? "round" : ""; })
                              .Case<arith::SIToFPOp>([](arith::SIToFPOp c) {
                                return c.getIn().getType().isInteger(32) && c.getType().isF32() ? "itof" : "";
                              })
@@ -440,6 +446,16 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
       // keeps an i32's value.
       if (name == "ext" || name == "trunc")
         return scalar[v] = args[0];
+      // round(x) = the integer nearest x (ties away from zero) back in f32: the Vector Engine's conversions.
+      if (name == "round") {
+        Node toInt{Node::Op};
+        toInt.op = "ftoi";
+        toInt.integer = true;
+        toInt.args = args;
+        toInt.shape = dag.nodes[args[0]].shape;
+        name = "itof";
+        args = {dag.add(toInt)};
+      }
       // 2^x = e^(x ln 2): the Vector Engine has e^x (within its ulp budget, not bit-exact to exp2).
       if (name == "exp2") {
         Node ln2{Node::Const};
@@ -508,9 +524,7 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
         return failure();
       }
       n.args = {key, *a, *f};
-      for (int arg : n.args)
-        n.shape = join(n.shape, dag.nodes[arg].shape);
-      return dag.add(n);
+      return addSelect(n);
     };
     // select(x <pred> y, a, b) on i32s: the tag unit compares i32 keys exactly, x against a constant y, else
     // x - y against 0; >=, <= and != take the other branch of <, > and ==.
@@ -550,9 +564,7 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
       }
       n.cmp = (pred == P::sgt ? "Greater(" : pred == P::slt ? "Less(" : "Equal(") + std::to_string(bound) + "i32)";
       n.args = {key, *a, *f};
-      for (int arg : n.args)
-        n.shape = join(n.shape, dag.nodes[arg].shape);
-      return dag.add(n);
+      return addSelect(n);
     };
     Value yielded = cast<linalg::YieldOp>(body.getTerminator()).getOperand(0);
     int result;
@@ -696,7 +708,9 @@ void rewriteSigmoid(Dag &dag) {
 }
 
 /// A planned VE op: its stage, the ALU it takes, and how it reads its other operand.
-enum Stage { Tag = 0, Logic = 1, Fxp = 2, FxpToFp = 3, Narrow = 4, Fp = 5, Reduce = 6, FpDiv = 7, Widen = 8, Clip = 10 };
+enum Stage {
+  Tag = 0, Logic = 1, Fxp = 2, FxpToFp = 3, Narrow = 4, Fp = 5, Reduce = 6, FpDiv = 7, Widen = 8, FpToFxp = 9, Clip = 10
+};
 
 class Planner {
 public:
@@ -1084,7 +1098,7 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
     int need;            // stage
     bool needWay4 = true;
     std::string alu, veOp;
-    enum { FpBinary, FpUnary, Div, ClipBin, ReduceOp, FpZip, ClipZip, Select, EqKey, IntOp, IntZip, AbsI, IToF } form;
+    enum { FpBinary, FpUnary, Div, ClipBin, ReduceOp, FpZip, ClipZip, Select, EqKey, IntOp, IntZip, AbsI, IToF, FToI } form;
     std::string method; // IntOp, IntZip: the furiosa-opt method
     float negImm = 0;
     // i32 ops: add, sub and mul in the fixed-point stage (an add in the clip stage once past it), max and min in
@@ -1110,6 +1124,8 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
                (dag.nodes[st.operand].kind != Node::Const && !dag.nodes[st.operand].integer))
         return fail(func, "an i32 '" + op + "' whose other operand is neither an immediate nor an i32 value"),
                failure();
+    } else if (op == "ftoi") {
+      need = FpToFxp, needWay4 = false, alu = "FpToFxp", form = FToI;
     } else if (op == "itof") {
       need = FxpToFp, needWay4 = false, alu = "FxpToFp", form = IToF;
     } else if (op == "absi") {
@@ -1200,7 +1216,7 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
     Value vrf;
     UnitAttr stash;
     if (form != ReduceOp && form != FpUnary && form != FpZip && form != ClipZip && form != Select && form != EqKey &&
-        form != IntZip && form != AbsI && form != IToF && !(op == "neg")) {
+        form != IntZip && form != AbsI && form != IToF && form != FToI && !(op == "neg")) {
       operandOf(st, imm, vrf, stash);
       if (clipSub)
         imm = b.getF32FloatAttr(-dag.nodes[st.operand].value);
@@ -1227,6 +1243,11 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
       // An i32 is a fixed-point value with no fraction bits (integer width 31).
       s = VectorReinterpretOp::create(b, loc, stream(IntegerType::get(ctx, 32), time(), packet()), s);
       s = VectorFxpToFpOp::create(b, loc, stream(f32(), time(), packet()), s, b.getI32IntegerAttr(31));
+      break;
+    case FToI:
+      // Rounds to the nearest integer (ties away from zero), saturating; the bits ride on as f32.
+      s = VectorFpToFxpOp::create(b, loc, stream(IntegerType::get(ctx, 32), time(), packet()), s, b.getI32IntegerAttr(31));
+      s = VectorReinterpretOp::create(b, loc, stream(f32(), time(), packet()), s);
       break;
     case IntOp:
     case IntZip:
@@ -1547,9 +1568,10 @@ bool regroup(Dag &dag) {
         return n.kind == Node::Const || (n.shape == Shape::Full && (n.kind != Node::Input || n.rows == allRows));
       }))
     return false;
-  // Each input may be a VRF operand of some pass: rows short enough for all of them at once.
-  int64_t inputs = llvm::count_if(dag.nodes, [](const Node &n) { return n.kind == Node::Input; });
-  int64_t kRow = std::min<int64_t>(1024, kVrfBytes / 4 / std::max<int64_t>(inputs, 2) / 16 * 16);
+  // Each input, and a select's computed operand, may be a VRF operand of some pass: rows short enough for all of
+  // them at once.
+  int64_t operands = llvm::count_if(dag.nodes, [](const Node &n) { return n.kind == Node::Input || n.op == "select"; });
+  int64_t kRow = std::min<int64_t>(1024, kVrfBytes / 4 / std::max<int64_t>(operands, 2) / 16 * 16);
   int64_t total = dag.r * dag.h;
   for (int64_t h = std::min(total, kRow); h >= 16 && (dag.h > kRow || dag.h % 16); --h)
     if (total % h == 0 && h % 16 == 0) {

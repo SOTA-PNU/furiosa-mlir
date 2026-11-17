@@ -723,6 +723,14 @@ LogicalResult VectorFxpToFpOp::verify() {
   return verifySamePlacement(*this, getInput().getType(), getResult().getType());
 }
 
+LogicalResult VectorFpToFxpOp::verify() {
+  if (!getInput().getType().getElementType().isF32() || !getResult().getType().getElementType().isInteger(32))
+    return emitOpError("converts an f32 stream to i32");
+  if (getIntWidth() < 0 || getIntWidth() > 31)
+    return emitOpError("an integer width within [0, 31]");
+  return verifySamePlacement(*this, getInput().getType(), getResult().getType());
+}
+
 LogicalResult VectorFxpOp::verify() {
   if (failed(verifyOpName(*this, getOp(), kFxpOps)))
     return failure();
