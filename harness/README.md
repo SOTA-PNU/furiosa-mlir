@@ -65,8 +65,9 @@ L1 is two checks, both required:
 
 For the fp32 models, the NPU tolerance is measured, not chosen: twice the logit drift of the same
 Triton graph run entirely in bf16 on the GPU (recorded in `registry.py`), plus the top-1 class must be
-unchanged (`top1`). Qwen3 is a bf16 graph; its NPU tolerance equals its graph-level L1 tolerance and its
-greedy `next_token` must match exactly (integers are always exact).
+unchanged (`top1`). Qwen3 is a bf16 graph: its NPU tolerance is twice the drift between two correct implementations of
+the same graph (L1's CPU JIT against the GPU golden, 2.7%), and its greedy `next_token` must match
+exactly (integers are always exact).
 
 The Vector Engine's own arithmetic is measured, not assumed: `harness/characterize/` is a furiosa-opt crate that
 runs every f32 unary function of the Vector Engine over fixed input ranges on npu3 and compares with an f64
