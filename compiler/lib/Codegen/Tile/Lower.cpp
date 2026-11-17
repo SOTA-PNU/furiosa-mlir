@@ -694,8 +694,15 @@ LogicalResult Lowering::planLayout() {
         break;
       }
   colPad = roundUp(colLocalSize, kLanes);
-  // DMA rows to DM are whole 8-byte units: bf16 needs four live columns per unit.
-  bool bf16 = p.outType.isBF16() || llvm::any_of(p.reads, [](const Read &r) { return r.type.isBF16(); });
+  // DMA rows to DM are whole 8-byte units: bf16 needs four live columns per unit, in the output and in the reads
+  // tiles hold column-innermost (contraction operands keep K innermost).
+  auto kInner = [&](unsigned r) {
+    return gemm && (r == gemm->stream || r == gemm->trf || llvm::is_contained(gemm->streamExtras, r) ||
+                    llvm::is_contained(gemm->trfExtras, r));
+  };
+  bool bf16 = p.outType.isBF16();
+  for (auto [i, r] : llvm::enumerate(p.reads))
+    bf16 |= r.type.isBF16() && !kInner(i);
   if (bf16 && colLocalSize % 4)
     return fail(std::to_string(colLocalSize) + " bf16 columns per slice (DMA rows are 8-byte units)");
   int64_t blocks = (c + colLocalSize - 1) / colLocalSize;
