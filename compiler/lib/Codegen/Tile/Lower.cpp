@@ -714,9 +714,21 @@ LogicalResult Lowering::planLayout() {
   colLocalD = Digit{*col, 1, colLocalSize, colExtent};
   int64_t rowSlices = kSlices / int64_t(llvm::PowerOf2Ceil(blocks));
 
-  // Rows: slices first (as many as the rows allow), local digits up to the DM budget, then tiles.
+  // Rows: slices first (as many as the rows allow), local digits up to the DM budget, then tiles. A tile the
+  // Vector Engine reduces holds the reduction's extent per row.
+  int64_t reduced = 1;
+  for (auto [i, n] : llvm::enumerate(p.nodes))
+    if (n.kind == Node::Reduce && !(gemm && i == gemm->node)) {
+      int64_t size = 1;
+      for (unsigned a : std::get<1>(flatReduce(p, i)))
+        size *= p.axes[a].size;
+      reduced = std::max(reduced, size);
+    }
   SmallVector<Digit> rowTiles;
-  assignRows(rowSlices, 4 * colPad * 4 + (gemm ? 4 * kTile : 0), localD, sliceD, rowTiles);
+  int64_t tiles = assignRows(rowSlices, 4 * colPad * 4 * reduced + (gemm ? 4 * kTile : 0), localD, sliceD, rowTiles);
+  // Each tile is a pass sequence of its own in the kernel.
+  if (tiles > kSlices)
+    return fail(std::to_string(tiles) + " row tiles (rows that split into no slices or local digits that fit DM)");
   llvm::append_range(tileD, rowTiles);
   return success();
 }
