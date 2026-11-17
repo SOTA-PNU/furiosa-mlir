@@ -121,6 +121,8 @@ private:
   LogicalResult findGemm();
   LogicalResult tryGemm(unsigned node);
   LogicalResult planLayout();
+  int64_t assignRows(int64_t rowSlices, int64_t perRow, SmallVector<Digit> &local, SmallVector<Digit> &slice,
+                     SmallVector<Digit> &tile);
   LogicalResult declare();
 
   // Mappings.
@@ -463,14 +465,20 @@ LogicalResult Lowering::planLayout() {
     rows = gemm->m;
     col = gemm->n[0];
   } else {
-    // The column: the output axis contiguous in the most reads, else the innermost output axis.
+    // The column: the output axis contiguous (stride 1) in the most reads, else the innermost output axis; an
+    // even one, since DMA rows are 8-byte units.
     std::map<unsigned, int> votes;
     for (const Read &r : p.reads)
-      if (!r.index.empty() && r.index.back().terms.size() == 1 && r.index.back().terms[0].second == 1)
-        ++votes[r.index.back().terms[0].first];
+      if (!r.index.empty())
+        for (auto [a, c] : r.index.back().terms)
+          if (c == 1)
+            ++votes[a];
     unsigned best = p.out.back();
+    for (unsigned a : p.out)
+      if (p.axes[best].size % 2 && !(p.axes[a].size % 2))
+        best = a;
     for (auto [a, v] : votes)
-      if (llvm::is_contained(p.out, a) && v > votes[best])
+      if (llvm::is_contained(p.out, a) && !(p.axes[a].size % 2) && (v > votes[best] || p.axes[best].size % 2))
         best = a;
     col = best;
     for (unsigned a : p.out)
@@ -509,24 +517,36 @@ LogicalResult Lowering::planLayout() {
     // K tiles and columns per slice: the largest K tile (a multiple of 32 dividing K) for which some whole number
     // of lane groups dividing the columns fits a TRF lane (groups x tile bf16) on at most 256 column blocks.
     // K tiles beyond the first accumulate through a Vector Engine add.
+    // Among the K tiles (multiples of 32 dividing K) and lane-group widths that fit a TRF lane on at most 256
+    // column blocks, the one with the fewest passes: row tiles x (K tiles + their adds + the epilogue).
     int64_t kf = kl.size();
     colLocalSize = 0;
-    for (int64_t t = kf; t >= 32 && !colLocalSize; t -= 32) {
+    int64_t bestCost = INT64_MAX;
+    for (int64_t t = kf; t >= 32; t -= 32) {
       if (kf % t)
         continue;
       int64_t maxGroups = kTrfLaneBytes / (2 * t);
       if (maxGroups < 1)
         continue;
+      SmallVector<int64_t> widths;
       if (c % kLanes == 0) {
         for (int64_t g = std::min(maxGroups, c / kLanes); g >= 1; --g)
-          if ((c / kLanes) % g == 0 && c / (g * kLanes) <= kSlices) {
-            colLocalSize = g * kLanes;
-            kTile = t;
-            break;
-          }
+          if ((c / kLanes) % g == 0 && c / (g * kLanes) <= kSlices)
+            widths.push_back(g * kLanes);
       } else {
-        kTile = t; // one lane group: up to 8 columns per slice
-        break;
+        widths.push_back(0); // decided below: at most one lane group per slice
+      }
+      for (int64_t w : widths) {
+        int64_t blocks = w ? c / w : 1;
+        SmallVector<Digit> l, sl, tl;
+        int64_t tiles = assignRows(kSlices / int64_t(llvm::PowerOf2Ceil(blocks)),
+                                   4 * roundUp(std::max<int64_t>(w, 8), kLanes) * 4 + 4 * t, l, sl, tl);
+        int64_t cost = tiles * (2 * (kf / t) + 2);
+        if (cost < bestCost) {
+          bestCost = cost;
+          kTile = t;
+          colLocalSize = w;
+        }
       }
     }
     if (!colLocalSize && c % kLanes == 0) {
@@ -584,7 +604,16 @@ LogicalResult Lowering::planLayout() {
   int64_t rowSlices = kSlices / int64_t(llvm::PowerOf2Ceil(blocks));
 
   // Rows: slices first (as many as the rows allow), local digits up to the DM budget, then tiles.
-  int64_t perRow = 4 * colPad * 4 + (gemm ? 4 * kTile : 0);
+  SmallVector<Digit> rowTiles;
+  assignRows(rowSlices, 4 * colPad * 4 + (gemm ? 4 * kTile : 0), localD, sliceD, rowTiles);
+  llvm::append_range(tileD, rowTiles);
+  return success();
+}
+
+/// Splits the rows into local digits (up to the DM budget), slice digits (up to `rowSlices`, inner ones counted as
+/// powers of two) and tile digits; returns the number of row tiles.
+int64_t Lowering::assignRows(int64_t rowSlices, int64_t perRow, SmallVector<Digit> &local,
+                            SmallVector<Digit> &slice, SmallVector<Digit> &tile) {
   int64_t maxLocal = std::max<int64_t>(1, kDmBudget / perRow);
   int64_t total = 1;
   for (unsigned a : rows)
@@ -596,24 +625,24 @@ LogicalResult Lowering::planLayout() {
   SmallVector<Cursor> cur;
   for (unsigned a : rows)
     cur.push_back({a, 1, p.axes[a].size});
-  int64_t local = 1;
-  SmallVector<Digit> got;
+  int64_t have = 1;
+  local.clear();
   for (int i = cur.size() - 1; i >= 0; --i) {
     Cursor &cu = cur[i];
-    if ((total + local - 1) / local <= rowSlices || local >= maxLocal)
+    if ((total + have - 1) / have <= rowSlices || have >= maxLocal)
       break;
-    int64_t need = (total / local + rowSlices - 1) / rowSlices;
+    int64_t need = (total / have + rowSlices - 1) / rowSlices;
     int64_t d = 0;
-    if (cu.left <= std::min(need, maxLocal / local))
+    if (cu.left <= std::min(need, maxLocal / have))
       d = cu.left;
     else {
-      for (int64_t x = need; x <= cu.left && local * x <= maxLocal; ++x)
+      for (int64_t x = need; x <= cu.left && have * x <= maxLocal; ++x)
         if (cu.left % x == 0) {
           d = x;
           break;
         }
       if (!d)
-        for (int64_t x = std::min(cu.left, maxLocal / local); x > 1; --x)
+        for (int64_t x = std::min(cu.left, maxLocal / have); x > 1; --x)
           if (cu.left % x == 0) {
             d = x;
             break;
@@ -621,17 +650,15 @@ LogicalResult Lowering::planLayout() {
     }
     if (d <= 1)
       break;
-    got.push_back({cu.axis, cu.place, d});
-    local *= d;
+    local.push_back({cu.axis, cu.place, d});
+    have *= d;
     cu.place *= d;
     cu.left /= d;
     if (cu.left > 1)
       break;
   }
-  std::reverse(got.begin(), got.end());
-  localD = got;
-  got.clear();
-  // Slice digits, innermost first; each one taken counts as a power of two (it may end up inside another).
+  std::reverse(local.begin(), local.end());
+  slice.clear();
   int64_t slices = 1;
   for (int i = cur.size() - 1; i >= 0; --i) {
     Cursor &cu = cur[i];
@@ -645,19 +672,22 @@ LogicalResult Lowering::planLayout() {
       }
     if (d <= 1)
       break;
-    got.push_back({cu.axis, cu.place, d});
+    slice.push_back({cu.axis, cu.place, d});
     slices *= int64_t(llvm::PowerOf2Ceil(d));
     cu.place *= d;
     cu.left /= d;
     if (cu.left > 1)
       break;
   }
-  std::reverse(got.begin(), got.end());
-  sliceD = got;
+  std::reverse(slice.begin(), slice.end());
+  tile.clear();
+  int64_t tiles = 1;
   for (const Cursor &cu : cur)
-    if (cu.left > 1)
-      tileD.push_back({cu.axis, cu.place, cu.left});
-  return success();
+    if (cu.left > 1) {
+      tile.push_back({cu.axis, cu.place, cu.left});
+      tiles *= cu.left;
+    }
+  return tiles;
 }
 
 LogicalResult Lowering::plan() {
