@@ -9,6 +9,7 @@ import fcntl
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -112,7 +113,10 @@ def executable(launch: Launch) -> tuple[Path, Path]:
                              if line.startswith("{") and '"executable":"' in line.replace(" ", "")), None)
             if proc.returncode or not uplifted:
                 raise RuntimeError(f"{launch.kernel.__name__}: NPU build failed:\n{proc.stderr[-2000:]}")
-            exe = deps_binary(Path(uplifted))
+            # A copy of its own: every specialization's crate has the kernel's name and is its own workspace,
+            # so cargo gives them all one deps/run_graph-<hash> name, which the next build overwrites.
+            exe = work / "run_graph"
+            shutil.copy2(deps_binary(Path(uplifted)), exe)
         record.write_text(str(exe))
         return exe, work
 
