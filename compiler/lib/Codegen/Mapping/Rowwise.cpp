@@ -65,7 +65,8 @@ struct Node {
   Type type;               // Input: the buffer's element type
   unsigned rows = 0;       // Input: the row dims it varies along (bit i: row dim i), broadcast along the others
   bool col = false;        // Input: whether it varies along the columns
-  float value = 0;         // Const
+  float value = 0;         // Const; a padded Input: the fill past its live columns (an i32 one, its bits)
+  int64_t live = 0;        // Input: the columns its buffer holds when a pad fills the rest (0: all of them)
   std::string op;          // Op: add, sub, mul, div, max, min, exp, sqrt, neg, select, eqkey, ...; Reduce: Add, Max,
                            // Min, MinI, MaxI (i32)
   std::string cmp;         // Op select: the tag comparison its key (args[0]) passes where it takes args[1]
@@ -90,7 +91,8 @@ struct Dag {
   int add(Node n) {
     std::string key = std::to_string(int(n.kind)) + "|" + std::to_string(n.arg) + "|" +
                       std::to_string(llvm::bit_cast<uint32_t>(n.value)) + "|" + n.op + "|" + n.cmp + "|" + std::to_string(int(n.shape)) +
-                      "|" + std::to_string(n.rows) + "|" + std::to_string(n.col) + "|" + std::to_string(n.integer);
+                      "|" + std::to_string(n.rows) + "|" + std::to_string(n.col) + "|" + std::to_string(n.integer) +
+                      "|" + std::to_string(n.live);
     for (int a : n.args)
       key += "," + std::to_string(a);
     if (auto it = interned.find(key); it != interned.end())
@@ -162,10 +164,12 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
   SmallVector<int64_t> tileShape(full.getShape());
   if (dag.tileStep)
     tileShape[dag.tileDim] = dag.tileStep;
+  // Unit dims aside (a reduction to a scalar stored as [1], through a cast).
+  auto live = [](ArrayRef<int64_t> shape) { return llvm::to_vector(llvm::make_filter_range(shape, [](int64_t e) { return e != 1; })); };
   linalg::GenericOp reducer;
   for (auto g : body->getOps<linalg::GenericOp>())
     if (!reducer && g.getNumReductionLoops() == 1 &&
-        cast<RankedTensorType>(g.getResultTypes()[0]).getShape() == ArrayRef<int64_t>(tileShape))
+        live(cast<RankedTensorType>(g.getResultTypes()[0]).getShape()) == live(tileShape))
       reducer = g;
   bool sameShapes = llvm::all_of(results, [&](Value v) { return v.getType() == results[0].getType(); });
   bool onlyRows = sameShapes && reducer;
@@ -292,8 +296,36 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
       }
       t = slice.getSource();
     }
+    // A buffer padded past its last column with a constant (a masked load's `other`): the columns it holds, the rest
+    // filled when its rows are staged.
+    int64_t live = 0;
+    float fill = 0;
+    if (auto pad = t.getDefiningOp<tensor::PadOp>(); pad && read->col && pad.getConstantPaddingValue()) {
+      int64_t last = pad.getSourceType().getRank() - 1;
+      bool tail = llvm::all_of(pad.getStaticLow(), [](int64_t l) { return l == 0; });
+      for (auto [d, h] : llvm::enumerate(pad.getStaticHigh()))
+        tail &= int64_t(d) == last ? h > 0 && !ShapedType::isDynamic(h) : h == 0;
+      llvm::APFloat f(0.0f);
+      APInt i;
+      Value c = pad.getConstantPaddingValue();
+      if (tail && matchPattern(c, m_ConstantFloat(&f))) {
+        bool lost;
+        f.convert(llvm::APFloat::IEEEsingle(), llvm::APFloat::rmNearestTiesToEven, &lost);
+        fill = f.convertToFloat();
+      } else if (tail && matchPattern(c, m_ConstantInt(&i)) && i.getBitWidth() == 32) {
+        fill = llvm::bit_cast<float>(uint32_t(i.getZExtValue()));
+      } else {
+        tail = false;
+      }
+      if (tail) {
+        live = pad.getSourceType().getDimSize(last);
+        t = pad.getSource();
+      }
+    }
     if (auto arg = dyn_cast<BlockArgument>(t); arg && arg.getOwner() == &func.getBody().front()) {
       Node n{Node::Input};
+      n.live = live;
+      n.value = fill;
       n.shape = *shape;
       n.arg = arg.getArgNumber();
       n.type = cast<RankedTensorType>(t.getType()).getElementType();
@@ -476,6 +508,10 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
                                           : "";
                              })
                              .Case<math::RoundOp>([](math::RoundOp r) { return r.getType().isF32() ? "round" : ""; })
+                             // An integral f32 (rounded) converts to its i32 exactly whichever way it rounds.
+                             .Case<arith::FPToSIOp>([](arith::FPToSIOp c) {
+                               return c.getIn().getDefiningOp<math::RoundOp>() && c.getIn().getType().isF32() ? "ftoi" : "";
+                             })
                              .Case<arith::SIToFPOp>([](arith::SIToFPOp c) {
                                return c.getIn().getType().isInteger(32) && c.getType().isF32() ? "itof" : "";
                              })
@@ -804,9 +840,9 @@ private:
   /// move it as the view holds it: a row value (its f32 padded to 8 bytes) or rows padded to whole packets. The
   /// view's rows (a tile's padding dropped), then the DM element; byte-granular HBM-to-HBM copies fill and drain
   /// it. Null when the view moves directly.
-  MapAttr scratchMap(MapAttr viewMap, bool col);
+  MapAttr scratchMap(MapAttr viewMap, bool col, MapAttr held = {}, Type et = {});
   /// The columns of a padded scratch's view (of mapping `staged`), the part a copy to or from HBM moves.
-  Value interior(Value scratchView, MapAttr staged, bool mut);
+  Value interior(Value scratchView, MapAttr staged, bool mut, MapAttr live = {});
   /// The DM element of an input: the columns, or a row value's padded f32.
   MapAttr inputElement(const Node &n) { return n.col ? H : rowPacket(2); }
   /// An input's DmTensor from (a view of) its HBM tensor, through a padded scratch when it needs one.
@@ -1408,16 +1444,26 @@ LogicalResult Planner::declare(func::FuncOp func, ArrayRef<int64_t> written) {
   // Rows move in packets of 8 f32 (16 bf16): a row length that is not a multiple of 16 pads to one. Copies move and
   // stores write the columns alone, so only a reduction reads the padding: a float input it reduces directly pads
   // with the reduction's identity.
-  bool pad = dag.h % 16 && dag.h != 1;
+  bool pad = dag.h % 16;
+  // A padded read (a buffer holding fewer columns) fills the rest with its pad.
+  for (auto [i, n] : llvm::enumerate(dag.nodes))
+    if (n.kind == Node::Input && n.live) {
+      if (tiled())
+        return fail(func, "a padded read in row tiles"); // shortcut: tile the live columns too when a case needs it
+      padFill[i] = n.value;
+    }
   for (const Node &n : dag.nodes) {
     if (!pad || n.kind != Node::Reduce)
       continue;
     int in = n.args[0];
-    float id = n.op == "Add" ? 0.0f : n.op == "Max" ? -INFINITY : INFINITY;
-    // shortcut: i32 reductions and reductions of computed values over padded rows are refused (an i32 fill needs an
-    // i32 memset; a computed value's padding is not its input's); pad those with a masked stream when a case needs it.
-    if (n.integer || dag.nodes[in].kind != Node::Input || (padFill.count(in) && padFill[in] != id))
-      return fail(func, "a reduction over padded rows of a value other than a float input");
+    auto bits = [](int32_t v) { return llvm::bit_cast<float>(v); };
+    float id = n.op == "Add" ? 0.0f : n.op == "Max" ? -INFINITY : n.op == "Min" ? INFINITY : n.op == "AddI" ? 0.0f
+               : n.op == "MaxI" ? bits(INT32_MIN) : bits(INT32_MAX);
+    // shortcut: reductions of computed values over padded rows are refused (a computed value's padding is not its
+    // input's); pad those with a masked stream when a case needs it.
+    if (dag.nodes[in].kind != Node::Input ||
+        (padFill.count(in) && llvm::bit_cast<uint32_t>(padFill[in]) != llvm::bit_cast<uint32_t>(id)))
+      return fail(func, "a reduction over padded rows of a value other than an input (or padded otherwise)");
     padFill[in] = id;
   }
   // A row axis per row dim of more than one row (a single row keeps one axis of one), and the column axis.
@@ -1459,8 +1505,6 @@ LogicalResult Planner::declare(func::FuncOp func, ArrayRef<int64_t> written) {
   for (auto [k, outType] : llvm::enumerate(dag.outTypes)) {
     if (!outType.isBF16() && !outType.isF32() && !outType.isInteger(32))
       return fail(func, "the outputs must be bf16, f32 or i32");
-    if (rootRow(k) && outType.isBF16())
-      return fail(func, "a row value is stored as f32 or i32");
     if (tiled())
       outParams.push_back(kb.inout(written[k], outType, outMap(rootRow(k))));
     else
@@ -1487,7 +1531,7 @@ MapAttr Planner::inputMap(const Node &n) {
     if (d >= 0 && (n.rows >> d) & 1)
       parts.push_back(axis);
   if (n.col)
-    parts.push_back(columns);
+    parts.push_back(n.live ? H.resize(n.live) : columns);
   return MapAttr::pair(ctx, parts);
 }
 
@@ -1495,7 +1539,8 @@ Value Planner::loadInput(const Node &n, Value hbmView, MapAttr viewMap) {
   OpBuilder &b = kb.builder();
   Location loc = kb.loc();
   DmTensorType dm = kb.dmType(n.type, slice, inputElement(n));
-  MapAttr staged = scratchMap(viewMap, n.col);
+  MapAttr live = n.live ? H.resize(n.live) : columns;
+  MapAttr staged = scratchMap(viewMap, n.col, live);
   if (!staged)
     return ViewToDmOp::create(b, loc, dm, hbmView);
   Value scratch = AllocHbmOp::create(b, loc, kb.hbmType(n.type, staged));
@@ -1507,24 +1552,26 @@ Value Planner::loadInput(const Node &n, Value hbmView, MapAttr viewMap) {
     MemsetOp::create(b, loc, fill, b.getF32FloatAttr(it->second));
     DmToHbmViewOp::create(b, loc, fill, ViewOp::create(b, loc, into.getType(), scratch));
   }
-  HbmToHbmViewOp::create(b, loc, hbmView, n.col ? interior(into, staged, true) : into);
+  HbmToHbmViewOp::create(b, loc, hbmView, n.col ? interior(into, staged, true, live) : into);
   return ToDmOp::create(b, loc, dm, scratch);
 }
 
-Value Planner::interior(Value scratchView, MapAttr staged, bool mut) {
+Value Planner::interior(Value scratchView, MapAttr staged, bool mut, MapAttr live) {
+  if (!live)
+    live = columns;
   SmallVector<MapAttr> parts;
   for (Attribute a : staged.getKind() == MapKind::Pair ? staged.getOperands() : ArrayRef<Attribute>(staged))
     parts.push_back(cast<MapAttr>(a));
-  parts.back() = columns.padTo(H.size(), mut ? PadKind::Bottom : PadKind::Top);
+  parts.back() = live.padTo(H.size(), mut ? PadKind::Bottom : PadKind::Top);
   auto t = cast<HbmViewType>(scratchView.getType());
   return TileOp::create(kb.builder(), kb.loc(),
                         HbmViewType::get(ctx, t.getElementType(), t.getChip(), MapAttr::pair(ctx, parts), mut),
-                        scratchView, H, kb.builder().getI64IntegerAttr(columns.size()),
+                        scratchView, H, kb.builder().getI64IntegerAttr(live.size()),
                         kb.builder().getI64IntegerAttr(0));
 }
 
-MapAttr Planner::scratchMap(MapAttr viewMap, bool col) {
-  if (col && H == columns)
+MapAttr Planner::scratchMap(MapAttr viewMap, bool col, MapAttr held, Type et) {
+  if (col && H == (held ? held : columns))
     return {};
   SmallVector<MapAttr> live;
   for (Attribute a : viewMap.getKind() == MapKind::Pair ? viewMap.getOperands() : ArrayRef<Attribute>(viewMap)) {
@@ -1533,7 +1580,7 @@ MapAttr Planner::scratchMap(MapAttr viewMap, bool col) {
   }
   if (col)
     live.pop_back(); // the columns, whole packets in the scratch
-  live.push_back(col ? H : rowPacket(2));
+  live.push_back(col ? H : rowPacket(et && et.isBF16() ? 4 : 2)); // a row value: one 8-byte unit
   return MapAttr::pair(ctx, live);
 }
 
@@ -1541,7 +1588,7 @@ void Planner::storeOutput(size_t k, Value dm, Value hbmView, MapAttr viewMap) {
   OpBuilder &b = kb.builder();
   Location loc = kb.loc();
   Type et = dag.outTypes[k];
-  MapAttr staged = scratchMap(viewMap, !rootRow(k));
+  MapAttr staged = scratchMap(viewMap, !rootRow(k), {}, et);
   if (!staged) {
     DmToHbmViewOp::create(b, loc, dm, hbmView);
     return;
@@ -1688,6 +1735,16 @@ bool regroup(Dag &dag) {
           n.rows = dag.r > 1 ? 1 : 0;
       return true;
     }
+  // A single column (a halving tree's last steps) moves no whole packet: one row of every element instead.
+  if (dag.h == 1 && total <= kRow) {
+    dag.r = 1;
+    dag.h = total;
+    dag.rowExtents = {1};
+    for (Node &n : dag.nodes)
+      if (n.kind == Node::Input)
+        n.rows = 0;
+    return true;
+  }
   return false;
 }
 

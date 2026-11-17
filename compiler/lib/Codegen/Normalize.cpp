@@ -740,12 +740,22 @@ void treeReductions(ModuleOp module) {
     Value init = g.getDpsInits()[0];
     Value fresh = tensor::EmptyOp::create(b, loc, cast<RankedTensorType>(init.getType()).getShape(), et);
     AffineMap outId = AffineMap::getMultiDimIdentityMap(outRank, ctx);
+    // An init that fills the combiner's neutral element (x ^ 0) leaves the total as it is.
+    auto fill = init.getDefiningOp<linalg::FillOp>();
+    std::optional<TypedAttr> neutral = arith::getNeutralElement(comb);
+    Attribute filled;
+    bool keep = !fill || !neutral || !matchPattern(fill.getInputs()[0], m_Constant(&filled)) || filled != *neutral;
+    SmallVector<Value> ins{cur};
+    SmallVector<AffineMap> totalMaps{AffineMap::get(outRank, 0, read, ctx), outId};
+    if (keep) {
+      ins.push_back(init);
+      totalMaps.push_back(outId);
+    }
     auto total = linalg::GenericOp::create(
-        b, loc, TypeRange{init.getType()}, ValueRange{cur, init}, ValueRange{fresh},
-        ArrayRef<AffineMap>{AffineMap::get(outRank, 0, read, ctx), outId, outId},
+        b, loc, TypeRange{init.getType()}, ins, ValueRange{fresh}, totalMaps,
         SmallVector<utils::IteratorType>(outRank, utils::IteratorType::parallel),
         [&](OpBuilder &nb, Location l, ValueRange args) {
-          linalg::YieldOp::create(nb, l, combined(nb, l, args[0], args[1]));
+          linalg::YieldOp::create(nb, l, keep ? combined(nb, l, args[0], args[1]) : args[0]);
         });
     g.getResult(0).replaceAllUsesWith(total.getResult(0));
     g.erase();

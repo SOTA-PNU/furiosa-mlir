@@ -2,7 +2,7 @@
 
 // A reduction whose combiner the Vector Engine cannot reduce (here a product, as tl.cumprod raises) becomes a tree
 // of elementwise ops: the terms over the whole space, the halves along the reduced dim combined until one element
-// is left, then the init.
+// is left, then the init (here 2; an init of the combiner's neutral element, as xor's 0, is left out).
 
 // CHECK-LABEL: func.func @prod
 // CHECK: %[[T:.*]] = linalg.generic {{.*}} iterator_types = ["parallel", "parallel"]} ins(%arg0 : tensor<8x4xf32>)
@@ -13,12 +13,15 @@
 // CHECK: tensor.extract_slice %[[H]][0, 1] [8, 1] [1, 1]
 // CHECK: %[[L:.*]] = linalg.generic {{.*}} : tensor<8x1xf32>, tensor<8x1xf32>) outs(%{{.*}} : tensor<8x1xf32>)
 // CHECK: linalg.generic {{.*}} ins(%[[L]], %{{.*}} : tensor<8x1xf32>, tensor<8xf32>) outs(%{{.*}} : tensor<8xf32>)
+// CHECK-LABEL: func.func @xor
+// CHECK: %[[X:.*]] = linalg.generic {{.*}} : tensor<8x1xi32>, tensor<8x1xi32>) outs(%{{.*}} : tensor<8x1xi32>)
+// CHECK: linalg.generic {{.*}} ins(%[[X]] : tensor<8x1xi32>) outs(%{{.*}} : tensor<8xi32>)
 // CHECK-NOT: "reduction"
 #in = affine_map<(d0, d1) -> (d0, d1)>
 #out = affine_map<(d0, d1) -> (d0)>
 module {
   func.func @prod(%x: tensor<8x4xf32>, %o: tensor<8xf32>) -> tensor<8xf32> attributes {furiosa.written = [1]} {
-    %one = arith.constant 1.0 : f32
+    %one = arith.constant 2.0 : f32
     %e = tensor.empty() : tensor<8xf32>
     %f = linalg.fill ins(%one : f32) outs(%e : tensor<8xf32>) -> tensor<8xf32>
     %r = linalg.generic {indexing_maps = [#in, #out], iterator_types = ["parallel", "reduction"]} ins(%x : tensor<8x4xf32>) outs(%f : tensor<8xf32>) {
@@ -27,5 +30,16 @@ module {
       linalg.yield %m : f32
     } -> tensor<8xf32>
     return %r : tensor<8xf32>
+  }
+  func.func @xor(%x: tensor<8x4xi32>, %o: tensor<8xi32>) -> tensor<8xi32> attributes {furiosa.written = [1]} {
+    %zero = arith.constant 0 : i32
+    %e = tensor.empty() : tensor<8xi32>
+    %f = linalg.fill ins(%zero : i32) outs(%e : tensor<8xi32>) -> tensor<8xi32>
+    %r = linalg.generic {indexing_maps = [#in, #out], iterator_types = ["parallel", "reduction"]} ins(%x : tensor<8x4xi32>) outs(%f : tensor<8xi32>) {
+    ^bb0(%a: i32, %acc: i32):
+      %m = arith.xori %acc, %a : i32
+      linalg.yield %m : i32
+    } -> tensor<8xi32>
+    return %r : tensor<8xi32>
   }
 }

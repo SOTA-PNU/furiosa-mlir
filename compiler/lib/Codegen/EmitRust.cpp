@@ -554,6 +554,9 @@ LogicalResult Emitter::emit(func::FuncOp kernel) {
               std::string v = rustF32(o.getValue().convertToFloat());
               if (o.getTarget().getType().getElementType().isBF16())
                 v = "const { bf16::from_f32(" + v + ") }";
+              // An i32 fill carries its bits in the f32 value.
+              if (o.getTarget().getType().getElementType().isInteger(32))
+                v = std::to_string(llvm::bit_cast<int32_t>(o.getValue().convertToFloat())) + "i32";
               os << "    " << nameOf(o.getTarget()) << ".view_mut().memset(" << v << ", &mut device.sub);\n";
               return success();
             })

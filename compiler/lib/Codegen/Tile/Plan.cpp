@@ -203,20 +203,21 @@ LogicalResult Plan::planLayout() {
     llvm::append_range(rows, gemm->m);
     col = gemm->n[0];
   } else {
-    // The column: the output axis contiguous (stride 1) in the most reads, else the innermost output axis; an
-    // even one, since DMA rows are 8-byte units.
+    // The column: the output axis contiguous (stride 1) in the most reads, else the innermost output axis; one of
+    // whole 8-byte units (2 f32, 4 bf16), since DMA rows are 8-byte units: else an odd one pads to whole packets.
     std::map<unsigned, int> votes;
     for (const Read &r : p.reads)
       if (!r.index.empty())
         for (auto [a, c] : r.index.back().terms)
           if (c == 1)
             ++votes[a];
+    int64_t unit = p.outType.isBF16() || llvm::any_of(p.reads, [](const Read &r) { return r.type.isBF16(); }) ? 4 : 2;
     unsigned best = p.out.back();
     for (unsigned a : p.out)
-      if (p.axes[best].size % 2 && !(p.axes[a].size % 2))
+      if (p.axes[best].size % unit && !(p.axes[a].size % unit))
         best = a;
     for (auto [a, v] : votes)
-      if (llvm::is_contained(p.out, a) && !(p.axes[a].size % 2) && (v > votes[best] || p.axes[best].size % 2))
+      if (llvm::is_contained(p.out, a) && !(p.axes[a].size % unit) && (v > votes[best] || p.axes[best].size % unit))
         best = a;
     col = best;
     for (unsigned a : p.out)
