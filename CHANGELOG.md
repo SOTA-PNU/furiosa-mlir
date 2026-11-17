@@ -6,16 +6,14 @@ npu stage) against GPU goldens.
 
 ## 1.2.0 (unreleased, main)
 
-Known issue on main: fused attention's forward kernel no longer maps whole (14 unmapped steps at a1ec302; it
-passed L4 in 1.1.0); a fix is in progress.
-
 - Normalization: reduction loops of extent 1 drop (`tl.expand_dims` with a reduction, int32 and int8); `tl.umulhi`
   computed from 16-bit limbs, exact under the engine's wrapping multiply (cae9784).
 - Operator matrix on npu3: masked stores pass in every dtype (10 cases; they failed at 1805f3e).
 - Selects keyed by a boolean combination of comparisons nest into selects keyed by one each: `tl.map_elementwise`'s
   three-way compare on npu3 (0ab16b6).
 - A widened i1 is a select; a reduction no class maps reads its input broadcast over the loops it lacks:
-  `tl.histogram` on npu3 (ccb3f49).
+  `tl.histogram` on npu3 (ccb3f49; c49e615 limits the broadcast to a reduction's sole reduced input, which had
+  split fused attention's forward kernel on main).
 - A read whose address wraps (a mod or floordiv one loop decides) splits at the wrap into box copies: `tl.gather`
   by a rotated index on npu3 (0af780b; 3c04413 fixes a dangling operand list in it).
 - In a generic no class maps, a select one loop decides splits even when its sides are computed: `tl.maximum`'s
@@ -24,6 +22,8 @@ passed L4 in 1.1.0); a fix is in progress.
   identity; bf16 row values; one-column rows; a reduction to a scalar stored through a cast is one step. Every
   reduction (sum, max, min, argmax, argmin, xor_sum) and bf16 abs/cos/sin/rsqrt pass on npu3 for all dtypes and
   shapes, 32 more matrix cases (0e97b8c).
+- i8 and i16 ride in i32 lanes with wraps at their width; bf16 bitcasts to i16 through the f32 bits: `tl.flip` on bf16
+  bit-exact on npu3 (db8aa18; fp16 stays out, it lives on the device as f32).
 
 ## 1.1.0 (2026-11-17, release/1.1.0)
 
