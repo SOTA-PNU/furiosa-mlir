@@ -1,0 +1,4 @@
+# The compiler's Python dependencies (the furiosa-enabled Triton ships in python/); torch is the CPU build.
+torch==2.15.0
+numpy==2.5.5
+ml_dtypes==0.6.0

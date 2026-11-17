@@ -82,6 +82,25 @@ def deps_binary(uplifted: Path) -> Path:
                 if not p.suffix and p.stat().st_ino == inode)
 
 
+def build_run_graph(crate: Path, exe: Path, npu: bool = True) -> Path:
+    """Builds the crate's run_graph for npu3 (cargo furiosa-opt) or the CPU emulation (cargo) in a target slot
+    and copies it to `exe`: every crate's binary is uplifted to target/release/run_graph, and a crate with the name
+    of another in the slot would share its deps/ binary, so the copy is resolved while the slot is held."""
+    env = dict(os.environ, FURIOSA_VISIBLE_CHIPS=NPU, PATH=f"{ROOT / '.tools' / 'bin'}:{os.environ['PATH']}")
+    env.setdefault("LIBCLANG_PATH", "/usr/lib/llvm-18/lib")
+    cmd = (["cargo", "furiosa-opt", "build"] if npu else ["cargo", "build"])
+    cmd += ["--release", "--bin", "run_graph", "--message-format=json-render-diagnostics"]
+    with target_slot(CACHE / ("targets" if npu else "targets-cpu"), crate) as target:
+        env["CARGO_TARGET_DIR"] = str(target)
+        proc = subprocess.run(cmd, cwd=crate, env=env, capture_output=True, text=True)
+        uplifted = next((json.loads(line)["executable"] for line in proc.stdout.splitlines()
+                         if line.startswith("{") and '"executable":"' in line.replace(" ", "")), None)
+        if proc.returncode or not uplifted:
+            raise RuntimeError(f"{crate}: {'NPU' if npu else 'emulation'} build failed:\n{proc.stderr[-2000:]}")
+        shutil.copy2(deps_binary(Path(uplifted)), exe)
+    return exe
+
+
 def executable(launch: Launch) -> tuple[Path, Path]:
     """The built run_graph for this launch's specialization (built on first use) and its work dir."""
     from triton.runtime.cache import triton_key  # libtriton: raising and codegen
@@ -103,23 +122,7 @@ def executable(launch: Launch) -> tuple[Path, Path]:
         # could take another specialization's binary as fresh.
         result = driver.compile_graphs([graph], work.name, work / "out")
         build_crate(result, work / "out", work / "crate")
-        env = dict(os.environ, FURIOSA_VISIBLE_CHIPS=NPU, PATH=f"{ROOT / '.tools' / 'bin'}:{os.environ['PATH']}")
-        env.setdefault("LIBCLANG_PATH", "/usr/lib/llvm-18/lib")
-        with target_slot(CACHE / "targets", work) as target:
-            # Every crate's binary is uplifted to target/release/run_graph; keep the per-crate deps/ binary
-            # it links to, resolved before another build in this slot can relink it.
-            env["CARGO_TARGET_DIR"] = str(target)
-            proc = subprocess.run(["cargo", "furiosa-opt", "build", "--release", "--bin", "run_graph",
-                                   "--message-format=json-render-diagnostics"], cwd=work / "crate", env=env,
-                                  capture_output=True, text=True)
-            uplifted = next((json.loads(line)["executable"] for line in proc.stdout.splitlines()
-                             if line.startswith("{") and '"executable":"' in line.replace(" ", "")), None)
-            if proc.returncode or not uplifted:
-                raise RuntimeError(f"{launch.kernel.__name__}: NPU build failed:\n{proc.stderr[-2000:]}")
-            # A copy of its own: every specialization's crate has the kernel's name and is its own workspace,
-            # so cargo gives them all one deps/run_graph-<hash> name, which the next build overwrites.
-            exe = work / "run_graph"
-            shutil.copy2(deps_binary(Path(uplifted)), exe)
+        exe = build_run_graph(work / "crate", work / "run_graph")
         record.write_text(str(exe))
         return exe, work
 

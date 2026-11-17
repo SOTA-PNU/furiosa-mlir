@@ -1,0 +1,3 @@
+# docker build sends the repo root as context: only the binary package (scripts/package.sh) goes in.
+*
+!dist/*.tar.gz

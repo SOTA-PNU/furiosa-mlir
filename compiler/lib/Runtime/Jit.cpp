@@ -51,9 +51,12 @@
 
 #include "llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <dlfcn.h>
 #include <functional>
 #include <mutex>
 
@@ -123,6 +126,21 @@ constexpr const char *kPipeline =
 
 // The runtime library memref.copy of non-contiguous memrefs calls into.
 constexpr const char *kRunnerUtils = MLIR_C_RUNNER_UTILS_PATH;
+
+/// The MLIR runner utilities the JIT links: FURIOSA_RUNNER_UTILS, else a copy next to this library (a packaged
+/// install, docs/usage.md), else where the build found them.
+std::string runnerUtils() {
+  if (const char *path = std::getenv("FURIOSA_RUNNER_UTILS"))
+    return path;
+  Dl_info self;
+  if (dladdr(reinterpret_cast<void *>(&runnerUtils), &self) && self.dli_fname) {
+    llvm::SmallString<256> beside(llvm::sys::path::parent_path(self.dli_fname));
+    llvm::sys::path::append(beside, "libmlir_c_runner_utils.so");
+    if (llvm::sys::fs::exists(beside))
+      return std::string(beside);
+  }
+  return kRunnerUtils;
+}
 
 void registerOnce() {
   static std::once_flag once;
@@ -241,7 +259,8 @@ std::unique_ptr<JitModule> JitModule::compile(llvm::StringRef text, std::string 
   }
   std::function<llvm::Error(llvm::Module *)> optimize = makeOptimizingTransformer(3, 0, machine->get());
 
-  llvm::StringRef libs[] = {kRunnerUtils};
+  std::string utils = runnerUtils();
+  llvm::StringRef libs[] = {utils};
   ExecutionEngineOptions options;
   options.sharedLibPaths = libs;
   options.transformer = optimize;

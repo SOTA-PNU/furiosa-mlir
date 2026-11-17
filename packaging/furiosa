@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# The furiosa CLI of a binary package: compile, run and trace models (docs/usage.md).
+here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+PATH="$here:$PATH" exec "$here/../venv/bin/python" -m furiosa_compiler.cli "$@"

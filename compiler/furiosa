@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# The furiosa CLI from a source checkout: compile, run and trace models (docs/usage.md). It holds the build lock
+# shared, so it never loads a libtriton that compiler/build.sh is relinking.
+here="$(cd "$(dirname "$0")" && pwd)"
+PYTHONPATH="$here${PYTHONPATH:+:$PYTHONPATH}" exec "$here/with-build-lock.sh" "$here/.venv/bin/python" -m furiosa_compiler.cli "$@"
