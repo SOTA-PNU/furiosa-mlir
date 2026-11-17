@@ -7,7 +7,6 @@ npu stage) against GPU goldens.
 ## 1.2.0 (unreleased, main)
 
 - Normalization: reduction loops of extent 1 drop; `tl.umulhi` computed from 16-bit limbs (cae9784).
-- Binary package: a kernel launched from a script finds the package's pinned furiosa-opt tools (22f6ab7).
 - Selects keyed by a boolean combination of comparisons nest into selects keyed by one each: `tl.map_elementwise`'s
   three-way compare on npu3 (0ab16b6).
 - A widened i1 is a select; a reduction no class maps reads its input broadcast over the loops it lacks:
@@ -35,7 +34,8 @@ matrix cases pass (741 at 1805f3e), none with a wrong result.
   elementwise generics are relaid out; an elementwise generic reading its init reads it as an input; returned
   buffers are copies; a step never takes a buffer it reads as its destination; outputs another step reads stay
   outputs (no merge counts a stale group as a reader).
-- Fixes: int32 sort no longer re-walks unmappable values exponentially in the row-wise fold (900 s to 12 s).
+- Fixes: int32 sort no longer re-walks unmappable values exponentially in the row-wise fold (900 s to 12 s); a
+  kernel launched from a script in the binary package uses the package's pinned furiosa-opt tools.
 - Tools: `furiosa compile | run | trace`, the binary package (`scripts/package.sh`), the Docker playground,
   `docs/usage.md`; `HARNESS_TRITON` runs the harness against a copy of the Triton package.
 
