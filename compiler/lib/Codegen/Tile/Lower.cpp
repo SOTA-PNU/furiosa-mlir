@@ -188,23 +188,41 @@ private:
   void copy(Value src, Value dst) { HbmToHbmViewOp::create(b, loc(), src, dst); }
   /// A DM tile or vector converted between f32 and bf16 by one pass (fetch_cast up, the Cast Engine down).
   Value convert(Value dm, Type to);
-  /// Tiles view `v` (of mapping `parts`) to one position of each digit in `at`.
-  Value tileDigits(Value v, SmallVector<MapAttr> parts, ArrayRef<std::pair<MapAttr, int64_t>> at, bool mut) {
-    for (auto [d, index] : at) {
-      auto it = llvm::find(parts, d);
+  /// A tile position of a digit: `start`, plus the induction variable `iv` of a device loop over the tiles.
+  struct TilePos {
+    MapAttr digit;
+    int64_t start;
+    Value iv;
+  };
+  SmallVector<TilePos> tileAt(ArrayRef<unsigned> axes, ArrayRef<int64_t> tileIndex) {
+    SmallVector<TilePos> at;
+    for (auto [i, d] : llvm::enumerate(tileD))
+      if (llvm::is_contained(axes, d.axis))
+        at.push_back({digit(d), tileIndex[i], tileIvs.empty() ? Value() : tileIvs[i]});
+    return at;
+  }
+  /// Tiles view `v` (of mapping `parts`) to the tile positions `at`.
+  Value tilePositions(Value v, SmallVector<MapAttr> parts, ArrayRef<TilePos> at, bool mut) {
+    for (const TilePos &t : at) {
+      auto it = llvm::find(parts, t.digit);
       assert(it != parts.end() && "a tiled digit of the view");
-      *it = kb.one().padTo(d.size(), mut ? PadKind::Bottom : PadKind::Top);
-      v = tileView(v, d, 1, index, pairOf(parts));
+      *it = kb.one().padTo(t.digit.size(), mut ? PadKind::Bottom : PadKind::Top);
+      if (!t.iv) {
+        v = tileView(v, t.digit, 1, t.start, pairOf(parts));
+        continue;
+      }
+      auto vt = cast<HbmViewType>(v.getType());
+      v = TileAtOp::create(b, loc(), HbmViewType::get(ctx, vt.getElementType(), vt.getChip(), pairOf(parts), mut), v,
+                           t.digit, b.getI64IntegerAttr(1), b.getI64IntegerAttr(t.start), ValueRange{t.iv},
+                           b.getDenseI64ArrayAttr({1}))
+              .getResult();
     }
     return v;
   }
-  SmallVector<std::pair<MapAttr, int64_t>> tileAt(ArrayRef<unsigned> axes, ArrayRef<int64_t> tileIndex) {
-    SmallVector<std::pair<MapAttr, int64_t>> at;
-    for (auto [i, d] : llvm::enumerate(tileD))
-      if (llvm::is_contained(axes, d.axis))
-        at.push_back({digit(d), tileIndex[i]});
-    return at;
-  }
+  // Device loops over the tiles (one fopt.for per tile digit): their induction variables, and the outermost loop,
+  // before which every staging goes.
+  SmallVector<Value> tileIvs;
+  Operation *loopAnchor = nullptr;
 
   // Operands: staged reads (fopt.stage) and their tiles (fopt.read), lowered by furiosa-dma (Dma.cpp), which
   // decides the staging layout.
@@ -233,6 +251,9 @@ private:
     }
     spec.tag = "S" + std::to_string(fresh++) + "_";
     spec.axesAt = kb.numAxes();
+    OpBuilder::InsertionGuard guard(b);
+    if (loopAnchor)
+      b.setInsertionPoint(loopAnchor);
     return StageOp::create(b, loc(), kb.hbmType(r.type, pairOf(logical)), kb.param(paramOf[r.arg]), spec.encode(ctx))
         .getResult();
   }
@@ -241,10 +262,17 @@ private:
   Value toDm(Value staged, ArrayRef<unsigned> axes, ArrayRef<int64_t> tileIndex, MapAttr element, bool withK = false,
              int64_t kIndex = 0) {
     SmallVector<Attribute> at;
-    for (auto [d, index] : tileAt(axes, tileIndex))
-      at.push_back(b.getArrayAttr({d, b.getI64IntegerAttr(index)}));
+    SmallVector<Value> ivs;
+    for (const TilePos &t : tileAt(axes, tileIndex)) {
+      int64_t iv = -1;
+      if (t.iv) {
+        iv = ivs.size();
+        ivs.push_back(t.iv);
+      }
+      at.push_back(b.getArrayAttr({t.digit, b.getI64IntegerAttr(t.start), b.getI64IntegerAttr(iv)}));
+    }
     Type et = cast<HbmTensorType>(staged.getType()).getElementType();
-    return ReadOp::create(b, loc(), kb.dmType(et, sliceMap(), element), staged, b.getArrayAttr(at),
+    return ReadOp::create(b, loc(), kb.dmType(et, sliceMap(), element), staged, ivs, b.getArrayAttr(at),
                           b.getBoolAttr(withK), b.getI64IntegerAttr(kIndex), b.getI64IntegerAttr(rcIndex));
   }
 
@@ -892,21 +920,39 @@ LogicalResult Lowering::emit() {
   int64_t numTiles = 1;
   for (const Digit &d : tileD)
     numTiles *= d.size;
-  for (int64_t t = 0; t < numTiles; ++t) {
-    SmallVector<int64_t> index(tileD.size());
-    int64_t rest = t;
-    for (int i = tileD.size() - 1; i >= 0; --i) {
-      index[i] = rest % tileD[i].size;
-      rest /= tileD[i].size;
+  // The tiles: one device loop per tile digit (the body emitted once, its tile views indexed by the loops'
+  // induction variables, every staging before the loops), or unrolled.
+  bool deviceLoops = numTiles > 1;
+  {
+    OpBuilder::InsertionGuard guard(b);
+    if (deviceLoops)
+      for (const Digit &d : tileD) {
+        auto loop = ForOp::create(b, loc(), b.getI64IntegerAttr(d.size));
+        Block *body = new Block();
+        loop.getBody().push_back(body);
+        tileIvs.push_back(body->addArgument(b.getIndexType(), loc()));
+        if (!loopAnchor)
+          loopAnchor = loop;
+        b.setInsertionPointToStart(body);
+      }
+    for (int64_t t = 0; t < (deviceLoops ? 1 : numTiles); ++t) {
+      SmallVector<int64_t> index(tileD.size());
+      int64_t rest = t;
+      for (int i = tileD.size() - 1; i >= 0; --i) {
+        index[i] = rest % tileD[i].size;
+        rest /= tileD[i].size;
+      }
+      vals.clear();
+      auto v = evaluate(p.root, index);
+      if (failed(v))
+        return failure();
+      if (v->kind != Val::Tile)
+        return fail("the stored value does not vary over the rows");
+      DmToHbmViewOp::create(b, loc(), convert(v->dm, p.outType),
+                            tilePositions(view(outCanonical, true), outParts, tileAt(layout, index), true));
     }
-    vals.clear();
-    auto v = evaluate(p.root, index);
-    if (failed(v))
-      return failure();
-    if (v->kind != Val::Tile)
-      return fail("the stored value does not vary over the rows");
-    DmToHbmViewOp::create(b, loc(), convert(v->dm, p.outType),
-                          tileDigits(view(outCanonical, true), outParts, tileAt(layout, index), true));
+    tileIvs.clear();
+    loopAnchor = nullptr;
   }
   // The relayout into the written buffer's own layout: a padded row or column is read back as its axis (the
   // canonical digits are row-major per axis: tile, slice, local).

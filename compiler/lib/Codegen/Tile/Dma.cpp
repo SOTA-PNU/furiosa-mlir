@@ -694,9 +694,13 @@ Value Stager::lower(ReadOp read, Value hbm) {
   b.setInsertionPoint(read);
   SmallVector<MapAttr> parts(spec.canonical);
   SmallVector<std::pair<MapAttr, int64_t>> at;
+  llvm::DenseMap<Attribute, Value> ivOf; // tile digits a device loop indexes
   for (Attribute x : read.getAt()) {
-    auto pair = cast<ArrayAttr>(x);
-    at.push_back({cast<MapAttr>(pair[0]), cast<IntegerAttr>(pair[1]).getInt()});
+    auto entry = cast<ArrayAttr>(x);
+    auto digit = cast<MapAttr>(entry[0]);
+    at.push_back({digit, cast<IntegerAttr>(entry[1]).getInt()});
+    if (int64_t iv = cast<IntegerAttr>(entry[2]).getInt(); iv >= 0)
+      ivOf[digit] = read.getIvs()[iv];
   }
   bool withK = read.getWithK();
   if (tapMajor && !withK) { // the Vector Engine reduction's flat axis (chunk axis first) leads
@@ -719,7 +723,21 @@ Value Stager::lower(ReadOp read, Value hbm) {
     if (kTiles() > 1)
       at.push_back({spec.kf.stride(spec.kTile), read.getKIndex()});
   }
-  Value v = tileDigits(view(hbm, false), parts, at, false);
+  Value v = view(hbm, false);
+  for (auto [d, index] : at) {
+    auto it = llvm::find(parts, d);
+    assert(it != parts.end() && "a tiled digit of the view");
+    *it = one().padTo(d.size(), PadKind::Top);
+    if (Value iv = ivOf.lookup(d)) {
+      auto vt = cast<HbmViewType>(v.getType());
+      v = TileAtOp::create(b, loc(), HbmViewType::get(ctx, vt.getElementType(), vt.getChip(), pairOf(parts), false),
+                           v, d, b.getI64IntegerAttr(1), b.getI64IntegerAttr(index), ValueRange{iv},
+                           b.getDenseI64ArrayAttr({1}))
+              .getResult();
+      continue;
+    }
+    v = tileView(v, d, 1, index, pairOf(parts));
+  }
   return ViewToDmOp::create(b, loc(), read.getType(), v);
 }
 

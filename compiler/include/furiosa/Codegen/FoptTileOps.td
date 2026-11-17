@@ -107,13 +107,16 @@ def Fopt_StageOp : Fopt_Op<"stage"> {
 def Fopt_ReadOp : Fopt_Op<"read"> {
   let summary = "one tile of a staged read, moved to DM (abstract)";
   let description = [{
-    `at` selects the tile: [digit, index] per tiled digit of the staging layout. `k_index` is the contraction's K
+    `at` selects the tile: [digit, start, iv] per tiled digit of the staging layout, the tile at start (plus the
+    induction variable `ivs[iv]` of a device loop over the tiles, when iv >= 0). `k_index` is the contraction's K
     tile (with `with_k`), `rc_index` the reduction chunk.
   }];
-  let arguments = (ins Fopt_HbmTensor:$staged, ArrayAttr:$at, BoolAttr:$with_k, I64Attr:$k_index,
-                       I64Attr:$rc_index);
+  let arguments = (ins Fopt_HbmTensor:$staged, Variadic<Index>:$ivs, ArrayAttr:$at, BoolAttr:$with_k,
+                       I64Attr:$k_index, I64Attr:$rc_index);
   let results = (outs Fopt_DmTensor:$result);
-  let assemblyFormat = "$staged attr-dict `:` qualified(type($staged)) `->` qualified(type($result))";
+  let assemblyFormat = [{
+    $staged (`ivs` `(` $ivs^ `)`)? attr-dict `:` qualified(type($staged)) `->` qualified(type($result))
+  }];
 }
 
 #endif // FURIOSA_CODEGEN_FOPT_TILE_OPS

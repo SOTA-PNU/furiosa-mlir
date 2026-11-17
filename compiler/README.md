@@ -113,8 +113,9 @@ are sliced) and K loops over its contraction's reduction dims (`furiosa.tile_dim
 whole taps or part of the inner axis), and mapping to fopt folds the loops back into the plan's tile digits and
 K tiles. Codegen maps this stage. L1
 runs `linalg.mlir`, `structured.mlir`, `steps.mlir` and `tiled.mlir`.
-Mapping a tiled kernel to fopt is the second level: the tiled class emits its engine stages as fopt, but its data
-movement abstract, as `fopt.stage` (a buffer read at a linear index over the program's axes, with the layout its
+Mapping a tiled kernel to fopt is the second level: the tiled class emits its engine stages as fopt, its tiles as
+device loops (one `fopt.for` per tile digit, the body once with its tile views indexed by the loop's induction
+variable; furiosa-opt keeps the loop), and its data movement abstract, as `fopt.stage` (a buffer read at a linear index over the program's axes, with the layout its
 tiles are cut from) and `fopt.read` (one tile of it in DM). `furiosa-dma` (lib/Codegen/Tile/Dma.cpp) makes the
 data-movement decisions and lowers both to HBM staging buffers and DMAs: padded copies and their fills (one copy
 shared by the stages of a buffer that differ only in their windows, such as unrolled taps), tap-major or

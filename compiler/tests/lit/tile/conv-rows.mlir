@@ -4,7 +4,8 @@
 // furiosa-tile tiles a kernel by the tiled lowering's plan: a 3x3 convolution over 224x224x64 (VGG conv1_2)
 // splits its output rows into 4 tiles of 56. The loop computes each tile's contraction from a 58-row window of
 // the padded input (tile and fuse) and its epilogue, and inserts it into the result; the pad stays whole.
-// Mapping the tiled kernel folds the loop back into the plan's tile digit (A0 / 56).
+// Mapping the tiled kernel folds the loop back into the plan's tile digit (A0 / 56), and emits it as a device
+// loop.
 
 // CHECK-LABEL: func.func @conv
 // CHECK: tensor.pad
@@ -14,7 +15,10 @@
 // CHECK: linalg.generic {{.*}} outs(%{{.*}} : tensor<1x56x224x64xf32>)
 // CHECK: tensor.insert_slice %{{.*}} into %[[ACC]][0, %[[I]], 0, 0] [1, 56, 224, 64]
 
-// FOPT: fopt.tile %{{.*}} index <"A0{224} / 56"> len 1 start 3
+// The tiles run as a device loop: its body once, the tile views indexed by the loop's induction variable.
+// FOPT: "fopt.for"() <{count = 4 : i64}> ({
+// FOPT-NEXT: ^bb0(%[[T:.*]]: index):
+// FOPT: "fopt.tile_at"(%{{.*}}, %[[T]]) <{coeffs = array<i64: 1>, index = #fopt.m<"A0{224} / 56">, len = 1 : i64, start = 0 : i64}>
 
 #x = affine_map<(d0, d1, d2, d3, d4, d5) -> (0, d0 + d3, d1 + d4, d5)>
 #w = affine_map<(d0, d1, d2, d3, d4, d5) -> (d2, d5, d3, d4)>
