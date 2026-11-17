@@ -59,7 +59,9 @@ def all_cases() -> list[Case]:
         cases += [Case("dot", "dot", dtype, s) for s in DOTS]
     cases += [Case("memory", "descriptor", dtype, s) for dtype in ALL for s in [(1, 64, 64), (1, 50, 64)]]
     cases += [Case("program", "program_id", "float32", (1, 64, 64))]
-    cases += [Case("atomic", "atomic_add", "float32", (1, 8, 64))]
+    for op in K.ATOMIC:
+        cases += [Case("atomic", op, dtype, (1, 8, 64)) for dtype in (["int32"] if op in ("atomic_and", "atomic_or",
+                                                                                         "atomic_xor") else ["float32", "int32"])]
     return cases
 
 
@@ -163,8 +165,22 @@ def build(case: Case):
         return K.program_kernel, (rows,), dict(x_ptr=x, out_ptr=torch.empty_like(x), R=rows, C=c), {"out_ptr": wide(x) + rows}, "float"
     if case.group == "atomic":
         x = _input((rows, c), dt, generator=g)
-        return (K.atomic_kernel, (rows,), dict(x_ptr=x, out_ptr=torch.zeros(c, dtype=x.dtype), R=rows, C=c),
-                {"out_ptr": (wide(x).sum(0), wide(x).abs().sum(0))}, "sum")
+        rowwise = case.op == "atomic_add_rows"
+        out = _input((rows, c) if rowwise else (c,), dt, generator=g)  # the old value takes part
+        xs, os_ = wide(x), wide(out)
+        if rowwise:
+            ref = os_ + xs
+        elif case.op == "atomic_add":
+            ref = (os_ + xs.sum(0), os_.abs() + xs.abs().sum(0))
+        elif case.op in ("atomic_max", "atomic_min"):
+            ref = (torch.maximum if case.op == "atomic_max" else torch.minimum)(os_, xs.amax(0) if case.op == "atomic_max" else xs.amin(0))
+        else:
+            ref = out.clone()
+            for r in range(rows):
+                ref = {"atomic_and": torch.bitwise_and, "atomic_or": torch.bitwise_or, "atomic_xor": torch.bitwise_xor}[case.op](ref, x[r])
+        kind = "sum" if case.op == "atomic_add" else "float"
+        return (K.atomic_kernel, (rows,), dict(x_ptr=x, out_ptr=out, R=rows, C=c, OP=K.ATOMIC.index(case.op)),
+                {"out_ptr": ref}, kind)
     raise ValueError(case.group)
 
 

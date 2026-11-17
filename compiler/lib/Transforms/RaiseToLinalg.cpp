@@ -441,7 +441,7 @@ public:
 
   DenseMap<unsigned, int64_t> trips;    // per loop id: its trip count in this instance
   DenseMap<Operation *, bool> taken;     // per scf.if: whether this instance took its then-branch
-  DenseSet<Operation *> executed;        // the stores this instance runs
+  DenseSet<Operation *> executed;        // the stores (and atomics) this instance runs
 
 private:
   MLIRContext *ctx;
@@ -730,7 +730,7 @@ private:
       return evalFor(f);
     if (auto i = dyn_cast<scf::IfOp>(op))
       return evalIf(i);
-    if (isa<tt::StoreOp>(op))
+    if (isa<tt::StoreOp, tt::AtomicRMWOp>(op))
       executed.insert(op);
     return success();
   }
@@ -852,6 +852,18 @@ struct BufferInfo {
 /// The coordinate space a store defines. Each stored axis has a global index (the axis plus its tile
 /// origin in that instance) that is an expression of the view dims: one view dim for a linear axis, or
 /// the mixed-radix recombination of the view dims of its digits for an address built with div/mod.
+/// What writes a buffer: a store, or an atomic read-modify-write whose old value is unused (it then
+/// stores old (op) val).
+struct Write {
+  Operation *op;
+  Value getPtr() const { return isa<tt::StoreOp>(op) ? cast<tt::StoreOp>(op).getPtr() : cast<tt::AtomicRMWOp>(op).getPtr(); }
+  Value getValue() const { return isa<tt::StoreOp>(op) ? cast<tt::StoreOp>(op).getValue() : cast<tt::AtomicRMWOp>(op).getVal(); }
+  Value getMask() const { return isa<tt::StoreOp>(op) ? cast<tt::StoreOp>(op).getMask() : cast<tt::AtomicRMWOp>(op).getMask(); }
+  InFlightDiagnostic emitError(const Twine &message) const { return op->emitError(message); }
+  Operation *getOperation() const { return op; }
+  Operation *operator->() const { return op; }
+};
+
 struct StoreSpace {
   int arg = -1;
   SmallVector<int64_t> viewShape, viewStrides; // row-major view of the buffer
@@ -1024,9 +1036,9 @@ private:
 
   LogicalResult parseLaunch();
   LogicalResult evaluate();
-  FailureOr<StoreSpace> storeSpace(tt::StoreOp store, ArrayRef<int64_t> extraStrides = {});
-  LogicalResult raiseStoreIn(tt::StoreOp store, const StoreSpace &sp);
-  LogicalResult raiseStore(tt::StoreOp store);
+  FailureOr<StoreSpace> storeSpace(Write store, ArrayRef<int64_t> extraStrides = {});
+  LogicalResult raiseStoreIn(Write store, const StoreSpace &sp);
+  LogicalResult raiseStore(Write store);
 
   AffineExpr originExpr(const Gen &g, unsigned viewDim);
   AffineExpr tidy(const Gen &g, AffineExpr e);
@@ -1208,7 +1220,7 @@ bool components(AffineExpr e, int64_t scale, SmallVectorImpl<Component> &out) {
 }
 } // namespace
 
-FailureOr<StoreSpace> Raiser::storeSpace(tt::StoreOp store, ArrayRef<int64_t> extraStrides) {
+FailureOr<StoreSpace> Raiser::storeSpace(Write store, ArrayRef<int64_t> extraStrides) {
   // The loops around the store become its leading axes: each iteration is one more stored tile.
   SmallVector<unsigned> encl;
   for (Operation *op = store->getParentOp(); op && op != kernel.getOperation(); op = op->getParentOp())
@@ -3064,7 +3076,7 @@ FailureOr<Value> Raiser::materializeState(Gen &g, scf::ForOp loop, unsigned resu
   return extract(results[result], dimsOf[result]);
 }
 
-LogicalResult Raiser::raiseStore(tt::StoreOp store) {
+LogicalResult Raiser::raiseStore(Write store) {
   auto sp = storeSpace(store);
   if (failed(sp))
     return failure();
@@ -3125,7 +3137,7 @@ LogicalResult Raiser::raiseStore(tt::StoreOp store) {
 }
 
 /// Raises `store` over the coordinate space `sp`.
-LogicalResult Raiser::raiseStoreIn(tt::StoreOp store, const StoreSpace &spRef) {
+LogicalResult Raiser::raiseStoreIn(Write store, const StoreSpace &spRef) {
   const StoreSpace *sp = &spRef;
   space = sp;
   int arg = sp->arg;
@@ -3157,13 +3169,21 @@ LogicalResult Raiser::raiseStoreIn(tt::StoreOp store, const StoreSpace &spRef) {
   OpBuilder::InsertionGuard guard(b);
   b.setInsertionPoint(anchor);
   SmallVector<int64_t> box(root.extent);
-  Value empty = tensor::EmptyOp::create(b, loc, box, elem);
+  auto rmw = dyn_cast<tt::AtomicRMWOp>(store.getOperation());
+  // An atomic starts from what the box holds and combines into it.
+  Value init = !rmw ? tensor::EmptyOp::create(b, loc, box, elem).getResult()
+               : sp->full ? reshape(current[arg], sp->viewShape)
+                          : tensor::ExtractSliceOp::create(b, loc, reshape(current[arg], sp->viewShape),
+                                                           getAsIndexOpFoldResult(ctx, sp->boxLo),
+                                                           getAsIndexOpFoldResult(ctx, box),
+                                                           getAsIndexOpFoldResult(ctx, SmallVector<int64_t>(nd, 1)))
+                                .getResult();
   LogicalResult status = success();
   Gen g = root;
   auto op = linalg::GenericOp::create(b, 
-      loc, TypeRange{empty.getType()}, ValueRange{}, ValueRange{empty},
+      loc, TypeRange{init.getType()}, ValueRange{}, ValueRange{init},
       ArrayRef<AffineMap>{AffineMap::getMultiDimIdentityMap(nd, ctx)},
-      SmallVector<utils::IteratorType>(nd, utils::IteratorType::parallel), [&](OpBuilder &ob, Location, ValueRange) {
+      SmallVector<utils::IteratorType>(nd, utils::IteratorType::parallel), [&](OpBuilder &ob, Location, ValueRange args) {
         g.ob = &ob;
         g.index.assign(nd, Value());
         auto v = emit(g, store.getValue(), env);
@@ -3172,7 +3192,41 @@ LogicalResult Raiser::raiseStoreIn(tt::StoreOp store, const StoreSpace &spRef) {
           linalg::YieldOp::create(ob, loc, ValueRange{arith::ConstantOp::create(ob, loc, ob.getZeroAttr(elem))});
           return;
         }
-        linalg::YieldOp::create(ob, loc, ValueRange{*v});
+        Value out = *v;
+        if (rmw) {
+          Value old = args[0];
+          bool fp = isa<FloatType>(elem);
+          switch (rmw.getAtomicRmwOp()) {
+          case tt::RMWOp::ADD:
+          case tt::RMWOp::FADD:
+            out = fp ? arith::AddFOp::create(ob, loc, old, out).getResult() : arith::AddIOp::create(ob, loc, old, out).getResult();
+            break;
+          case tt::RMWOp::MAX:
+            out = fp ? arith::MaxNumFOp::create(ob, loc, old, out).getResult() : arith::MaxSIOp::create(ob, loc, old, out).getResult();
+            break;
+          case tt::RMWOp::MIN:
+            out = fp ? arith::MinNumFOp::create(ob, loc, old, out).getResult() : arith::MinSIOp::create(ob, loc, old, out).getResult();
+            break;
+          case tt::RMWOp::UMAX:
+            out = arith::MaxUIOp::create(ob, loc, old, out);
+            break;
+          case tt::RMWOp::UMIN:
+            out = arith::MinUIOp::create(ob, loc, old, out);
+            break;
+          case tt::RMWOp::AND:
+            out = arith::AndIOp::create(ob, loc, old, out);
+            break;
+          case tt::RMWOp::OR:
+            out = arith::OrIOp::create(ob, loc, old, out);
+            break;
+          case tt::RMWOp::XOR:
+            out = arith::XOrIOp::create(ob, loc, old, out);
+            break;
+          case tt::RMWOp::XCHG:
+            break;
+          }
+        }
+        linalg::YieldOp::create(ob, loc, ValueRange{out});
       });
   g.anchor = op;
   if (failed(status)) {
@@ -3280,23 +3334,28 @@ LogicalResult Raiser::run() {
     argTypes.push_back(RankedTensorType::get(buf.shape, buf.elem));
   // Stores, in program order, decide the results. The instances that run a store are split by their
   // control path and the buffer they write; each part is raised on its own.
-  SmallVector<tt::StoreOp> stores;
-  bool atomics = false;
-  kernel.walk([&](Operation *op) {
-    if (auto s = dyn_cast<tt::StoreOp>(op))
-      stores.push_back(s);
-    atomics |= isa<tt::AtomicRMWOp, tt::AtomicCASOp>(op);
+  SmallVector<Write> stores;
+  WalkResult walked = kernel.walk([&](Operation *op) {
+    if (isa<tt::StoreOp>(op))
+      stores.push_back({op});
+    if (isa<tt::AtomicRMWOp>(op) && op->use_empty() && !op->getParentOfType<scf::ForOp>())
+      stores.push_back({op});
+    else if (isa<tt::AtomicRMWOp, tt::AtomicCASOp>(op))
+      return op->emitError("furiosa: only an atomic read-modify-write outside loops whose old value is unused is "
+                           "raised"),
+             WalkResult::interrupt();
+    return WalkResult::advance();
   });
-  if (atomics)
-    return kernel.emitError("furiosa: atomics are not raised");
+  if (walked.wasInterrupted())
+    return failure();
   SmallVector<Operation *> branches;
   kernel.walk([&](scf::IfOp i) { branches.push_back(i); });
-  std::vector<std::pair<tt::StoreOp, SmallVector<Evaluator *>>> parts;
+  std::vector<std::pair<Write, SmallVector<Evaluator *>>> parts;
   std::set<int> writtenSet;
-  for (tt::StoreOp st : stores) {
+  for (Write st : stores) {
     std::map<std::pair<int, std::vector<int>>, SmallVector<Evaluator *>> byKey;
     for (auto &ev : evals) {
-      if (!ev->executed.count(st))
+      if (!ev->executed.count(st.getOperation()))
         continue;
       const Sym *p = ev->get(st.getPtr());
       if (!p || p->kind != Sym::Ptr)
@@ -3307,8 +3366,42 @@ LogicalResult Raiser::run() {
       byKey[{p->base, path}].push_back(ev.get());
       writtenSet.insert(p->base);
     }
-    for (auto &[key, instances] : byKey)
-      parts.push_back({st, instances});
+    for (auto &[key, instances] : byKey) {
+      if (!isa<tt::AtomicRMWOp>(st.getOperation())) {
+        parts.push_back({st, instances});
+        continue;
+      }
+      // Instances whose atomics touch an element in common apply one after the other: split them into
+      // rounds that write disjoint elements, each raised as a store of old (op) val.
+      std::vector<std::set<int64_t>> roundAddrs;
+      std::vector<SmallVector<Evaluator *>> rounds;
+      SmallVector<int64_t> shape = shapeOf(st.getValue().getType());
+      for (Evaluator *ev : instances) {
+        const Sym *p = ev->get(st.getPtr()), *m = st.getMask() ? ev->get(st.getMask()) : nullptr;
+        if (!p->data.empty() || (st.getMask() && (!m || m->kind != Sym::Mask)))
+          return st.emitError("furiosa: an atomic address or mask depends on data");
+        std::set<int64_t> addrs;
+        SmallVector<int64_t> at(shape.size(), 0);
+        for (bool more = !(m && m->never); more;) {
+          if (!m || llvm::all_of(m->conds, [&](AffineExpr c) { return evalAt(c, at) >= 0; }))
+            addrs.insert(evalAt(p->expr, at));
+          more = false;
+          for (int k = shape.size() - 1; k >= 0 && !more; --k)
+            more = ++at[k] < shape[k] || (at[k] = 0, false);
+        }
+        unsigned r = 0;
+        while (r < rounds.size() && llvm::any_of(addrs, [&](int64_t a) { return roundAddrs[r].count(a); }))
+          ++r;
+        if (r == rounds.size()) {
+          rounds.emplace_back();
+          roundAddrs.emplace_back();
+        }
+        rounds[r].push_back(ev);
+        roundAddrs[r].insert(addrs.begin(), addrs.end());
+      }
+      for (auto &round : rounds)
+        parts.push_back({st, round});
+    }
   }
   SmallVector<Type> resultTypes;
   for (int w : writtenSet)

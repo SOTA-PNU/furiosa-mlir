@@ -1,8 +1,13 @@
-// RUN: not furiosa-mlir-opt --furiosa-raise-to-linalg %s 2>&1 | FileCheck %s
+// RUN: furiosa-mlir-opt --furiosa-raise-to-linalg %s | FileCheck %s
 
-// A kernel outside the supported subset fails with a diagnostic naming what is unsupported.
+// A scalar atomic add whose old value is unused: y[0] = y[0] + sum(x), a store that starts from the
+// buffer's current value. (An atomic whose old value is used, or a compare-and-swap, is reported.)
 
-// CHECK: error: furiosa: atomics are not raised
+// CHECK-LABEL: func.func @atomic_sum
+// CHECK: %[[SUM:.*]] = linalg.generic {{.*}}["reduction"]
+// CHECK: linalg.generic {{.*}} outs(%arg1 : tensor<1xf32>)
+// CHECK: %[[S:.*]] = tensor.extract %[[SUM]][] : tensor<f32>
+// CHECK: arith.addf %out, %[[S]] : f32
 
 // Triton source:
 // def atomic_sum(x_ptr, y_ptr, BLOCK: tl.constexpr):

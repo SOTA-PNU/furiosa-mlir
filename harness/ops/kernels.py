@@ -12,6 +12,7 @@ REDUCE = ["sum", "max", "min", "argmax", "argmin", "xor_sum"]
 SCAN = ["cumsum", "cumprod", "flip", "sort", "softmax"]
 MISC = ["cast", "clamp", "fma", "full", "zeros_like", "arange"]
 SHAPE = ["trans", "reshape", "expand_dims", "broadcast_to", "permute"]
+ATOMIC = ["atomic_add", "atomic_max", "atomic_min", "atomic_and", "atomic_or", "atomic_xor", "atomic_add_rows"]
 
 
 @triton.jit
@@ -213,7 +214,23 @@ def program_kernel(x_ptr, out_ptr, R: tl.constexpr, C: tl.constexpr):
 
 
 @triton.jit
-def atomic_kernel(x_ptr, out_ptr, R: tl.constexpr, C: tl.constexpr):
+def atomic_kernel(x_ptr, out_ptr, R: tl.constexpr, C: tl.constexpr, OP: tl.constexpr):
+    """Every program combines its row of x into the same row of out (OP < 6), or into its own row of out
+    (OP 6: disjoint footprints)."""
     row = tl.program_id(0)
     c = tl.arange(0, C)
-    tl.atomic_add(out_ptr + c, tl.load(x_ptr + row * C + c))
+    x = tl.load(x_ptr + row * C + c)
+    if OP == 0:
+        tl.atomic_add(out_ptr + c, x)
+    elif OP == 1:
+        tl.atomic_max(out_ptr + c, x)
+    elif OP == 2:
+        tl.atomic_min(out_ptr + c, x)
+    elif OP == 3:
+        tl.atomic_and(out_ptr + c, x)
+    elif OP == 4:
+        tl.atomic_or(out_ptr + c, x)
+    elif OP == 5:
+        tl.atomic_xor(out_ptr + c, x)
+    else:
+        tl.atomic_add(out_ptr + row * C + c, x)
