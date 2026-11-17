@@ -270,10 +270,14 @@ LogicalResult Plan::planLayout() {
     };
     colLocalSize = 0;
     int64_t bestCost = INT64_MAX;
+    // A Vector Engine reduction besides the contraction holds 8 accumulators per slice, as below: four lane groups.
+    bool veReduce = llvm::any_of(llvm::enumerate(p.nodes), [&](auto n) {
+      return n.value().kind == Node::Reduce && n.index() != gemm->node;
+    });
     for (int64_t t = kf; t >= 32; t -= 32) {
       if (!kTileFits(t))
         continue;
-      int64_t maxGroups = kTrfLaneBytes / (2 * t);
+      int64_t maxGroups = std::min<int64_t>(kTrfLaneBytes / (2 * t), veReduce ? 4 : INT64_MAX);
       if (maxGroups < 1)
         continue;
       SmallVector<int64_t> widths;
@@ -303,7 +307,7 @@ LogicalResult Plan::planLayout() {
       for (int64_t t = kf; t >= 32; t -= 32)
         if (kTileFits(t) && kTrfLaneBytes / (2 * t) >= 1) {
           kTile = t;
-          colLocalSize = std::min<int64_t>(kTrfLaneBytes / (2 * t), 128 / kLanes) * kLanes;
+          colLocalSize = std::min<int64_t>({kTrfLaneBytes / (2 * t), 128 / kLanes, veReduce ? 4 : 128}) * kLanes;
           break;
         }
     }

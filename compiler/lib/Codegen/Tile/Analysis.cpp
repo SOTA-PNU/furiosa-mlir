@@ -745,6 +745,18 @@ public:
         return failure();
       return values[v] = *in;
     }
+    // 2^x = e^(x ln 2): the Vector Engine has e^x (within its ulp budget, not bit-exact to exp2).
+    if (isa<math::Exp2Op>(op)) {
+      auto in = scalar(op->getOperand(0), body, values, acc);
+      if (failed(in))
+        return failure();
+      RawNode scaled{Node::Op}, e{Node::Op};
+      scaled.op = "mul";
+      scaled.args = {*in, constant(0.6931471805599453)};
+      e.op = "exp";
+      e.args = {add(scaled)};
+      return values[v] = add(e);
+    }
     std::string name = llvm::TypeSwitch<Operation *, std::string>(op)
                            .Case<arith::AddFOp>([](auto) { return "add"; })
                            .Case<arith::SubFOp>([](auto) { return "sub"; })
@@ -1042,6 +1054,36 @@ FailureOr<Program> mlir::furiosa::tile::analyze(func::FuncOp func, ArrayRef<int6
     return a;
   };
   p.reductionLoop = folder.reductionLoop;
+  auto allLins = [&] {
+    SmallVector<Lin *> lins;
+    for (Read &r : p.reads)
+      for (Lin &l : r.index)
+        lins.push_back(&l);
+    for (Lin &l : p.outIndex)
+      lins.push_back(&l);
+    return lins;
+  };
+  // Drops axis `ai`, which no index uses any more: every later axis moves down by one.
+  auto dropAxis = [&](unsigned ai) {
+    auto shift = [&](unsigned a) { return a > ai ? a - 1 : a; };
+    for (Lin *l : allLins())
+      for (auto &[a, k] : l->terms)
+        a = shift(a);
+    llvm::erase(p.out, ai);
+    for (unsigned &a : p.out)
+      a = shift(a);
+    for (Node &n : p.nodes) {
+      llvm::erase(n.axes, ai);
+      for (unsigned &a : n.axes)
+        a = shift(a);
+    }
+    for (auto &[a, k] : p.loopTiles)
+      a = shift(a);
+    p.axes.erase(p.axes.begin() + ai);
+    p.axisDim.erase(p.axisDim.begin() + ai);
+    for (auto &[da, ta] : axisOf)
+      ta = shift(ta);
+  };
   for (auto [dt, di, t] : folder.tiled) {
     std::optional<unsigned> at = axisOfDim(dt), ai = axisOfDim(di);
     if (!at)
@@ -1050,12 +1092,7 @@ FailureOr<Program> mlir::furiosa::tile::analyze(func::FuncOp func, ArrayRef<int6
       p.loopTiles.push_back({*at, 1});
       continue;
     }
-    SmallVector<Lin *> lins;
-    for (Read &r : p.reads)
-      for (Lin &l : r.index)
-        lins.push_back(&l);
-    for (Lin &l : p.outIndex)
-      lins.push_back(&l);
+    SmallVector<Lin *> lins = allLins();
     for (Lin *l : lins)
       if (l->coeff(*at) != t * l->coeff(*ai)) {
         why = "a tile loop's index used apart from its tile";
@@ -1073,25 +1110,64 @@ FailureOr<Program> mlir::furiosa::tile::analyze(func::FuncOp func, ArrayRef<int6
     p.axisDim[*at].second = 1;
     p.dimExtent[dt] *= t;
     p.loopTiles.push_back({*at, t});
-    // Drop axis ai: every later axis moves down by one.
-    auto shift = [&](unsigned a) { return a > *ai ? a - 1 : a; };
-    for (Lin *l : lins)
-      for (auto &[a, k] : l->terms)
-        a = shift(a);
-    llvm::erase(p.out, *ai);
-    for (unsigned &a : p.out)
-      a = shift(a);
-    for (Node &n : p.nodes) {
-      llvm::erase(n.axes, *ai);
-      for (unsigned &a : n.axes)
-        a = shift(a);
-    }
-    for (auto &[a, k] : p.loopTiles)
-      a = shift(a);
-    p.axes.erase(p.axes.begin() + *ai);
-    p.axisDim.erase(p.axisDim.begin() + *ai);
-    for (auto &[da, ta] : axisOf)
-      ta = shift(ta);
+    dropAxis(*ai);
+  }
+  // Adjacent digits of one dim that every index reads together merge back into one axis: in one buffer dim at
+  // coefficients size(lo) * c and c, or in adjacent buffer dims, the lower one whole (those dims then flatten into
+  // one). A loop the maps reshape apart only at the buffers' dims (a contraction's 256 rows read from a 2 x 128
+  // buffer) is one axis again.
+  for (bool merged = true; merged;) {
+    merged = false;
+    for (unsigned hi = 0; hi < p.axes.size() && !merged; ++hi)
+      for (unsigned lo = 0; lo < p.axes.size() && !merged; ++lo) {
+        if (hi == lo || p.axisDim[hi].first != p.axisDim[lo].first ||
+            p.axisDim[hi].second != p.axisDim[lo].second * p.axes[lo].size ||
+            llvm::any_of(p.loopTiles, [&](auto &t) { return t.first == hi || t.first == lo; }))
+          continue;
+        // Whether the index list reads hi and lo together; `apply` flattens their buffer dims.
+        auto together = [&](SmallVector<Lin> &index, SmallVector<int64_t> &shape, bool fill, bool apply) {
+          std::optional<unsigned> jh, jl;
+          for (auto [j, l] : llvm::enumerate(index)) {
+            if (l.uses(hi) && std::exchange(jh, j))
+              return false;
+            if (l.uses(lo) && std::exchange(jl, j))
+              return false;
+          }
+          if (!jh && !jl)
+            return true;
+          if (!jh || !jl)
+            return false;
+          if (*jh == *jl)
+            return index[*jh].coeff(hi) == index[*jh].coeff(lo) * p.axes[lo].size;
+          Lin &h = index[*jh], &l = index[*jl];
+          if (*jl != *jh + 1 || fill || h.coeff(hi) != 1 || l.terms.size() != 1 || l.offset || l.coeff(lo) != 1 ||
+              shape[*jl] != p.axes[lo].size)
+            return false;
+          if (apply) {
+            for (auto &[a, c] : h.terms)
+              c *= shape[*jl];
+            h.offset *= shape[*jl];
+            h.add(lo, 1);
+            shape[*jh] *= shape[*jl];
+            index.erase(index.begin() + *jl);
+            shape.erase(shape.begin() + *jl);
+          }
+          return true;
+        };
+        bool ok = together(p.outIndex, p.outShape, false, false);
+        for (Read &r : p.reads)
+          ok &= together(r.index, r.shape, r.fill.has_value(), false);
+        if (!ok)
+          continue;
+        together(p.outIndex, p.outShape, false, true);
+        for (Read &r : p.reads)
+          together(r.index, r.shape, r.fill.has_value(), true);
+        for (Lin *l : allLins())
+          llvm::erase_if(l->terms, [&](auto &t) { return t.first == hi; });
+        p.axes[lo].size *= p.axes[hi].size;
+        dropAxis(hi);
+        merged = true;
+      }
   }
   return p;
 }

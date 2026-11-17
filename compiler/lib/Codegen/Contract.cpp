@@ -327,9 +327,13 @@ void collapse(linalg::GenericOp g) {
   auto iters = g.getIteratorTypesArray();
   SmallVector<int64_t> ranges = g.getStaticLoopRanges();
   AffineMap out = g.getMatchingIndexingMap(g.getDpsInitOperand(0));
-  auto dimsOf = [](AffineMap m) {
+  // A constant 0 into a unit dim of the operand rides along like a unit loop dim.
+  auto dimsOf = [](AffineMap m, Value v) {
+    ArrayRef<int64_t> shape = cast<RankedTensorType>(v.getType()).getShape();
     SmallVector<unsigned> ds;
-    for (AffineExpr e : m.getResults()) {
+    for (auto [i, e] : llvm::enumerate(m.getResults())) {
+      if (auto c = dyn_cast<AffineConstantExpr>(e); c && c.getValue() == 0 && shape[i] == 1)
+        continue;
       auto d = dyn_cast<AffineDimExpr>(e);
       if (!d)
         return SmallVector<unsigned>{~0u};
@@ -339,8 +343,9 @@ void collapse(linalg::GenericOp g) {
   };
   // m: the dims only the output and operand 0 share; n: those of operand 1.
   unsigned xi = 0;
-  SmallVector<unsigned> a = dimsOf(g.getIndexingMapsArray()[0]), w = dimsOf(g.getIndexingMapsArray()[1]),
-                        y = dimsOf(out);
+  SmallVector<unsigned> a = dimsOf(g.getIndexingMapsArray()[0], g.getDpsInputs()[0]),
+                        w = dimsOf(g.getIndexingMapsArray()[1], g.getDpsInputs()[1]),
+                        y = dimsOf(out, g.getDpsInits()[0]);
   if (llvm::is_contained(a, ~0u) || llvm::is_contained(w, ~0u) || llvm::is_contained(y, ~0u))
     return;
   SmallVector<unsigned> m, n, k;

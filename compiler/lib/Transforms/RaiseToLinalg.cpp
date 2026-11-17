@@ -2206,15 +2206,19 @@ FailureOr<Value> Raiser::emitLoad(Gen &g, Read load, ArrayRef<Axis> env) {
   }
 
   int64_t numel = buffers[arg].numel();
-  Value i = exprValue(g, *addr);
-  auto data = emitDataTerms(g, *p0, env);
-  if (failed(data))
-    return failure();
   Interval range = bounds(*addr, ranges, symRanges);
   if (range.lo < 0 || range.hi >= numel)
     range = exactBounds(*addr, ranges, symRanges);
+  // A guarded load leaves the buffer only where its value is discarded: it reads the window of addresses it spans,
+  // holding what the clamped address reads, at an affine address from the window's start (which furiosa-structure
+  // promotes). A masked or data-dependent one is clamped in the body.
+  bool padded = !on && p0->data.empty() && (range.lo < 0 || range.hi >= numel) && range.lo < numel && range.hi >= 0;
+  Value i = exprValue(g, padded ? *addr - range.lo : *addr);
+  auto data = emitDataTerms(g, *p0, env);
+  if (failed(data))
+    return failure();
   bool mayLeave = *data || range.lo < 0 || range.hi >= numel;
-  // A load in an iteration that a shorter trip masks off may be clamped: its value is discarded.
+  // A load in an iteration that a shorter trip masks off may leave its buffer: its value is discarded.
   bool guarded = llvm::any_of(g.loopPos, [&](auto kv) { return varTrip[kv.first]; }) ||
                  llvm::any_of(g.loopIv, [&](auto kv) { return varTrip[kv.first]; });
   if (*data)
@@ -2222,10 +2226,49 @@ FailureOr<Value> Raiser::emitLoad(Gen &g, Read load, ArrayRef<Axis> env) {
   if (mayLeave) {
     if (!on && !*data && !guarded)
       return load.emitError("furiosa: an unmasked load may read outside its buffer"), failure();
-    i = arith::MaxSIOp::create(ob, loc, i, arith::ConstantIndexOp::create(ob, loc, 0));
-    i = arith::MinSIOp::create(ob, loc, i, arith::ConstantIndexOp::create(ob, loc, numel - 1));
+    if (!padded) {
+      i = arith::MaxSIOp::create(ob, loc, i, arith::ConstantIndexOp::create(ob, loc, 0));
+      i = arith::MinSIOp::create(ob, loc, i, arith::ConstantIndexOp::create(ob, loc, numel - 1));
+    }
   }
   Value src = flatOf(versionAt(load, arg), arg);
+  if (padded) {
+    int64_t inLo = std::max<int64_t>(range.lo, 0), inHi = std::min<int64_t>(range.hi, numel - 1);
+    OpBuilder::InsertionGuard guard(b);
+    if (Operation *def = src.getDefiningOp())
+      b.setInsertionPointAfter(def);
+    else
+      b.setInsertionPointToStart(src.getParentBlock());
+    MLIRContext *ctx = b.getContext();
+    Type et = cast<RankedTensorType>(src.getType()).getElementType();
+    auto at = [&](int64_t v) { return getAsIndexOpFoldResult(ctx, {v}); };
+    // The window holds what the clamped address would read: the buffer's part of it, its first and last element
+    // repeated before and after (each a box copy or a broadcast).
+    Value window = tensor::EmptyOp::create(b, loc, ArrayRef<int64_t>{range.hi - range.lo + 1}, et);
+    auto put = [&](Value part, int64_t offset) {
+      int64_t n = cast<RankedTensorType>(part.getType()).getDimSize(0);
+      window = tensor::InsertSliceOp::create(b, loc, part, window, at(offset), at(n), at(1));
+    };
+    auto repeat = [&](int64_t element, int64_t n) {
+      Value one = tensor::ExtractSliceOp::create(b, loc, src, at(element), at(1), at(1));
+      Value out = tensor::EmptyOp::create(b, loc, ArrayRef<int64_t>{n}, et);
+      return linalg::GenericOp::create(
+                 b, loc, TypeRange{out.getType()}, ValueRange{one}, ValueRange{out},
+                 ArrayRef<AffineMap>{AffineMap::get(1, 0, b.getAffineConstantExpr(0)), b.getMultiDimIdentityMap(1)},
+                 SmallVector<utils::IteratorType>{utils::IteratorType::parallel},
+                 [](OpBuilder &nb, Location l, ValueRange args) { linalg::YieldOp::create(nb, l, args[0]); })
+          .getResult(0);
+    };
+    if (range.lo < 0)
+      put(repeat(0, -range.lo), 0);
+    put(inLo > 0 || inHi < numel - 1
+            ? tensor::ExtractSliceOp::create(b, loc, src, at(inLo), at(inHi - inLo + 1), at(1)).getResult()
+            : src,
+        inLo - range.lo);
+    if (range.hi >= numel)
+      put(repeat(numel - 1, range.hi - numel + 1), numel - range.lo);
+    src = window;
+  }
   Value elem = tensor::ExtractOp::create(ob, loc, src, ValueRange{i});
   if (Type t = getElementTypeOrSelf(load.getType()); t != elem.getType()) // through a pointer bitcast
     elem = arith::BitcastOp::create(ob, loc, t, elem);

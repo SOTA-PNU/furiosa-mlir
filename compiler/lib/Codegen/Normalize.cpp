@@ -811,6 +811,164 @@ std::optional<bool> decides(arith::CmpIPredicate pred, int64_t lo, int64_t hi) {
   }
 }
 
+/// A reduction whose steps a program-dependent trip count guards, yielding select(j < T(p), acc . t, acc) (a loop
+/// whose trip count varies by program), splits along the parallel loops p the guard reads, in a generic no class
+/// maps as it is: each piece reduces over its own steps, an interval of j, from its slice of the initial value, with
+/// no guard, so no step computes a value it then discards (which a mask could turn into NaN); a piece with no steps
+/// is its slice of the initial value.
+void splitGuardedReductions(ModuleOp module, function_ref<bool(linalg::GenericOp)> mapsAlone) {
+  MLIRContext *ctx = module.getContext();
+  SmallVector<linalg::GenericOp> generics;
+  module.walk([&](linalg::GenericOp g) { generics.push_back(g); });
+  for (linalg::GenericOp g : generics) {
+    SmallVector<int64_t> ranges = g.getStaticLoopRanges();
+    auto iters = g.getIteratorTypesArray();
+    if (g.getNumDpsInits() != 1 || !g.getNumReductionLoops() || ShapedType::isDynamicShape(ranges))
+      continue;
+    Block &body = g.getRegion().front();
+    auto sel = body.getTerminator()->getOperand(0).getDefiningOp<arith::SelectOp>();
+    auto cmp = sel && sel.getFalseValue() == body.getArgument(g.getNumDpsInputs())
+                   ? sel.getCondition().getDefiningOp<arith::CmpIOp>()
+                   : arith::CmpIOp();
+    AffineExpr l = cmp ? affineIndex(cmp.getLhs(), body, ctx) : AffineExpr();
+    AffineExpr r = cmp ? affineIndex(cmp.getRhs(), body, ctx) : AffineExpr();
+    if (!l || !r)
+      continue;
+    auto lin = linearForm(l - r);
+    if (failed(lin))
+      continue;
+    // The guarded step j (one reduction loop) and the parallel loops p the trip reads, read by the output.
+    std::optional<unsigned> j;
+    SmallVector<unsigned> ps;
+    AffineMap out = g.getMatchingIndexingMap(g.getDpsInitOperand(0));
+    bool shaped = true;
+    int64_t pieces = 1;
+    for (auto [d, coef] : lin->second) {
+      if (iters[d] == utils::IteratorType::reduction) {
+        shaped &= !j;
+        j = d;
+      } else {
+        shaped &= out.getResultPosition(getAffineDimExpr(d, ctx)).has_value();
+        ps.push_back(d);
+        pieces *= ranges[d];
+      }
+    }
+    if (!j || ps.empty() || !shaped || pieces > 64 || (mapsAlone && mapsAlone(g)))
+      continue;
+    // Each piece's program indices, and the steps of j its guard admits: an interval [first, end), or none.
+    SmallVector<std::map<unsigned, int64_t>> ats;
+    SmallVector<std::pair<int64_t, int64_t>> steps;
+    bool intervals = true;
+    for (int64_t piece = 0; piece < pieces && intervals; ++piece) {
+      std::map<unsigned, int64_t> at;
+      for (int64_t rest = piece, i = ps.size() - 1; i >= 0; --i) {
+        at[ps[i]] = rest % ranges[ps[i]];
+        rest /= ranges[ps[i]];
+      }
+      int64_t fixed = lin->first, cj = lin->second.at(*j);
+      for (auto [d, v] : at)
+        fixed += lin->second.at(d) * v;
+      int64_t first = -1, end = -1;
+      for (int64_t v = 0; v < ranges[*j]; ++v) {
+        std::optional<bool> on = decides(cmp.getPredicate(), fixed + cj * v, fixed + cj * v);
+        intervals &= on.has_value() && !(*on && end >= 0);
+        if (on && *on && first < 0)
+          first = v;
+        if (on && !*on && first >= 0 && end < 0)
+          end = v;
+      }
+      if (first >= 0 && end < 0)
+        end = ranges[*j];
+      ats.push_back(at);
+      steps.push_back({first, end});
+    }
+    if (!intervals)
+      continue;
+    OpBuilder b(g);
+    Location loc = g.getLoc();
+    auto outType = cast<RankedTensorType>(g.getResult(0).getType());
+    Value result = tensor::EmptyOp::create(b, loc, outType.getShape(), outType.getElementType());
+    for (auto [at, step] : llvm::zip(ats, steps)) {
+      auto [first, end] = step;
+      // The piece's offsets and sizes in the result, along the output dims of p.
+      SmallVector<int64_t> shape(outType.getShape());
+      SmallVector<OpFoldResult> offs(shape.size(), b.getIndexAttr(0)), sizes, ones(shape.size(), b.getIndexAttr(1));
+      for (auto [d, v] : at) {
+        unsigned pos = *out.getResultPosition(getAffineDimExpr(d, ctx));
+        offs[pos] = b.getIndexAttr(v);
+        shape[pos] = 1;
+      }
+      for (int64_t n : shape)
+        sizes.push_back(b.getIndexAttr(n));
+      Value init = tensor::ExtractSliceOp::create(b, loc, g.getDpsInits()[0], offs, sizes, ones);
+      Value value = init;
+      if (first >= 0) {
+        SmallVector<int64_t> pieceRanges(ranges);
+        std::map<unsigned, int64_t> shift(at);
+        shift[*j] = first;
+        for (auto [d, v] : at)
+          pieceRanges[d] = 1;
+        pieceRanges[*j] = end - first;
+        SmallVector<AffineMap> maps;
+        SmallVector<Value> inputs;
+        for (OpOperand *in : g.getDpsInputOperands()) {
+          AffineMap m = g.getMatchingIndexingMap(in);
+          for (auto [d, v] : shift)
+            m = m.replace(getAffineDimExpr(d, ctx), getAffineDimExpr(d, ctx) + v, ranges.size(), 0);
+          auto inType = cast<RankedTensorType>(in->get().getType());
+          SmallVector<OpFoldResult> io(inType.getRank(), b.getIndexAttr(0)), is, ones1(inType.getRank(), b.getIndexAttr(1));
+          for (int64_t n : inType.getShape())
+            is.push_back(b.getIndexAttr(n));
+          bool sliced = false;
+          SmallVector<AffineExpr> exprs;
+          for (auto [k, res] : llvm::enumerate(m.getResults())) {
+            AffineExpr e = withinRanges(simplifyAffineExpr(res, m.getNumDims(), 0), pieceRanges);
+            // A dim read as d + c (d split) is sliced to the piece, so the operand spans its loop d.
+            auto le = linearForm(e);
+            if (succeeded(le) && le->second.size() == 1 && shift.count(le->second.begin()->first) &&
+                le->second.begin()->second == 1) {
+              unsigned d = le->second.begin()->first;
+              io[k] = b.getIndexAttr(le->first);
+              is[k] = b.getIndexAttr(pieceRanges[d]);
+              e = getAffineDimExpr(d, ctx);
+              sliced = true;
+            }
+            exprs.push_back(e);
+          }
+          inputs.push_back(sliced ? tensor::ExtractSliceOp::create(b, loc, in->get(), io, is, ones1).getResult()
+                                  : in->get());
+          maps.push_back(AffineMap::get(m.getNumDims(), 0, exprs, ctx));
+        }
+        maps.push_back(out);
+        auto gp = linalg::GenericOp::create(b, loc, TypeRange{init.getType()}, inputs, ValueRange{init}, maps, iters);
+        IRMapping map;
+        g.getRegion().cloneInto(&gp.getRegion(), map);
+        Block &pb = gp.getRegion().front();
+        for (auto index : llvm::to_vector(pb.getOps<linalg::IndexOp>()))
+          if (auto it = shift.find(index.getDim()); it != shift.end() && it->second) {
+            OpBuilder ib(index->getBlock(), std::next(index->getIterator()));
+            Value shifted = arith::AddIOp::create(ib, loc, index, arith::ConstantIndexOp::create(ib, loc, it->second));
+            index.getResult().replaceAllUsesExcept(shifted, shifted.getDefiningOp());
+          }
+        // Every step of the piece runs: the guard goes.
+        auto ps2 = cast<arith::SelectOp>(map.lookup(sel.getResult()).getDefiningOp());
+        ps2.getResult().replaceAllUsesWith(ps2.getTrueValue());
+        ps2.erase();
+        SmallVector<Operation *> ops;
+        for (Operation &op : pb.without_terminator())
+          ops.push_back(&op);
+        for (Operation *op : llvm::reverse(ops))
+          if (isOpTriviallyDead(op))
+            op->erase();
+        value = gp.getResult(0);
+      }
+      result = tensor::InsertSliceOp::create(b, loc, value, result, offs, sizes, ones);
+    }
+    g.getResult(0).replaceAllUsesWith(result);
+    g.erase();
+  }
+}
+
 /// A generic that only chooses between two reads by an index comparison one loop decides alone (tl.cat's
 /// `i < n ? a : b`, tl.join's `j == 0`) splits at that loop's thresholds: one copy per run of the loop, reading
 /// its own side, inserted into the result. No index table remains, and each run is a box copy. With the oracle, a
@@ -1286,6 +1444,7 @@ void expandMath(ModuleOp module) {
 
 void mlir::furiosa::normalizeKernels(ModuleOp module, function_ref<bool(linalg::GenericOp)> mapsAlone) {
   expandMath(module);
+  splitGuardedReductions(module, mapsAlone);
   nestSelectKeys(module);
   // Affine reads become inputs first: one that wraps splits like a select.
   SmallVector<linalg::GenericOp> reading;
