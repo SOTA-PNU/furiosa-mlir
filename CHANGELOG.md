@@ -40,6 +40,8 @@ npu stage) against GPU goldens.
   indices); the Splitter refuses a step past 256 DMA statements (furiosa-opt's compile time grows superlinearly in
   them). cumsum and cumprod at 1x256x256, cumprod at 1024 lanes, flip at 4x32x128 and 1x256x256 pass on npu3;
   the matrix at 8f7ce01 plus this change: 879 of 907 (5a5c85f).
+- Row-wise: a reduction of a computed term pads its input with the reduction's identity when the term keeps it
+  (MLIR's folders evaluate it): bf16 max at 2x7x33 maps again under the NaN guard (d15e419).
 
 ## 1.1.0 (2026-11-17, release/1.1.0)
 
