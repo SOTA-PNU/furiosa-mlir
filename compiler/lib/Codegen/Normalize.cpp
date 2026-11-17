@@ -1343,6 +1343,134 @@ void nestSelectKeys(ModuleOp module) {
   }
 }
 
+/// A generic yielding one element a data-dependent address reads (tl.gather by data: out[i, j] = x[i, f(x[i, j])])
+/// that the gather class cannot move (a DMA moves 8-byte units) gathers rows of 8 bytes instead: the address a
+/// splits into a row a / g and a lane a % g of g = 8 / (element bytes on the device) elements; the gather class
+/// reads the rows (the buffer reshaped [N / g, g]), copies take each lane, and a select by the lane picks it.
+void splitElementGathers(ModuleOp module, function_ref<bool(linalg::GenericOp)> mapsAlone) {
+  if (!mapsAlone)
+    return;
+  SmallVector<linalg::GenericOp> found;
+  module.walk([&](linalg::GenericOp g) {
+    if (g.getNumDpsInits() != 1 || g.getNumReductionLoops() ||
+        !g.getMatchingIndexingMap(g.getDpsInitOperand(0)).isIdentity())
+      return;
+    auto extract = g.getRegion().front().getTerminator()->getOperand(0).getDefiningOp<tensor::ExtractOp>();
+    if (extract && !g.getRegion().isAncestor(extract.getTensor().getParentRegion()) &&
+        g.getRegion().front().getArguments().back().use_empty() && !mapsAlone(g))
+      found.push_back(g);
+  });
+  for (linalg::GenericOp g : found) {
+    Block &body = g.getRegion().front();
+    auto extract = body.getTerminator()->getOperand(0).getDefiningOp<tensor::ExtractOp>();
+    // A data-dependent address: some index reads a block argument (affine ones promoted to indexing maps).
+    std::function<bool(Value)> data = [&](Value v) {
+      if (auto arg = dyn_cast<BlockArgument>(v))
+        return arg.getOwner() == &body;
+      Operation *op = v.getDefiningOp();
+      return op && op->getBlock() == &body && llvm::any_of(op->getOperands(), data);
+    };
+    auto table = cast<RankedTensorType>(extract.getTensor().getType());
+    Type et = table.getElementType();
+    int64_t bytes = et.isBF16() ? 2 : et.isIntOrFloat() && et.getIntOrFloatBitWidth() <= 32 ? 4 : 0; // f16, i8: 32-bit
+    if (!llvm::any_of(extract.getIndices(), data) || !table.hasStaticShape() || !bytes)
+      continue;
+    int64_t group = 8 / bytes, n = table.getNumElements();
+    if (n % group)
+      continue;
+    OpBuilder b(g);
+    Location loc = g.getLoc();
+    Type i32 = b.getI32Type();
+    auto outType = cast<RankedTensorType>(g.getResult(0).getType());
+    unsigned rank = g.getNumLoops();
+    SmallVector<utils::IteratorType> parallel(rank, utils::IteratorType::parallel);
+    AffineMap id = b.getMultiDimIdentityMap(rank);
+    auto empty = [&](ArrayRef<int64_t> shape, Type t) { return tensor::EmptyOp::create(b, loc, shape, t).getResult(); };
+    // The address, computed as the generic computes it; its row and (in the select) its lane.
+    auto address = linalg::GenericOp::create(b, loc, TypeRange{outType.clone(i32)}, g.getDpsInputs(),
+                                             ValueRange{empty(outType.getShape(), i32)}, g.getIndexingMapsArray(),
+                                             parallel);
+    IRMapping map;
+    g.getRegion().cloneInto(&address.getRegion(), map);
+    Block &sb = address.getRegion().front();
+    sb.getArgument(sb.getNumArguments() - 1).setType(i32);
+    {
+      auto ex = cast<tensor::ExtractOp>(map.lookup(extract.getResult()).getDefiningOp());
+      OpBuilder eb(ex);
+      Value a = arith::ConstantIndexOp::create(eb, loc, 0);
+      int64_t stride = 1;
+      for (int k = table.getRank() - 1; k >= 0; --k) {
+        Value term = arith::MulIOp::create(eb, loc, ex.getIndices()[k], arith::ConstantIndexOp::create(eb, loc, stride));
+        a = arith::AddIOp::create(eb, loc, a, term);
+        stride *= table.getDimSize(k);
+      }
+      sb.getTerminator()->setOperand(0, arith::IndexCastOp::create(eb, loc, i32, a));
+      ex.erase();
+    }
+    auto row = linalg::GenericOp::create(
+        b, loc, TypeRange{outType.clone(i32)}, ValueRange{address.getResult(0)},
+        ValueRange{empty(outType.getShape(), i32)}, ArrayRef<AffineMap>{id, id}, parallel,
+        [&](OpBuilder &nb, Location l, ValueRange args) {
+          Value log = arith::ConstantIntOp::create(nb, l, nb.getI32Type(), llvm::Log2_64(group));
+          linalg::YieldOp::create(nb, l, arith::ShRSIOp::create(nb, l, args[0], log).getResult());
+        });
+    // The rows: out[.., p] = table[row[..] * g + p], the table a buffer reshaped [N / g, g].
+    Value rows = extract.getTensor();
+    if (table.getRank() != 1)
+      rows = tensor::CollapseShapeOp::create(b, loc, RankedTensorType::get({n}, et), rows,
+                                             SmallVector<ReassociationIndices>{llvm::to_vector(llvm::seq<int64_t>(
+                                                 0, table.getRank()))});
+    rows = tensor::ExpandShapeOp::create(b, loc, RankedTensorType::get({n / group, group}, et), rows,
+                                         SmallVector<ReassociationIndices>{{0, 1}});
+    SmallVector<int64_t> pairShape(outType.getShape());
+    pairShape.push_back(group);
+    SmallVector<AffineExpr> lead;
+    for (unsigned d = 0; d < rank; ++d)
+      lead.push_back(b.getAffineDimExpr(d));
+    auto gather = linalg::GenericOp::create(
+        b, loc, TypeRange{RankedTensorType::get(pairShape, et)}, ValueRange{row.getResult(0)},
+        ValueRange{empty(pairShape, et)},
+        ArrayRef<AffineMap>{AffineMap::get(rank + 1, 0, lead, b.getContext()), b.getMultiDimIdentityMap(rank + 1)},
+        SmallVector<utils::IteratorType>(rank + 1, utils::IteratorType::parallel),
+        [&](OpBuilder &nb, Location l, ValueRange args) {
+          Value r = arith::IndexCastOp::create(nb, l, nb.getIndexType(), args[0]);
+          Value p = linalg::IndexOp::create(nb, l, rank);
+          linalg::YieldOp::create(nb, l, tensor::ExtractOp::create(nb, l, rows, ValueRange{r, p}).getResult());
+        });
+    // Each lane a box of the rows; a select by the lane takes it.
+    SmallVector<Value> ins{address.getResult(0)};
+    SmallVector<ReassociationIndices> drop;
+    for (unsigned d = 0; d < rank; ++d)
+      drop.push_back({int64_t(d)});
+    drop.back().push_back(rank);
+    SmallVector<int64_t> boxShape(outType.getShape());
+    boxShape.push_back(1);
+    for (int64_t k = 0; k < group; ++k) {
+      SmallVector<OpFoldResult> offs(rank + 1, b.getIndexAttr(0)), sizes, strides(rank + 1, b.getIndexAttr(1));
+      offs[rank] = b.getIndexAttr(k);
+      for (int64_t e : boxShape)
+        sizes.push_back(b.getIndexAttr(e));
+      Value box = tensor::ExtractSliceOp::create(b, loc, RankedTensorType::get(boxShape, et), gather.getResult(0), offs,
+                                                 sizes, strides);
+      ins.push_back(tensor::CollapseShapeOp::create(b, loc, outType, box, drop));
+    }
+    auto pick = linalg::GenericOp::create(
+        b, loc, TypeRange{outType}, ins, ValueRange{empty(outType.getShape(), et)},
+        SmallVector<AffineMap>(ins.size() + 1, id), parallel, [&](OpBuilder &nb, Location l, ValueRange args) {
+          Value v = args[1];
+          Value lane = arith::AndIOp::create(nb, l, args[0], arith::ConstantIntOp::create(nb, l, nb.getI32Type(), group - 1));
+          for (int64_t k = 1; k < group; ++k) {
+            Value is = arith::CmpIOp::create(nb, l, arith::CmpIPredicate::eq, lane,
+                                             arith::ConstantIntOp::create(nb, l, nb.getI32Type(), k));
+            v = arith::SelectOp::create(nb, l, is, args[k + 1], v);
+          }
+          linalg::YieldOp::create(nb, l, v);
+        });
+    g.getResult(0).replaceAllUsesWith(pick.getResult(0));
+    g.erase();
+  }
+}
+
 /// Math ops the Vector Engine lacks, in ones it has: asin, acos, atan and atan2 by MLIR's polynomial
 /// approximations (whose fma and copysign expand below), copysign(a, b) = b < 0 ? -|a| : |a|, fma(a, b, c) =
 /// a*b + c (rounded twice), log2(x) = ln(x) * log2(e) (within the engine's ln ulp budget, not bit-exact), and
@@ -1351,7 +1479,8 @@ void nestSelectKeys(ModuleOp module) {
 /// integers already and pass through (the conversion would saturate). Unsigned i32 min and max compare signed with
 /// the sign bits flipped (which maps unsigned order onto signed order): minui(a, b) = minsi(a ^ s, b ^ s) ^ s. An
 /// i32 mului_extended (tl.umulhi) is the wrapping product and its high half from 16-bit limbs (the engine's
-/// integer multiply wraps). A widened i1 is a select: extui(c) = c ? 1 : 0, extsi(c) = c ? -1 : 0.
+/// integer multiply wraps). A widened i1 is a select: extui(c) = c ? 1 : 0, extsi(c) = c ? -1 : 0. A signed
+/// remainder by a power of two m truncates toward zero: remsi(a, m) = a - ((a + ((a >>s 31) & (m - 1))) & -m).
 void expandMath(ModuleOp module) {
   RewritePatternSet approximations(module.getContext());
   populateMathPolynomialApproximationPatterns(approximations, [](StringRef name) {
@@ -1380,6 +1509,19 @@ void expandMath(ModuleOp module) {
     op->getResult(0).replaceAllUsesWith(
         arith::SelectOp::create(b, op->getLoc(), op->getOperand(0), c(isa<arith::ExtUIOp>(op) ? 1 : -1), c(0)));
     op->erase();
+  });
+  module.walk([&](arith::RemSIOp op) {
+    APInt m;
+    if (!op.getType().isInteger(32) || !matchPattern(op.getRhs(), m_ConstantInt(&m)) || !m.isStrictlyPositive() ||
+        !m.isPowerOf2())
+      return;
+    OpBuilder b(op);
+    Location loc = op.getLoc();
+    auto c = [&](int64_t v) { return arith::ConstantOp::create(b, loc, b.getI32IntegerAttr(v)).getResult(); };
+    Value a = op.getLhs(), bias = arith::AndIOp::create(b, loc, arith::ShRSIOp::create(b, loc, a, c(31)), c(m.getSExtValue() - 1));
+    Value q = arith::AndIOp::create(b, loc, arith::AddIOp::create(b, loc, a, bias), c(-m.getSExtValue()));
+    op.getResult().replaceAllUsesWith(arith::SubIOp::create(b, loc, a, q).getResult());
+    op.erase();
   });
   module.walk([&](arith::MulUIExtendedOp op) {
     if (!op.getType(0).isInteger(32))
@@ -1495,6 +1637,7 @@ void mlir::furiosa::normalizeKernels(ModuleOp module, function_ref<bool(linalg::
   module.walk([&](linalg::GenericOp g) { reading.push_back(g); });
   for (linalg::GenericOp g : reading)
     promoteExtracts(g);
+  splitElementGathers(module, mapsAlone);
   splitIndexSelects(module, mapsAlone);
   selectionReductions(module);
   treeReductions(module);
