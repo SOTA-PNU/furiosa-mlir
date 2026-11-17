@@ -89,9 +89,13 @@ def steps(structured: str) -> str:
 
 def compile_model(model_path: Path, out: Path, keep_going: bool = False) -> dict:
     """Compiles every launch specialization of the model's graphs into ``out`` and writes graph.json."""
-    model = load_model(model_path)
+    return compile_graphs(load_model(model_path).graphs(), str(model_path), out, keep_going)
+
+
+def compile_graphs(model_graphs, model: str, out: Path, keep_going: bool = False) -> dict:
+    """compile_model for graphs already in hand (a single launch from the NPU launcher, say)."""
     kernels, by_key, counts, graphs = {}, {}, {}, []
-    for graph in model.graphs():
+    for graph in model_graphs:
         launches = []
         for launch in graph.launches:
             src, options, names, pointer_args = specialize(launch)
@@ -126,7 +130,7 @@ def compile_model(model_path: Path, out: Path, keep_going: bool = False) -> dict
             entry["written"] = kernel.written()
             entry["linalg"] = f"kernels/{symbol}/linalg.mlir"
         summary[symbol] = entry
-    result = {"model": str(model_path), "kernels": summary, "graphs": graphs}
+    result = {"model": model, "kernels": summary, "graphs": graphs}
     out.mkdir(parents=True, exist_ok=True)
     (out / "graph.json").write_text(json.dumps(result, indent=2) + "\n")
     return result

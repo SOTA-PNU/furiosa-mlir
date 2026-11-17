@@ -62,7 +62,7 @@ class FuriosaBackend(BaseBackend):
 
     def __init__(self, target: GPUTarget) -> None:
         super().__init__(target)
-        self.binary_ext = "linalg"
+        self.binary_ext = "ttir"  # the launch binary: the NPU launcher compiles each launch from its TTIR
 
     def hash(self) -> str:
         # triton_key() hashes libtriton but not this backend (its directory is no Python package), so the
@@ -103,6 +103,8 @@ class FuriosaBackend(BaseBackend):
         passes.common.add_symbol_dce(pm)
         passes.ttir.add_loop_unroll(pm)
         pm.run(mod, "make_ttir")
+        metadata["shared"], metadata["warp_size"] = 0, 1  # read by Triton's launch path
+        metadata["name"] = mod.get_entry_func_name()
         return mod
 
     @staticmethod
@@ -151,6 +153,10 @@ class FuriosaBackend(BaseBackend):
         if language != Language.TRITON:
             raise NotImplementedError(f"the furiosa backend compiles Triton kernels, not {language}")
         stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
+        if options.buffers == "[]":
+            # kernel[grid](...): Triton compiles before it knows the launch; the launcher compiles the
+            # specialized launch through every stage (furiosa_compiler.npu).
+            return
         stages["linalg"] = lambda src, metadata: self.make_linalg(src, metadata, options)
         stages["structured"] = lambda src, metadata: self.make_structured(src, metadata, options)
         stages["fopt"] = lambda src, metadata: self.make_fopt(src, metadata, options)

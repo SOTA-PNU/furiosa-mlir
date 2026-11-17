@@ -20,6 +20,18 @@ compiler/build.sh          # incremental rebuild of libtriton after C++ changes 
 ```
 
 `triton/backends/furiosa` is a symlink to `compiler/backend`, so Python changes need no rebuild.
+The compiler venv also needs CPU-only torch for `kernel[grid](...)` on host tensors:
+`uv pip install --python compiler/.venv/bin/python torch --index-url https://download.pytorch.org/whl/cpu`.
+
+## Triton launches run on the NPU
+
+In the compiler venv the furiosa driver is always Triton's active driver (`compiler/backend/driver.py`), so
+calling a `@triton.jit` kernel, `kernel[grid](x, y, out, n, BLOCK=1024)`, runs it on npu3: Triton compiles its
+TTIR, then the launcher specializes the launch (scalars as constexprs, the grid, each tensor's dtype and
+shape), compiles it through every stage into a crate, builds it once per specialization under
+`~/.cache/furiosa-npu`, runs it on npu3 and copies the written tensors back (`furiosa_compiler/npu.py`).
+Nothing falls back to the CPU or GPU: a kernel the compiler cannot map raises its diagnostic.
+`compiler/tests/test_npu_launch.py` checks it.
 
 ## Layout
 
