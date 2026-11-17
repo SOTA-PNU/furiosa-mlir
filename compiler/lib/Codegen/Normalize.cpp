@@ -1087,7 +1087,8 @@ void relayoutReads(linalg::GenericOp g, function_ref<bool(linalg::GenericOp)> ma
 
 /// A reduction no class maps whose inputs each vary along only some of its loops (tl.histogram: the values along
 /// the reduced loop, the bins along the other) reads the one spanning the reduced loops broadcast over the rest
-/// (a relayout, one DMA): the row-wise class streams a full tile of rows and columns.
+/// (a relayout, one DMA): the row-wise class streams a full tile of rows and columns. Only when that input is the
+/// only one the reduced loops index: a contraction's two operands both read them (normalizeContractions' case).
 void broadcastStreams(linalg::GenericOp g, function_ref<bool(linalg::GenericOp)> mapsAlone) {
   unsigned n = g.getNumLoops();
   auto spans = [&](AffineMap m, auto pred) {
@@ -1100,9 +1101,14 @@ void broadcastStreams(linalg::GenericOp g, function_ref<bool(linalg::GenericOp)>
       llvm::any_of(g.getDpsInputOperands(), [&](OpOperand *in) { return spans(g.getMatchingIndexingMap(in), all); }))
     return;
   OpOperand *stream = nullptr;
-  for (OpOperand *in : g.getDpsInputOperands())
-    if (g.getMatchingIndexingMap(in).isProjectedPermutation() && spans(g.getMatchingIndexingMap(in), reduced))
-      stream = in;
+  for (OpOperand *in : g.getDpsInputOperands()) {
+    AffineMap m = g.getMatchingIndexingMap(in);
+    if (llvm::none_of(llvm::seq<unsigned>(0, n), [&](unsigned d) { return reduced(d) && m.isFunctionOfDim(d); }))
+      continue;
+    if (stream || !m.isProjectedPermutation() || !spans(m, reduced))
+      return;
+    stream = in;
+  }
   if (!stream || mapsAlone(g))
     return;
   OpBuilder b(g);
