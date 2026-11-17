@@ -55,6 +55,9 @@ FailureOr<Copy> find(RaisedKernel &kernel) {
     if (!c.to && fill && matchPattern(fill.getInputs()[0], m_AnyZeroFloat()) &&
         fill.getOutputs()[0].getDefiningOp<tensor::EmptyOp>())
       c.to = func.getArgument(kernel.written[0]);
+    // An insert into an empty tensor writes the box alone: the rest is undefined (other inserts fill it).
+    if (!c.to && insert.getDest().getDefiningOp<tensor::EmptyOp>())
+      c.to = func.getArgument(kernel.written[0]);
     if (c.to && int64_t(c.to.getArgNumber()) != kernel.written[0] &&
         cast<RankedTensorType>(c.to.getType()) == cast<RankedTensorType>(func.getArgument(kernel.written[0]).getType())) {
       c.seed = c.to;

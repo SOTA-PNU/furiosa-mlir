@@ -52,8 +52,10 @@ LogicalResult translateFoptToRust(ModuleOp module, llvm::raw_ostream &os);
 FailureOr<std::string> foptSignature(ModuleOp module);
 
 /// Rewrites reads through mixed-radix map results (d1 * 128 + d2) into projected reads of the buffer reshaped by
-/// the radices and cut to a box, and drops inputs that only carried loop extents (lib/Codegen/Normalize.cpp).
-void normalizeKernels(ModuleOp module);
+/// the radices and cut to a box, drops inputs that only carried loop extents, and splits a generic that only
+/// chooses between two reads by an index into copies, unless `mapsAlone` says it maps as a step of its own
+/// (lib/Codegen/Normalize.cpp).
+void normalizeKernels(ModuleOp module, function_ref<bool(linalg::GenericOp)> mapsAlone = {});
 
 /// Takes contractions apart into the 2-D form op classes map: computed factors become producers, a non-zero
 /// start is added after, batch dims split into slices, dims collapse (lib/Codegen/Contract.cpp).

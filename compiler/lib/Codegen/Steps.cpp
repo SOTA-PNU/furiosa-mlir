@@ -159,7 +159,8 @@ bool mapsWhole(func::FuncOp func) {
   return false;
 }
 
-/// Whether some op class maps `g` as a step of its own: its inputs as buffers, a fill init kept.
+/// Whether some op class maps `g` as a step of its own: its inputs as buffers, a fill init kept, index-only
+/// values as tables (as hoistIndexOnly leaves the steps).
 bool mapsAlone(linalg::GenericOp g) {
   OpBuilder b(g.getContext());
   Location loc = g.getLoc();
@@ -185,9 +186,10 @@ bool mapsAlone(linalg::GenericOp g) {
   }
   Operation *copy = b.clone(*g, map);
   func::ReturnOp::create(b, loc, copy->getResults());
-  bool ok = mapsWhole(func);
-  func.erase();
-  return ok;
+  OwningOpRef<ModuleOp> holder = ModuleOp::create(loc);
+  holder->push_back(func);
+  hoistIndexOnly(*holder);
+  return mapsWhole(func);
 }
 
 /// A step: the unit ops it owns (it produces their values for the other steps), and those of other steps it
@@ -689,9 +691,11 @@ void Splitter::run(bool single) {
         continue;
       Value dest;
       for (OpOperand &use : terminator->getOpOperands()) {
+        // Through reshapes, and inserts that update `out` in place on the way to the return.
         Value v = use.get();
-        while (v.getDefiningOp() && isReshape(v.getDefiningOp()) && v != out)
-          v = v.getDefiningOp()->getOperand(0);
+        while (v != out && v.getDefiningOp() && (isReshape(v.getDefiningOp()) || isa<tensor::InsertSliceOp>(v.getDefiningOp())))
+          v = isa<tensor::InsertSliceOp>(v.getDefiningOp()) ? v.getDefiningOp<tensor::InsertSliceOp>().getDest()
+                                                           : v.getDefiningOp()->getOperand(0);
         if (v != out || !written)
           continue;
         unsigned index = cast<IntegerAttr>(written[use.getOperandNumber()]).getInt();
@@ -788,7 +792,7 @@ LogicalResult mlir::furiosa::splitSteps(ModuleOp module) {
     return success();
   if (failed(unrollKeptLoops(module)))
     return failure();
-  normalizeKernels(module);
+  normalizeKernels(module, mapsAlone);
   normalizeContractions(module, mapsAlone);
   // Reads the normalization rewrote alike (each operand gets its own reshape and box) become one again.
   PassManager pm(module.getContext());
