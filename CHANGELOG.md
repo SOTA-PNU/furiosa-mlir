@@ -6,6 +6,10 @@ npu stage) against GPU goldens.
 
 ## 1.3.0 (unreleased, main)
 
+- The tiled path's NaN-skipping clean value is exact: two logic ops under one tag ((x | m) & m = m where the tag
+  fails, x where it holds) instead of AbsMax, which propagated NaN. Tiled relus and reductions now skip NaN on
+  npu3 as on the GPU (relu, min, row and column max of NaN, +-inf and NaN-payload inputs exact); run time
+  unchanged (vgg16 3.01 vs 3.02 s, resnet101 2.19 vs 2.20 s) (0a7d88d).
 - A data-dependent element gather the 8-byte DMA rule blocks gathers 8-byte rows at the even-aligned address and
   selects the half by the address's parity (exact for any bits); a signed remainder by a power of two expands to
   shifts and masks: `extra.gather_data` on npu3 (832a9e3).
