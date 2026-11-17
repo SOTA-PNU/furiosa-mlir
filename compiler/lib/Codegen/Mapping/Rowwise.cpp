@@ -824,6 +824,7 @@ private:
   MapAttr H, slice; // H: the column axis, padded to whole packets
   MapAttr columns;   // the columns HBM holds (H resized to them)
   std::map<int, float> padFill; // padded rows: input node -> the identity of the reduction that reads it
+  Operation *loop = nullptr;    // the device loop over row tiles: scratch buffers are allocated (and filled) before it
   std::map<int, Value> materialized; // node -> DmTensor (Full: [slice, H], Row: [slice, 1 # 8])
   std::map<int, Value> vrfs;         // node -> VrfTensor
   std::map<int, unsigned> params;    // input node -> kernel parameter
@@ -1543,15 +1544,22 @@ Value Planner::loadInput(const Node &n, Value hbmView, MapAttr viewMap) {
   MapAttr staged = scratchMap(viewMap, n.col, live);
   if (!staged)
     return ViewToDmOp::create(b, loc, dm, hbmView);
-  Value scratch = AllocHbmOp::create(b, loc, kb.hbmType(n.type, staged));
-  Value into = ViewOp::create(b, loc, HbmViewType::get(ctx, n.type, kb.chip(), staged, true), scratch);
-  if (auto it = padFill.find(&n - dag.nodes.data()); it != padFill.end()) {
-    // Eight bytes of the fill, broadcast by the DMA over the scratch; the copy then writes the columns.
-    Value fill =
-        AllocDmOp::create(b, loc, kb.dmType(n.type, kb.one().padTo(kSlices), rowPacket(n.type.isBF16() ? 4 : 2)));
-    MemsetOp::create(b, loc, fill, b.getF32FloatAttr(it->second));
-    DmToHbmViewOp::create(b, loc, fill, ViewOp::create(b, loc, into.getType(), scratch));
+  Value scratch;
+  {
+    // In the device loop the scratch is the loop's: its padding is filled once, and each tile writes the columns.
+    OpBuilder::InsertionGuard guard(b);
+    if (loop)
+      b.setInsertionPoint(loop);
+    scratch = AllocHbmOp::create(b, loc, kb.hbmType(n.type, staged));
+    if (auto it = padFill.find(&n - dag.nodes.data()); it != padFill.end()) {
+      // Eight bytes of the fill, broadcast by the DMA over the scratch; the copy then writes the columns.
+      Value fill =
+          AllocDmOp::create(b, loc, kb.dmType(n.type, kb.one().padTo(kSlices), rowPacket(n.type.isBF16() ? 4 : 2)));
+      MemsetOp::create(b, loc, fill, b.getF32FloatAttr(it->second));
+      DmToHbmViewOp::create(b, loc, fill, ViewOp::create(b, loc, HbmViewType::get(ctx, n.type, kb.chip(), staged, true), scratch));
+    }
   }
+  Value into = ViewOp::create(b, loc, HbmViewType::get(ctx, n.type, kb.chip(), staged, true), scratch);
   HbmToHbmViewOp::create(b, loc, hbmView, n.col ? interior(into, staged, true, live) : into);
   return ToDmOp::create(b, loc, dm, scratch);
 }
@@ -1593,7 +1601,16 @@ void Planner::storeOutput(size_t k, Value dm, Value hbmView, MapAttr viewMap) {
     DmToHbmViewOp::create(b, loc, dm, hbmView);
     return;
   }
-  Value scratch = ToHbmOp::create(b, loc, kb.hbmType(et, staged), dm);
+  Value scratch;
+  if (loop) {
+    OpBuilder::InsertionGuard guard(b);
+    b.setInsertionPoint(loop);
+    scratch = AllocHbmOp::create(b, loc, kb.hbmType(et, staged));
+  }
+  if (scratch)
+    DmToHbmViewOp::create(b, loc, dm, ViewOp::create(b, loc, HbmViewType::get(ctx, et, kb.chip(), staged, true), scratch));
+  else
+    scratch = ToHbmOp::create(b, loc, kb.hbmType(et, staged), dm);
   Value from = ViewOp::create(b, loc, HbmViewType::get(ctx, et, kb.chip(), staged, false), scratch);
   HbmToHbmViewOp::create(b, loc, rootRow(k) ? from : interior(from, staged, false), hbmView);
 }
@@ -1624,7 +1641,19 @@ FailureOr<SmallVector<Value>> Planner::emitBody(func::FuncOp func) {
   // tile view (the others broadcast as they are), and writes its rows of the outputs through a mutable one.
   MapAttr outer = rowAxes.front().second;
   int64_t extent = outer.size(), step = dag.tileStep;
-  for (int64_t start = 0; start < extent; start += step) {
+  // Whole tiles run as one device loop: the body emitted once, its tile views indexed by the induction variable
+  // (unrolled tiles cost the NPU compile time and kernel size superlinearly).
+  OpBuilder::InsertionGuard guard(b);
+  Value iv;
+  if (extent % step == 0 && extent / step > 1) {
+    auto f = ForOp::create(b, loc, b.getI64IntegerAttr(extent / step));
+    Block *body = new Block();
+    f.getBody().push_back(body);
+    iv = body->addArgument(b.getIndexType(), loc);
+    b.setInsertionPointToStart(body);
+    loop = f;
+  }
+  for (int64_t start = 0; start < (iv ? step : extent); start += step) {
     int64_t len = std::min(step, extent - start);
     slice = rowsMap(len);
     materialized.clear();
@@ -1640,9 +1669,12 @@ FailureOr<SmallVector<Value>> Planner::emitBody(func::FuncOp func) {
                             ? outer.resize(len).padTo(extent, mut ? PadKind::Bottom : PadKind::Top)
                             : cast<MapAttr>(a));
       MapAttr part = MapAttr::pair(ctx, parts);
-      return {TileOp::create(b, loc, HbmViewType::get(ctx, et, kb.chip(), part, mut), v, outer,
-                             b.getI64IntegerAttr(len), b.getI64IntegerAttr(start)),
-              part};
+      auto type = HbmViewType::get(ctx, et, kb.chip(), part, mut);
+      if (iv)
+        return {TileAtOp::create(b, loc, type, v, outer, b.getI64IntegerAttr(len), b.getI64IntegerAttr(0),
+                                 ValueRange{iv}, b.getDenseI64ArrayAttr({step})),
+                part};
+      return {TileOp::create(b, loc, type, v, outer, b.getI64IntegerAttr(len), b.getI64IntegerAttr(start)), part};
     };
     for (auto [i, p] : params) {
       Node &n = dag.nodes[i];
@@ -1651,6 +1683,8 @@ FailureOr<SmallVector<Value>> Planner::emitBody(func::FuncOp func) {
         auto [view, map] = tileOf(kb.param(p), n.type, inputMap(n), false);
         inputDm[i] = loadInput(n, view, map);
       } else {
+        // shortcut: the same rows every tile, still loaded in the loop (DM tensors from before a device loop that
+        // its passes stream or put in the VRF fail furiosa-opt's scheduler: "schedule base graph has a cycle").
         Value view = ViewOp::create(b, loc, HbmViewType::get(ctx, n.type, kb.chip(), inputMap(n), false), kb.param(p));
         inputDm[i] = loadInput(n, view, inputMap(n));
       }

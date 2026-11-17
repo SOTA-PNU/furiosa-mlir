@@ -148,6 +148,10 @@ SmallVector<DenseElementsAttr> externalize(func::FuncOp func) {
   return data;
 }
 
+/// furiosa-opt compiles a kernel in time superlinear in its unrolled DMA statements (a 733-DMA conv took hours;
+/// the corpus's largest kernels have about 110): a step candidate beyond this many is split instead.
+constexpr unsigned kStepDmas = 256;
+
 bool mapsWhole(func::FuncOp func) {
   OpBuilder b(func.getContext());
   OwningOpRef<ModuleOp> scratch = ModuleOp::create(b, func.getLoc());
@@ -158,7 +162,7 @@ bool mapsWhole(func::FuncOp func) {
   scratch->push_back(copy);
   externalize(copy);
   for (const OpClass &c : opClasses())
-    if (mapsOnCopy(copy, c))
+    if (mapsOnCopy(copy, c, kStepDmas))
       return true;
   // FURIOSA_DEBUG=1 prints why a candidate step does not map.
   if (getenv("FURIOSA_DEBUG")) {

@@ -116,8 +116,9 @@ ArrayRef<OpClass> opClasses();
 const OpClass *matchClass(RaisedKernel &kernel);
 /// The pointer-argument names (from NameLocs on the arguments) and `furiosa.written` of a raised function.
 RaisedKernel raisedKernel(func::FuncOp func);
-/// Whether op class `c` maps `func` (tried on a copy, its diagnostics dropped).
-bool mapsOnCopy(func::FuncOp func, const OpClass &c);
+/// Whether op class `c` maps `func` (tried on a copy, its diagnostics dropped), with at most `maxDmas` DMA
+/// statements (a device loop's body counted once).
+bool mapsOnCopy(func::FuncOp func, const OpClass &c, unsigned maxDmas = ~0u);
 /// Maps a raised kernel with the first matching op class that maps it.
 LogicalResult mapKernel(func::FuncOp func);
 

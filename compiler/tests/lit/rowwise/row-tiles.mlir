@@ -5,7 +5,8 @@
 // Rows beyond the 256 slices (here 32 x 16 rows of a row max) take windows of the outermost row dim: 16 of its
 // rows, which with the 16 rows inside fill the slices. One decision (Rowwise's rowTile) serves both paths:
 // furiosa-tile makes it a loop over the root generic, and the row-wise class maps that tiled kernel to the same
-// fopt as the untiled one, a pass sequence per window over tile views.
+// fopt as the untiled one: one device loop over the windows, the pass sequence emitted once over tile views its
+// induction variable indexes (its scratch allocated before the loop).
 
 // LOOP-LABEL: func.func @rowmax
 // LOOP: scf.for %{{.*}} = %c0 to %c32 step %c16 iter_args
@@ -13,12 +14,12 @@
 
 // FOPT-LABEL: func.func @rowmax
 // FOPT-SAME: !fopt.hbm<f32, <"1">, <"R{32}, R1{16}">> {fopt.arg = 1 : i64, fopt.inout
-// FOPT: fopt.tile %{{.*}} index <"R{32}"> len 16 start 0 : {{.*}} false>
+// FOPT: fopt.alloc_hbm
+// FOPT: "fopt.for"() <{count = 2 : i64}>
+// FOPT: "fopt.tile_at"({{.*}}) <{coeffs = array<i64: 16>, index = #fopt.m<"R{32}">, len = 16 : i64, start = 0 : i64}> {{.*}} false>
 // FOPT: fopt.vector_intra_slice_reduce "Max"
-// FOPT: fopt.tile %{{.*}} index <"R{32}"> len 16 start 0 : {{.*}} true>
-// FOPT: fopt.tile %{{.*}} index <"R{32}"> len 16 start 16 : {{.*}} false>
-// FOPT: fopt.vector_intra_slice_reduce "Max"
-// FOPT: fopt.tile %{{.*}} index <"R{32}"> len 16 start 16 : {{.*}} true>
+// FOPT: "fopt.tile_at"({{.*}}) <{coeffs = array<i64: 16>, index = #fopt.m<"R{32}">, len = 16 : i64, start = 0 : i64}> {{.*}} true>
+// FOPT-NOT: fopt.vector_intra_slice_reduce
 #x = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
 #r = affine_map<(d0, d1, d2) -> (d0, d1)>
 module {

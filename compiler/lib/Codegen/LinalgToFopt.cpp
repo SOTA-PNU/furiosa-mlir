@@ -305,7 +305,7 @@ RaisedKernel mapping::raisedKernel(func::FuncOp func) { return {func, argNames(f
 /// A launch passes the device and the kernel's parameters as one tuple, which furiosa-opt takes up to 24 long.
 static constexpr unsigned kMaxParams = 23;
 
-bool mapping::mapsOnCopy(func::FuncOp func, const OpClass &c) {
+bool mapping::mapsOnCopy(func::FuncOp func, const OpClass &c, unsigned maxDmas) {
   OpBuilder b(func.getContext());
   OwningOpRef<ModuleOp> scratch = ModuleOp::create(b, func.getLoc());
   if (ModuleOp parent = func->getParentOfType<ModuleOp>())
@@ -321,7 +321,13 @@ bool mapping::mapsOnCopy(func::FuncOp func, const OpClass &c) {
     return false;
   // A class whose mapping does not verify does not map the kernel (codegen would fail on it).
   auto kernel = scratch->lookupSymbol<func::FuncOp>(func.getName());
-  return kernel && kernel.getNumArguments() <= kMaxParams && succeeded(verify(kernel));
+  unsigned dmas = 0;
+  if (kernel)
+    kernel.walk([&](Operation *op) {
+      dmas += isa<fopt::StageOp, fopt::ReadOp, fopt::ToDmOp, fopt::ViewToDmOp, fopt::ToHbmOp, fopt::DmToHbmViewOp,
+                  fopt::HbmToHbmViewOp, fopt::GatherOp>(op);
+    });
+  return kernel && kernel.getNumArguments() <= kMaxParams && dmas <= maxDmas && succeeded(verify(kernel));
 }
 
 LogicalResult mapping::mapKernel(func::FuncOp func) {
