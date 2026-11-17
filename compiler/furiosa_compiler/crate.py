@@ -230,6 +230,7 @@ class RunGraph:
         self.plans = plans  # kernel symbol -> launch plan (codegen)
         self.crate = crate
         self.axes = []  # (name, size) host-side axes, one per buffer dimension
+        self.kernel_args = {}  # kernel symbol -> its pointer arguments' roles, dtypes and sizes
 
     def host_mapping(self, g: int, names: dict, buffer: str, shape: list) -> str:
         """m![...] of the host-side (row-major) layout of a buffer, declaring its axes."""
@@ -243,6 +244,112 @@ class RunGraph:
                 self.axes.append((axis, size))
             dims.append(axis)
         return f"m![{', '.join(dims)}]"
+
+    def kernel_fn(self, symbol: str) -> str:
+        """The async fn that runs one kernel's steps on its pointer arguments (the buffers it reads come in as
+        aliases; those it writes fresh go back), shared by every launch of the kernel: rustc's time grows with
+        the code it checks, so the glue scales with distinct kernels, not launches."""
+        info = self.kernel_args[symbol]
+        plan, lines, defined = self.plans[symbol], [], set()
+
+        def zeros(name: str, rust_dtype: str, elements: int):
+            axis = f"Z{elements}"
+            if (axis, elements) not in self.axes:
+                self.axes.append((axis, elements))
+            lines.append(
+                f"    let {name} = HostTensor::<{rust_dtype}, m![{axis}]>::zero()"
+                f".to_hbm::<m![1], m![{axis}]>(&mut device.pdma).await?.into_buffer();"
+            )
+            defined.add(name)
+
+        for k, step in enumerate(plan["steps"]):
+            sig = self.signatures[step["module"]]
+            module = f"kernel::{step['module']}"
+
+            def slot(arg: int) -> tuple[str, str, int]:
+                """The variable behind a pointer argument of the step, its Rust dtype and element count."""
+                where = {"buffer": arg} if step["args"] is None else step["args"][arg]
+                if "const" in where:
+                    const = plan["consts"][where["const"]]
+                    if const["dtype"] not in MLIR_DTYPES:
+                        raise CrateError(f"{symbol}: table of {const['dtype']} has no furiosa-opt host type")
+                    name, elements = f"c{where['const']}", math.prod(const["shape"])
+                    if name not in defined:
+                        axis = f"Z{elements}"
+                        if (axis, elements) not in self.axes:
+                            self.axes.append((axis, elements))
+                        lines.append(
+                            f"    let {name} = HostTensor::<{MLIR_DTYPES[const['dtype']]}, m![{axis}]>::from_buf("
+                            f"include_bytes!(\"consts/{symbol}_{where['const']}.bin\").to_vec())"
+                            f".to_hbm::<m![1], m![{axis}]>(&mut device.pdma).await?.into_buffer();"
+                        )
+                        defined.add(name)
+                    return name, MLIR_DTYPES[const["dtype"]], elements
+                if "buffer" in where:
+                    a = where["buffer"]
+                    return f"p{a}", info["dtypes"][a], info["elements"][a]
+                temp = plan["temps"][where["temp"]]
+                if temp["dtype"] not in MLIR_DTYPES:
+                    raise CrateError(f"{symbol}: temporary of {temp['dtype']} has no furiosa-opt host type")
+                return f"t{where['temp']}", MLIR_DTYPES[temp["dtype"]], math.prod(temp["shape"])
+
+            params = []
+            for p, arg in enumerate(sig["inputs"]):
+                name, rust_dtype, elements = slot(arg)
+                mut = p in sig.get("inouts", [])
+                if name not in defined and name.startswith("t"):
+                    zeros(name, rust_dtype, elements)  # a temporary a step first updates in place starts as zeros
+                lines.append(f"    let {'mut ' if mut else ''}a{k}_{p} = {module}::Arg{p}::try_from({name}.alias(..)?)?;")
+                params.append(f"&mut a{k}_{p}" if mut else f"&a{k}_{p}")
+            call = f"launch({module}::{sig['kernel']}, (&mut *device{''.join(', ' + p for p in params)})).await?"
+            outs = [slot(arg)[0] for arg in sig["outputs"]]
+            if len(outs) == 1:
+                lines.append(f"    let {outs[0]} = {call}.into_buffer();")
+            elif outs:
+                results = ", ".join(f"r{k}_{r}" for r in range(len(outs)))
+                lines.append(f"    let ({results}) = {call};")
+                for r, name in enumerate(outs):
+                    lines.append(f"    let {name} = r{k}_{r}.into_buffer();")
+            else:
+                lines.append(f"    {call};")
+            defined.update(outs)
+        params = "".join(f", p{a}: HbmBuffer" for a in info["reads"])
+        rets = "".join(f"p{a}, " for a in info["writes"])
+        return (
+            f"/// Kernel {symbol}: reads pointer arguments {info['reads']}, writes {info['writes']} fresh.\n"
+            f"async fn k_{ident(symbol).lower()}(device: &mut Device{params}) -> eyre::Result<({'HbmBuffer, ' * len(info['writes'])})> {{\n"
+            + "\n".join(lines) + f"\n    Ok(({rets}))\n}}"
+        )
+
+    def analyze(self, symbol: str, launch: dict, graph: dict):
+        """A kernel's pointer arguments: those its steps read before writing fresh (with whether one is updated
+        in place), those they write fresh, and their dtypes and sizes (from a launch: every launch of a kernel
+        binds buffers of one shape)."""
+        if symbol in self.kernel_args:
+            return
+        plan = self.plans[symbol]
+        reads, writes, mutable = [], [], set()
+        for step in plan["steps"]:
+            sig = self.signatures[step["module"]]
+            where = lambda arg: {"buffer": arg} if step["args"] is None else step["args"][arg]  # noqa: E731
+            for p, arg in enumerate(sig["inputs"]):
+                a = where(arg).get("buffer")
+                if a is not None and a not in writes and a not in reads:
+                    reads.append(a)
+                if a is not None and p in sig.get("inouts", []):
+                    mutable.add(a)
+            for arg in sig["outputs"]:
+                a = where(arg).get("buffer")
+                if a is not None and a not in writes:
+                    writes.append(a)
+        dtypes, elements = {}, {}
+        for a, buffer in enumerate(launch["args"]):
+            d = graph["buffers"][buffer]["dtype"]
+            if d not in RUST_DTYPES:
+                raise CrateError(f"buffer {buffer}: dtype {d} has no furiosa-opt host type")
+            dtypes[a], elements[a] = RUST_DTYPES[d], math.prod(graph["buffers"][buffer]["shape"])
+        self.kernel_args[symbol] = {"reads": reads, "writes": writes, "mutable": mutable, "dtypes": dtypes,
+                                    "elements": elements}
 
     def graph_fn(self, g: int, graph: dict) -> str:
         names, var, lines = {}, {}, []
@@ -264,17 +371,6 @@ class RunGraph:
                 raise CrateError(f"buffer {buffer}: dtype {d} has no furiosa-opt host type")
             return RUST_DTYPES[d]
 
-        def zeros(variable_name: str, rust_dtype: str, elements: int):
-            """A fresh device buffer of zeros, for a buffer or temporary read before anything writes it."""
-            axis = f"Z{elements}"
-            if (axis, elements) not in self.axes:
-                self.axes.append((axis, elements))
-            lines.append(
-                f"    let {variable_name} = HostTensor::<{rust_dtype}, m![{axis}]>::zero()"
-                f".to_hbm::<m![1], m![{axis}]>(&mut device.pdma).await?.into_buffer();"
-            )
-            defined.add(variable_name)
-
         lines.append(f"/// Graph {g}: {graph['name']}")
         lines.append(f"async fn graph_{g}(device: &mut Device, inputs: &Inputs, files: &mut Outputs) -> eyre::Result<()> {{")
         defined = set()  # variables holding a device buffer
@@ -288,65 +384,28 @@ class RunGraph:
                 defined.add(variable(buffer))
         for i, launch in enumerate(graph["launches"]):
             symbol = launch["kernel"]
-            plan = self.plans[symbol]
+            self.analyze(symbol, launch, graph)
+            info = self.kernel_args[symbol]
+            args = []
+            for a in info["reads"]:
+                name = variable(launch["args"][a])
+                if name not in defined:
+                    # Only a buffer the kernel updates in place may start as zeros; a read one must exist.
+                    if a not in info["mutable"]:
+                        raise CrateError(f"graph {g} launch {i}: {name} is read before anything writes it")
+                    axis = f"Z{info['elements'][a]}"
+                    if (axis, info["elements"][a]) not in self.axes:
+                        self.axes.append((axis, info["elements"][a]))
+                    lines.append(
+                        f"    let {name} = HostTensor::<{info['dtypes'][a]}, m![{axis}]>::zero()"
+                        f".to_hbm::<m![1], m![{axis}]>(&mut device.pdma).await?.into_buffer();"
+                    )
+                    defined.add(name)
+                args.append(f", {name}.alias(..)?")
+            rets = [variable(launch["args"][a]) for a in info["writes"]]
             lines.append(f"    // launch {i}: {symbol}")
-            for k, step in enumerate(plan["steps"]):
-                sig = self.signatures[step["module"]]
-                module = f"kernel::{step['module']}"
-                tag = f"{i}_{k}" if len(plan["steps"]) > 1 else f"{i}"
-
-                def slot(arg: int) -> tuple[str, str, int, bool]:
-                    """The variable behind a pointer argument of the step, its Rust dtype and element count, and
-                    whether it is a temporary."""
-                    where = {"buffer": arg} if step["args"] is None else step["args"][arg]
-                    if "const" in where:
-                        const = plan["consts"][where["const"]]
-                        if const["dtype"] not in MLIR_DTYPES:
-                            raise CrateError(f"{symbol}: table of {const['dtype']} has no furiosa-opt host type")
-                        name, elements = f"c_{ident(symbol).lower()}_{where['const']}", math.prod(const["shape"])
-                        if name not in defined:
-                            axis = f"Z{elements}"
-                            if (axis, elements) not in self.axes:
-                                self.axes.append((axis, elements))
-                            lines.append(
-                                f"    let {name} = HostTensor::<{MLIR_DTYPES[const['dtype']]}, m![{axis}]>::from_buf("
-                                f"include_bytes!(\"consts/{symbol}_{where['const']}.bin\").to_vec())"
-                                f".to_hbm::<m![1], m![{axis}]>(&mut device.pdma).await?.into_buffer();"
-                            )
-                            defined.add(name)
-                        return name, MLIR_DTYPES[const["dtype"]], elements, False
-                    if "buffer" in where:
-                        buffer = launch["args"][where["buffer"]]
-                        info = graph["buffers"][buffer]
-                        return variable(buffer), dtype(buffer), math.prod(info["shape"]), False
-                    temp = plan["temps"][where["temp"]]
-                    if temp["dtype"] not in MLIR_DTYPES:
-                        raise CrateError(f"{symbol}: temporary of {temp['dtype']} has no furiosa-opt host type")
-                    return f"t{i}_{where['temp']}", MLIR_DTYPES[temp["dtype"]], math.prod(temp["shape"]), True
-
-                params = []
-                for p, arg in enumerate(sig["inputs"]):
-                    name, rust_dtype, elements, temp = slot(arg)
-                    mut = p in sig.get("inouts", [])
-                    if name not in defined:
-                        # Only a buffer the kernel updates in place may start as zeros; a read one must exist.
-                        if not mut and not temp:
-                            raise CrateError(f"graph {g} launch {i}: {name} is read before anything writes it")
-                        zeros(name, rust_dtype, elements)
-                    lines.append(f"    let {'mut ' if mut else ''}a{tag}_{p} = {module}::Arg{p}::try_from({name}.alias(..)?)?;")
-                    params.append(f"&mut a{tag}_{p}" if mut else f"&a{tag}_{p}")
-                call = f"launch({module}::{sig['kernel']}, (&mut *device{''.join(', ' + p for p in params)})).await?"
-                outs = [slot(arg)[0] for arg in sig["outputs"]]
-                if len(outs) == 1:
-                    lines.append(f"    let {outs[0]} = {call}.into_buffer();")
-                elif outs:
-                    results = ", ".join(f"r{tag}_{r}" for r in range(len(outs)))
-                    lines.append(f"    let ({results}) = {call};")
-                    for r, name in enumerate(outs):
-                        lines.append(f"    let {name} = r{tag}_{r}.into_buffer();")
-                else:
-                    lines.append(f"    {call};")
-                defined.update(outs)
+            lines.append(f"    let ({''.join(r + ', ' for r in rets)}) = k_{ident(symbol).lower()}(device{''.join(args)}).await?;")
+            defined.update(rets)
         for buffer, info in graph["buffers"].items():
             if info["kind"] in ("output", "state"):
                 if variable(buffer) not in defined:
@@ -368,6 +427,7 @@ class RunGraph:
             raise CrateError(f"kernels need different topologies {sorted(topologies)}; one device runs them all")
         chip, pe = topologies.pop() if topologies else (1, 8)
         fns = [self.graph_fn(g, graph) for g, graph in enumerate(self.graphs)]
+        fns += [self.kernel_fn(symbol) for symbol in self.kernel_args]
         arms = "\n".join(f"        {g} => graph_{g}(&mut device, &inputs, &mut files).await?," for g in range(len(self.graphs)))
         axes = ", ".join(f"{n} = {s}" for n, s in self.axes)
         return f"""\
