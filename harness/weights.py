@@ -3,19 +3,25 @@ random weights drive their activations to inf, which makes any comparison meanin
 
 import torch
 
+# Pinned versions, so regenerated golden data uses the weights the NPU tolerances were measured on.
 TORCHVISION = {
-    "alexnet": "AlexNet_Weights",
-    "vgg16": "VGG16_Weights",
-    "resnet101": "ResNet101_Weights",
-    "mobilenetv3_large": "MobileNet_V3_Large_Weights",
+    "alexnet": ("AlexNet_Weights", "IMAGENET1K_V1"),
+    "vgg16": ("VGG16_Weights", "IMAGENET1K_V1"),
+    "resnet101": ("ResNet101_Weights", "IMAGENET1K_V2"),
+    "mobilenetv3_large": ("MobileNet_V3_Large_Weights", "IMAGENET1K_V2"),
 }
-HUGGINGFACE = {"qwen3_0_6b": "Qwen/Qwen3-0.6B"}
+HUGGINGFACE = {"qwen3_0_6b": ("Qwen/Qwen3-0.6B", "c1899de289a04d12100db370d81485cdf75e47ca")}
+
+
+def version(loader: str, case: str) -> str:
+    return "/".join({"torchvision": TORCHVISION, "huggingface": HUGGINGFACE}[loader][case])
 
 
 def torchvision(case: str) -> dict[str, torch.Tensor]:
     import torchvision.models as tvm
 
-    weights = getattr(tvm, TORCHVISION[case]).DEFAULT
+    enum, name = TORCHVISION[case]
+    weights = getattr(getattr(tvm, enum), name)
     builder = {"mobilenetv3_large": "mobilenet_v3_large"}.get(case, case)
     return getattr(tvm, builder)(weights=weights).state_dict()
 
@@ -24,7 +30,8 @@ def huggingface(case: str) -> dict[str, torch.Tensor]:
     from huggingface_hub import snapshot_download
     from safetensors.torch import load_file
 
-    path = snapshot_download(HUGGINGFACE[case], allow_patterns=["*.safetensors", "*.json"])
+    repo, revision = HUGGINGFACE[case]
+    path = snapshot_download(repo, revision=revision, allow_patterns=["*.safetensors", "*.json"])
     from pathlib import Path
 
     tensors = {}

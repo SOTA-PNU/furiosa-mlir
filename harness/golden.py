@@ -86,6 +86,7 @@ def generate(name: str):
         })
     commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
     meta = {"case": name, "path": case.path, "seed": case.seed, "weights": case.weights,
+            "weights_version": checkpoints.version(case.weights, name) if case.weights else None,
             "triton": triton.__version__, "commit": commit, "graphs": graphs}
     (out_dir / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
     print(f"{name}: {len(graphs)} graph(s) -> {out_dir.relative_to(ROOT)}")
