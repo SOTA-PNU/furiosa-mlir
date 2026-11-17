@@ -1,0 +1,187 @@
+"""The operator test matrix: every (group, op, dtype, shape) case with its launch, inputs, torch
+reference and tolerance. Criteria follow SOTA-PNU/lowlevel-api-test so results compare across backends:
+floats `allclose(rtol=1e-2, atol=1e-2, equal_nan)`, integers exact."""
+
+from dataclasses import dataclass
+
+import torch
+import triton
+
+from harness.ops import kernels as K
+
+DTYPES = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16, "int32": torch.int32,
+          "int8": torch.int8, "float8_e4m3fn": torch.float8_e4m3fn}
+FLOATS = ["float32", "float16", "bfloat16"]
+ALL = FLOATS + ["int32", "int8"]
+# [B, R, C]: the default of lowlevel-api-test, a single row, several batches, an odd (masked) shape, a large tile.
+SHAPES = [(1, 64, 64), (1, 1, 1024), (4, 32, 128), (2, 7, 33), (1, 256, 256)]
+POW2 = [s for s in SHAPES if all(d & (d - 1) == 0 for d in s)]
+DOTS = [(64, 64, 64), (16, 64, 32), (128, 256, 64)]
+
+
+@dataclass(frozen=True)
+class Case:
+    group: str
+    op: str
+    dtype: str
+    shape: tuple
+
+    @property
+    def key(self) -> str:
+        return f"{self.group}.{self.op}.{self.dtype}.{'x'.join(map(str, self.shape))}"
+
+    @staticmethod
+    def parse(key: str) -> "Case":
+        group, op, dtype, shape = key.split(".")
+        return Case(group, op, dtype, tuple(int(d) for d in shape.split("x")))
+
+
+def all_cases() -> list[Case]:
+    cases = []
+    for op in K.UNARY:
+        for dtype in ALL if op in ("abs", "neg") else FLOATS:
+            cases += [Case("unary", op, dtype, s) for s in SHAPES]
+    for op in K.BINARY:
+        for dtype in FLOATS if op in ("fdiv", "div_rn") else ALL:
+            cases += [Case("binary", op, dtype, s) for s in SHAPES]
+    for op in K.REDUCE:
+        for dtype in ["int32", "int8"] if op == "xor_sum" else ALL:
+            cases += [Case("reduce", op, dtype, s) for s in SHAPES]
+    for op in K.SCAN:
+        for dtype in FLOATS if op in ("cumprod", "softmax") else ALL:
+            cases += [Case("scan", op, dtype, s) for s in POW2]
+    for op in K.MISC:
+        for dtype in FLOATS if op in ("clamp", "fma") else ALL if op != "cast" else ["float16", "bfloat16", "int32", "int8"]:
+            cases += [Case("misc", op, dtype, s) for s in [(1, 64, 64), (2, 7, 33)]]
+    for op in K.SHAPE:
+        cases += [Case("shape", op, dtype, s) for dtype in ALL for s in [(1, 64, 64), (2, 32, 64)]]
+    for dtype in FLOATS + ["int8", "float8_e4m3fn"]:
+        cases += [Case("dot", "dot", dtype, s) for s in DOTS]
+    cases += [Case("memory", "block_ptr", dtype, s) for dtype in ALL for s in [(1, 64, 64), (1, 50, 70)]]
+    cases += [Case("program", "program_id", "float32", (1, 64, 64))]
+    cases += [Case("atomic", "atomic_add", "float32", (1, 8, 64))]
+    return cases
+
+
+def _input(shape, dtype, low=-2.0, high=2.0, generator=None):
+    if dtype in ("int32", "int8"):
+        return torch.randint(-50, 50, shape, generator=generator).to(DTYPES[dtype])
+    return (torch.rand(shape, generator=generator) * (high - low) + low).to(DTYPES[dtype])
+
+
+def build(case: Case):
+    """(kernel, grid, args by parameter name, output names, reference by output name, tolerance kind)."""
+    g = torch.Generator().manual_seed(0)
+    b, r, c = case.shape
+    rows, dt = b * r, case.dtype
+    blk = dict(R=rows, C=c, BR=triton.next_power_of_2(rows), BC=triton.next_power_of_2(c))
+    wide = (lambda t: t.double()) if dt in FLOATS else (lambda t: t.long())
+    if case.group == "unary":
+        positive = case.op in ("log", "log2", "rsqrt", "sqrt", "sqrt_rn")
+        x = _input((rows, c), dt, 0.5 if positive else -2.0, 3.0 if positive else 2.0, g)
+        ref = {"abs": torch.abs, "ceil": torch.ceil, "cos": torch.cos, "erf": torch.erf, "exp": torch.exp,
+               "exp2": torch.exp2, "floor": torch.floor, "log": torch.log, "log2": torch.log2, "rsqrt": torch.rsqrt,
+               "sigmoid": torch.sigmoid, "sin": torch.sin, "sqrt": torch.sqrt, "sqrt_rn": torch.sqrt,
+               "neg": torch.neg}[case.op](wide(x))
+        out = torch.empty_like(x)
+        return K.unary_kernel, (1,), dict(x_ptr=x, out_ptr=out, OP=K.UNARY.index(case.op), **blk), {"out_ptr": ref}, "float"
+    if case.group == "binary":
+        x = _input((rows, c), dt, generator=g)
+        y = _input((rows, c), dt, 0.5, 2.0, g) if case.op in ("fdiv", "div_rn") else _input((rows, c), dt, generator=g)
+        xs, ys = wide(x), wide(y)
+        ref = {"add": xs + ys, "sub": xs - ys, "mul": xs * ys, "fdiv": xs / ys, "div_rn": xs / ys,
+               "maximum": torch.maximum(xs, ys), "minimum": torch.minimum(xs, ys),
+               "where": torch.where(xs > ys, xs, ys)}[case.op]
+        out = torch.empty_like(x)
+        return (K.binary_kernel, (1,), dict(x_ptr=x, y_ptr=y, out_ptr=out, OP=K.BINARY.index(case.op), **blk),
+                {"out_ptr": ref}, "float")
+    if case.group == "reduce":
+        x = _input((rows, c), dt, generator=g)
+        xs = wide(x)
+        if case.op == "xor_sum":
+            ref = xs[:, 0].clone()
+            for j in range(1, c):
+                ref ^= xs[:, j]
+        else:
+            ref = {"sum": lambda: xs.sum(-1), "max": lambda: xs.amax(-1), "min": lambda: xs.amin(-1),
+                   "argmax": lambda: xs.argmax(-1), "argmin": lambda: xs.argmin(-1)}[case.op]()
+        out = torch.empty(rows, dtype=torch.int32 if case.op in ("argmax", "argmin") else x.dtype)
+        return K.reduce_kernel, (1,), dict(x_ptr=x, out_ptr=out, OP=K.REDUCE.index(case.op), **blk), {"out_ptr": ref}, "sum"
+    if case.group == "scan":
+        if case.op == "cumprod":
+            x = (_input((rows, c), "float32", 0.5, 1.5, g) * torch.where(torch.rand(rows, c, generator=g) < 0.5, -1, 1)).to(DTYPES[dt])
+        else:
+            x = _input((rows, c), dt, generator=g)
+        xs = wide(x)
+        ref = {"cumsum": lambda: xs.cumsum(-1), "cumprod": lambda: xs.cumprod(-1), "flip": lambda: xs.flip(-1),
+               "sort": lambda: xs.sort(-1).values, "softmax": lambda: torch.softmax(xs, -1)}[case.op]()
+        out = torch.empty_like(x)
+        return (K.scan_kernel, (1,), dict(x_ptr=x, out_ptr=out, R=rows, C=c, BR=blk["BR"], OP=K.SCAN.index(case.op)),
+                {"out_ptr": ref}, "scan" if case.op in ("cumsum", "cumprod") else "float")
+    if case.group == "misc":
+        x = _input((rows, c), dt, generator=g)
+        y = _input((rows, c), dt, generator=g)
+        xs, ys = wide(x), wide(y)
+        idx = torch.arange(rows * c).reshape(rows, c)
+        ref = {"cast": xs, "clamp": xs.clamp(-0.5, 0.5), "fma": xs * ys + xs, "full": xs + 3, "zeros_like": xs,
+               "arange": idx.to(x.dtype).to(xs.dtype) + xs}[case.op]
+        out = torch.empty(rows, c, dtype=torch.float32 if case.op == "cast" else x.dtype)
+        return (K.misc_kernel, (1,), dict(x_ptr=x, y_ptr=y, out_ptr=out, OP=K.MISC.index(case.op), **blk),
+                {"out_ptr": ref}, "float")
+    if case.group == "shape":
+        x = _input(case.shape, dt, generator=g)
+        ref = {"trans": x.transpose(1, 2), "reshape": x.reshape(b, r * c), "expand_dims": x,
+               "broadcast_to": x[:, :1, :].expand(b, r, c), "permute": x.permute(2, 0, 1)}[case.op].contiguous()
+        out = torch.empty_like(ref)
+        return (K.shape_kernel, (1,), dict(x_ptr=x, out_ptr=out, B=b, R=r, C=c, OP=K.SHAPE.index(case.op)),
+                {"out_ptr": wide(ref)}, "float")
+    if case.group == "dot":
+        m, n, k = case.shape
+        a = _input((m, k), "float32", -1.0, 1.0, g)
+        bb = _input((k, n), "float32", -1.0, 1.0, g)
+        if dt == "int8":
+            a, bb = (a * 50).to(torch.int8), (bb * 50).to(torch.int8)
+        else:
+            a, bb = a.to(DTYPES[dt]), bb.to(DTYPES[dt])
+        out_dtype = {"int8": torch.int32, "float8_e4m3fn": torch.float16}.get(dt, DTYPES[dt])
+        ref = a.long() @ bb.long() if dt == "int8" else a.double() @ bb.double()
+        bound = a.double().abs() @ bb.double().abs()
+        out = torch.empty(m, n, dtype=out_dtype)
+        return K.dot_kernel, (1,), dict(a_ptr=a, b_ptr=bb, out_ptr=out, M=m, N=n, K=k), {"out_ptr": (ref, bound)}, "dot"
+    if case.group == "memory":
+        x = _input((rows, c), dt, generator=g)
+        out = torch.empty_like(x)
+        return (K.block_ptr_kernel, (1,), dict(x_ptr=x, out_ptr=out, R=rows, C=c, BR=16, BC=blk["BC"]),
+                {"out_ptr": wide(x)}, "float")
+    if case.group == "program":
+        x = _input((rows, c), dt, generator=g)
+        return K.program_kernel, (rows,), dict(x_ptr=x, out_ptr=torch.empty_like(x), R=rows, C=c), {"out_ptr": wide(x) + rows}, "float"
+    if case.group == "atomic":
+        x = _input((rows, c), dt, generator=g)
+        return (K.atomic_kernel, (rows,), dict(x_ptr=x, out_ptr=torch.zeros(c, dtype=x.dtype), R=rows, C=c),
+                {"out_ptr": wide(x).sum(0)}, "sum")
+    raise ValueError(case.group)
+
+
+def check(actual: torch.Tensor, expected, kind: str) -> tuple[bool, str]:
+    """lowlevel-api-test's rule: floats allclose(1e-2, 1e-2, equal_nan), integers exact. Running sums allow
+    log2(n)*eps*scale more; dots allow the bf16 operand rounding of the NPU's contraction, 2^-8*(|a|@|b|)."""
+    bound = None
+    if kind == "dot":
+        expected, bound = expected
+    if not actual.is_floating_point():
+        ok = torch.equal(actual.long(), expected.long())
+        return ok, "" if ok else f"{int((actual.long() != expected.long()).sum())} integer mismatches"
+    exp = expected.to(torch.float64)
+    act = actual.to(torch.float64)
+    tol = 1e-2 + 1e-2 * exp.abs()
+    if kind == "scan":
+        eps = torch.finfo(actual.dtype).eps
+        tol = tol + torch.log2(torch.tensor(float(exp.shape[-1]))) * eps * exp.abs().cummax(-1).values
+    if kind == "dot":
+        tol = tol + 2.0**-8 * bound
+    err = (act - exp).abs()
+    nan_ok = torch.isnan(act) & torch.isnan(exp)
+    ok = bool(((err <= tol) | nan_ok).all())
+    rel = float((err / exp.abs().clamp_min(1e-30)).nan_to_num(0).max()) if err.numel() else 0.0
+    return ok, f"max_abs {float(err.nan_to_num(0).max()):.3g} max_rel {rel:.3g}"
