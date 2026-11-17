@@ -36,7 +36,10 @@ CASES = {
     "tutorial_fused_attention": Case("harness/cases/tutorial_fused_attention.py", exact=Tol(rtol=2e-3, atol=2e-3)),
     "tutorial_persistent_matmul": Case("harness/cases/tutorial_persistent_matmul.py", exact=Tol(rtol=2e-3, atol=2e-3)),
     "tutorial_extern": Case("harness/cases/tutorial_extern.py", float_ranges={"x": (-1.0, 1.0)}),  # asin's domain
-    "tutorial_attention_bwd": Case("harness/cases/tutorial_attention_bwd.py", exact=Tol(rtol=2e-3, atol=2e-3)),
+    # The fp16 forward feeds the backward: chained over the graph, dk drifts 3.4e-3 of max|dk| from the GPU (each
+    # launch alone is within `exact`); the graph tolerance is twice that.
+    "tutorial_attention_bwd": Case("harness/cases/tutorial_attention_bwd.py", exact=Tol(rtol=2e-3, atol=2e-3),
+                                   graph=Tol(rtol=7e-3, atol=2e-3)),
     # Held-out kernels, written apart from the corpus (harness/README.md). NPU tolerances: data movement
     # and max are exact; contractions allow twice the measured drift of rounding their operands to bf16
     # (bmm 0.34%, depthwise 0.32% of max|out|); a bf16 output allows one bf16 ulp at max|golden|; fp32
