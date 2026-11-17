@@ -6,7 +6,9 @@ npu stage) against GPU goldens.
 
 ## 1.2.0 (unreleased, main)
 
-- Normalization: reduction loops of extent 1 drop; `tl.umulhi` computed from 16-bit limbs (cae9784).
+- Normalization: reduction loops of extent 1 drop (`tl.expand_dims` with a reduction, int32 and int8); `tl.umulhi`
+  computed from 16-bit limbs, exact under the engine's wrapping multiply (cae9784).
+- Operator matrix on npu3: masked stores pass in every dtype (10 cases; they failed at 1805f3e).
 - Selects keyed by a boolean combination of comparisons nest into selects keyed by one each: `tl.map_elementwise`'s
   three-way compare on npu3 (0ab16b6).
 - A widened i1 is a select; a reduction no class maps reads its input broadcast over the loops it lacks:
