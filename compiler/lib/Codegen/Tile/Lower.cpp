@@ -691,6 +691,8 @@ int64_t Lowering::assignRows(int64_t rowSlices, int64_t perRow, SmallVector<Digi
 }
 
 LogicalResult Lowering::plan() {
+  if (p.out.empty())
+    return fail("a scalar output (no output axis to lay out)");
   if (failed(findGemm()) || failed(planLayout()))
     return failure();
   auto supported = [](Type t) { return t.isF32() || t.isBF16(); };
