@@ -6,6 +6,12 @@ npu stage) against GPU goldens.
 
 ## 1.3.0 (unreleased, main)
 
+- tl.sort and tl.topk on npu3, exact for every dtype and shape (24 cases): compare-and-swap keys nest into selects in
+  reduction terms (eed201e); a loop read by its floordiv/mod digits splits into them, so the reads are projections
+  (9ead0e0); a generic no class maps reads an earlier generic's result instead of recomputing the fused stages
+  before it (140d820); an index-keyed select blends bitwise, b ^ ((a ^ b) & m), where no class maps the generic
+  (bdeb328); loops every operand reads alike collapse where that makes the generic map (aa90044). Split-steps takes
+  0.2 to 2 s per case; tl.flip needs fewer steps (45 to 39 at 1x64x64).
 - The tiled path's comparison tags honor ordered and unordered predicates exactly (they took oge/ole/one as the
   complements of olt/ogt/oeq, true on NaN; ord/uno did not map): all 14 cmpf predicates match torch on npu3 over NaN,
   +-inf, +-0 and the bounds' neighbours (b56a07b).
