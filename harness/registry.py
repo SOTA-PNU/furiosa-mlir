@@ -69,6 +69,25 @@ CASES = {
     "heldout2_adamw": Case("harness/cases/heldout2_adamw.py", exact=Tol(rtol=1e-5, atol=0), npu=Tol(rtol=1e-5, atol=0)),
     "heldout2_linear_bias_residual": Case("harness/cases/heldout2_linear_bias_residual.py", npu=Tol(rtol=8e-3, atol=0)),
     "heldout2_conv2d": Case("harness/cases/heldout2_conv2d.py", npu=Tol(rtol=4e-3, atol=0)),
+    # Third held-out batch, by the same rules (ten standard ops written from their math after 1.4.0, without
+    # reading the compiler). The attention's contractions allow twice the measured drift of rounding q, k, v and p
+    # to bf16 (0.32% of max|o|); e4m3 values are exact in bf16, so the fp8 matmul allows one bf16 ulp; integers are
+    # exact.
+    "heldout3_sliding_window_attention": Case("harness/cases/heldout3_sliding_window_attention.py",
+                                              exact=Tol(rtol=2e-3, atol=2e-3), npu=Tol(rtol=6.4e-3, atol=0)),
+    "heldout3_scatter_add": Case("harness/cases/heldout3_scatter_add.py", npu=Tol(rtol=1e-5, atol=0),
+                                 int_ranges={"ids": (0, 40)}),
+    "heldout3_batch_norm": Case("harness/cases/heldout3_batch_norm.py", npu=Tol(rtol=1e-5, atol=0)),
+    "heldout3_avgpool": Case("harness/cases/heldout3_avgpool.py", npu=Tol(rtol=1e-3, atol=0)),
+    "heldout3_upsample_bilinear": Case("harness/cases/heldout3_upsample_bilinear.py", npu=Tol(rtol=8e-3, atol=0)),
+    "heldout3_moe_topk_gating": Case("harness/cases/heldout3_moe_topk_gating.py", npu=Tol(rtol=1e-5, atol=0)),
+    "heldout3_segment_sum": Case("harness/cases/heldout3_segment_sum.py", npu=Tol(rtol=1e-5, atol=0),
+                                 int_ranges={"seg_len": (0, 16)}),
+    "heldout3_fp8_matmul": Case("harness/cases/heldout3_fp8_matmul.py", npu=Tol(rtol=8e-3, atol=0),
+                                float_ranges={"a": (-8.0, 8.0), "b": (-8.0, 8.0)}),
+    "heldout3_add_layernorm": Case("harness/cases/heldout3_add_layernorm.py", npu=Tol(rtol=1e-3, atol=0)),
+    "heldout3_cumsum": Case("harness/cases/heldout3_cumsum.py", npu=Tol(rtol=0, atol=0),
+                            int_ranges={"x": (-100, 100)}),
     # fp32 models: the NPU contracts in bf16, so L3/L4 allow twice the logit drift of the same Triton
     # graph run in bf16 on the GPU (measured: lenet5 0.16%, alexnet 0.37%, vgg16 0.66%, resnet101 2.4%,
     # mobilenetv3 6.5%, vit_b16 0.29% of max|logit|), and the top-1 class must not change.
