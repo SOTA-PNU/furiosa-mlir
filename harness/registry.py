@@ -71,13 +71,14 @@ CASES = {
     "heldout2_conv2d": Case("harness/cases/heldout2_conv2d.py", npu=Tol(rtol=4e-3, atol=0)),
     # fp32 models: the NPU contracts in bf16, so L3/L4 allow twice the logit drift of the same Triton
     # graph run in bf16 on the GPU (measured: lenet5 0.16%, alexnet 0.37%, vgg16 0.66%, resnet101 2.4%,
-    # mobilenetv3 6.5% of max|logit|), and the top-1 class must not change.
+    # mobilenetv3 6.5%, vit_b16 0.29% of max|logit|), and the top-1 class must not change.
     "lenet5": Case("models/lenet5.py", npu=Tol(rtol=3.2e-3, atol=0), top1="logits"),
     "alexnet": Case("models/alexnet.py", weights="torchvision", npu=Tol(rtol=7.4e-3, atol=0), top1="logits"),
     "vgg16": Case("models/vgg16.py", weights="torchvision", npu=Tol(rtol=1.3e-2, atol=0), top1="logits"),
     "resnet101": Case("models/resnet101.py", weights="torchvision", npu=Tol(rtol=4.8e-2, atol=0), top1="logits"),
     "mobilenetv3_large": Case("models/mobilenetv3_large.py", weights="torchvision", npu=Tol(rtol=1.3e-1, atol=0),
                               top1="logits"),
+    "vit_b16": Case("models/vit_b16.py", weights="torchvision", npu=Tol(rtol=5.8e-3, atol=0), top1="logits"),
     # 28 bf16 layers: each kernel is held to one ulp per launch, but one-ulp differences compound over
     # the depth of a whole graph. NPU: the models' rule, twice the drift between two correct
     # implementations of the graph (L1's CPU JIT vs the GPU golden: 2.7% at kv_cache.27.v); the greedy

@@ -9,6 +9,7 @@ TORCHVISION = {
     "vgg16": ("VGG16_Weights", "IMAGENET1K_V1"),
     "resnet101": ("ResNet101_Weights", "IMAGENET1K_V2"),
     "mobilenetv3_large": ("MobileNet_V3_Large_Weights", "IMAGENET1K_V2"),
+    "vit_b16": ("ViT_B_16_Weights", "IMAGENET1K_V1"),
 }
 HUGGINGFACE = {"qwen3_0_6b": ("Qwen/Qwen3-0.6B", "c1899de289a04d12100db370d81485cdf75e47ca")}
 
@@ -22,7 +23,7 @@ def torchvision(case: str) -> dict[str, torch.Tensor]:
 
     enum, name = TORCHVISION[case]
     weights = getattr(getattr(tvm, enum), name)
-    builder = {"mobilenetv3_large": "mobilenet_v3_large"}.get(case, case)
+    builder = {"mobilenetv3_large": "mobilenet_v3_large", "vit_b16": "vit_b_16"}.get(case, case)
     return getattr(tvm, builder)(weights=weights).state_dict()
 
 
