@@ -6,6 +6,8 @@ npu stage) against GPU goldens.
 
 ## 1.4.0 (unreleased, main)
 
+- Raise: a reduction whose input is the combiner's identity past a masked prefix reduces over the prefix (no clamp left,
+  the read promotes; the dot's live-K analysis shares it): held-out group norm passes L0 to L4 (d6133de).
 - Float scalar arguments stay fp32 values: the driver made every scalar a constexpr, so Triton folded float arguments in
   Python's double precision (1 - beta2 at 0.999 became 1e-3; the GPU computes 1 - 0.999f = 0.00099998713). A float
   argument not marked tl.constexpr is now an fp32 argument whose value the launch records and the raise binds and folds
