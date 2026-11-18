@@ -24,6 +24,7 @@
 #include "mlir/Transforms/Passes.h"
 
 #include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Base64.h"
 #include "llvm/Support/JSON.h"
 
@@ -235,6 +236,7 @@ private:
   std::vector<Group> groups;
   std::vector<llvm::SmallSetVector<unsigned, 2>> reads; // per group: the kernel buffers it reads
   llvm::DenseMap<Value, Value> resultOf;               // a step output -> its value after the call
+  llvm::StringMap<bool> mapped; // candidate text -> whether it maps: the scan retries candidates after each merge
 
   /// A group's ops and dups, in program order.
   SmallVector<Operation *> members(const Group &g) {
@@ -568,9 +570,14 @@ bool Splitter::mappable(int at, const Group &g) {
   SmallVector<Value> inputs, outputs = outputsOf(at, /*all=*/true);
   func::FuncOp func = outline(g, "candidate", outputs, inputs);
   groups[at] = std::move(kept);
-  bool ok = mapsWhole(func);
+  std::string text;
+  llvm::raw_string_ostream os(text);
+  func.print(os);
+  auto [it, fresh] = mapped.try_emplace(text, false);
+  if (fresh)
+    it->second = mapsWhole(func);
   func.erase();
-  return ok;
+  return it->second;
 }
 
 void Splitter::run(bool single) {
