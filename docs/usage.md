@@ -8,14 +8,27 @@ the binary package, and the Docker playground. All three give the same `furiosa`
 
 | | How | CLI |
 |---|---|---|
+| Release binaries | download from the GitHub release (`furiosa-mlir-<version>-linux-x86_64.tar.gz` or the wheel) | as below |
+| Binary package | untar, run its `install.sh` | `<package>/bin/furiosa` |
+| Wheel | `pip install furiosa_mlir-<version>-cp312-cp312-linux_x86_64.whl` into a fresh Python 3.12 venv | `furiosa` |
 | Source | `compiler/build.sh` (compiler/README.md) | `compiler/furiosa` |
-| Binary package | `scripts/package.sh` → `dist/furiosa-mlir-<version>-linux-x86_64.tar.gz`; untar, run its `install.sh` | `<package>/bin/furiosa` |
 | Docker | the package, then `docker build` (below) | `furiosa` in the container |
 
-The package holds the furiosa-enabled Triton (libtriton with the compiler passes, stripped), `furiosa_compiler`,
-`furiosa-mlir-opt`, the pinned furiosa-opt tools (`cargo-furiosa-opt`, `furiosa-opt-driver`), the example models
-and the playground. `install.sh` makes a Python 3.12 venv beside it with torch (CPU). Running on the NPU also
-needs Rust (rustup): the generated crates pin their toolchain, and rustup installs it on the first build.
+```
+gh release download v1.3.0 -R SOTA-PNU/furiosa-mlir -p '*.tar.gz'      # or -p '*.whl'
+tar xzf furiosa-mlir-1.3.0-linux-x86_64.tar.gz && furiosa-mlir-1.3.0-linux-x86_64/install.sh
+
+python3.12 -m venv venv && venv/bin/pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+    furiosa_mlir-1.3.0-cp312-cp312-linux_x86_64.whl          # the wheel provides `triton`: use a fresh venv
+cargo binstall cargo-furiosa-opt@0.10.0                     # or cargo install; on PATH for NPU builds
+```
+
+Both hold the furiosa-enabled Triton (libtriton with the compiler passes, stripped), `furiosa_compiler`,
+`furiosa-mlir-opt` and the licenses of Triton and LLVM; the tarball adds the example models and the playground,
+and its `install.sh` makes a Python 3.12 venv beside it with torch (CPU) and installs the furiosa-opt tools
+(`cargo-furiosa-opt` 0.10.0, crates.io) into `.tools/`. Running on the NPU needs Rust (rustup): the generated
+crates pin their toolchain, and rustup installs it on the first build. `scripts/package.sh` builds both artifacts
+from a built tree into `dist/`.
 
 ## A kernel
 
