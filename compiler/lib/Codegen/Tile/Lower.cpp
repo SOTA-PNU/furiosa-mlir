@@ -28,6 +28,8 @@
 #include "furiosa/Codegen/Codegen.h"
 #include "furiosa/Codegen/Fopt.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
+
 #include <cmath>
 #include <cstdlib>
 #include <map>
@@ -519,22 +521,52 @@ FailureOr<Val> Lowering::binary(const std::string &op, Val l, Val r) {
   return Val{l.kind, pass(l.dm, spec)};
 }
 
-/// The tag comparison of `x pred k` (or `k pred x`): the Cmp case and the guard bits under which it holds.
-static std::optional<std::pair<std::string, std::string>> tagOf(StringRef pred, double k, bool constFirst) {
-  StringRef q = pred.size() == 3 ? pred.drop_front() : pred; // olt -> lt
-  if (constFirst)
-    q = q == "lt" ? "gt" : q == "gt" ? "lt" : q == "le" ? "ge" : q == "ge" ? "le" : q;
-  std::string base;
-  if (q == "lt" || q == "ge")
-    base = "Less";
-  else if (q == "gt" || q == "le")
-    base = "Greater";
-  else if (q == "eq" || q == "ne")
-    base = "Equal";
-  else
+/// The tag comparisons of a predicate and the guards under which it holds and fails, each a disjunction of bit
+/// patterns over them (a branch slot a pattern).
+struct Tag {
+  SmallVector<std::string, 2> cmps, holds, fails;
+};
+
+/// The tags of `x pred k` (or `k pred x`). Less, Greater and Equal are false on NaN, so an ordered predicate holds
+/// where one of its comparisons does (x >= k: Greater or Equal) and an unordered one where its ordered complement's
+/// all fail (x >= k unordered: not Less); ord and uno test x < inf or x == inf.
+static std::optional<Tag> tagOf(StringRef pred, double k, bool constFirst) {
+  using P = arith::CmpFPredicate;
+  std::optional<P> q = arith::symbolizeCmpFPredicate(pred);
+  if (!q)
     return std::nullopt;
-  std::string bits = (q == "lt" || q == "gt" || q == "eq") ? "1---" : "0---";
-  return std::make_pair(base + "(" + mlir::furiosa::rustF32(float(k)) + ")", bits);
+  if (constFirst) // k pred x is x pred' k
+    q = *q == P::OGT ? P::OLT : *q == P::OLT ? P::OGT : *q == P::OGE ? P::OLE : *q == P::OLE ? P::OGE
+        : *q == P::UGT ? P::ULT : *q == P::ULT ? P::UGT : *q == P::UGE ? P::ULE : *q == P::ULE ? P::UGE : *q;
+  std::string kk = "(" + mlir::furiosa::rustF32(float(k)) + ")", L = "Less" + kk, G = "Greater" + kk, E = "Equal" + kk;
+  auto one = [](std::string c, bool set) {
+    return Tag{{c}, {set ? "1---" : "0---"}, {set ? "0---" : "1---"}};
+  };
+  auto two = [](std::string c0, std::string c1, bool either) {
+    Tag t{{c0, c1}, {"1---", "-1--"}, {"00--"}};
+    if (!either)
+      std::swap(t.holds, t.fails);
+    return t;
+  };
+  // A NaN bound fails every comparison: ord never holds, uno always.
+  std::string I = std::isnan(k) ? L : "Less(f32::INFINITY)", J = std::isnan(k) ? E : "Equal(f32::INFINITY)";
+  switch (*q) {
+  case P::OGT: return one(G, true);
+  case P::OLT: return one(L, true);
+  case P::OEQ: return one(E, true);
+  case P::ULE: return one(G, false);
+  case P::UGE: return one(L, false);
+  case P::UNE: return one(E, false);
+  case P::OGE: return two(G, E, true);
+  case P::OLE: return two(L, E, true);
+  case P::ONE: return two(G, L, true);
+  case P::ULT: return two(G, E, false);
+  case P::UGT: return two(L, E, false);
+  case P::UEQ: return two(G, L, false);
+  case P::ORD: return two(I, J, true);
+  case P::UNO: return two(I, J, false);
+  default: return std::nullopt;
+  }
 }
 
 FailureOr<Val> Lowering::select(const Node &n, ArrayRef<int64_t> tileIndex) {
@@ -555,22 +587,35 @@ FailureOr<Val> Lowering::select(const Node &n, ArrayRef<int64_t> tileIndex) {
   if (x->kind == Val::Scalar) {
     // A constant condition (a constant fill compared, as an unrolled loop's first running max) takes its branch.
     double l = constFirst ? kn.value : x->value, r = constFirst ? x->value : kn.value;
-    StringRef pred = StringRef(c.op).drop_front(4), q = pred.size() == 3 ? pred.drop_front() : pred;
-    bool ordered = !std::isnan(l) && !std::isnan(r);
-    bool holds = ordered ? (q == "gt" ? l > r : q == "lt" ? l < r : q == "ge" ? l >= r : q == "le" ? l <= r
-                            : q == "eq" ? l == r : l != r)
-                         : pred.starts_with("u");
+    bool holds = arith::applyCmpPredicate(*arith::symbolizeCmpFPredicate(StringRef(c.op).drop_front(4)),
+                                          llvm::APFloat(l), llvm::APFloat(r));
     return evaluate(n.args[holds ? 1 : 2], tileIndex);
   }
-  ArrayAttr cmps = b.getStrArrayAttr({tag->first, "False", "False", "False"});
+  SmallVector<StringRef, 4> names(tag->cmps.begin(), tag->cmps.end());
+  names.resize(4, "False");
+  ArrayAttr cmps = b.getStrArrayAttr(names);
+  // Branches taking `whenTrue` where the predicate holds and `otherwise` where it fails: the side with fewer
+  // patterns (the holding one on a tie, the failing one with `failsFirst`) a slot a pattern, the other "all". A VRF
+  // operand ("rf") is always "all": the engine tries the immediates first, in order.
+  auto branches = [&](Attribute whenTrue, Attribute otherwise, bool failsFirst = false) {
+    bool guardHolds = isa<StringAttr>(otherwise) ||
+                      (!isa<StringAttr>(whenTrue) && (tag->holds.size() != tag->fails.size()
+                                                          ? tag->holds.size() < tag->fails.size()
+                                                          : !failsFirst));
+    SmallVector<Attribute> out;
+    for (const std::string &g : guardHolds ? tag->holds : tag->fails)
+      out.push_back(b.getArrayAttr({b.getStringAttr(g), guardHolds ? whenTrue : otherwise}));
+    out.push_back(b.getArrayAttr({b.getStringAttr("all"), guardHolds ? otherwise : whenTrue}));
+    return b.getArrayAttr(out);
+  };
+  auto f32 = [&](float v) -> Attribute { return b.getF32FloatAttr(v); };
   // The chosen constant per element: max(k, k) with tag-branched immediates.
   auto constTile = [&](double whenTrue, double otherwise) {
     AluSpec spec;
     spec.method = "vector_clip";
     spec.op = "ClipBinaryOpF32::Max";
     spec.mode = "Mode11";
-    spec.branches = b.getArrayAttr({b.getArrayAttr({b.getStringAttr(tag->second), b.getF32FloatAttr(whenTrue)}),
-                                    b.getArrayAttr({b.getStringAttr("all"), b.getF32FloatAttr(otherwise)})});
+    spec.branches = branches(f32(whenTrue), f32(otherwise));
     return Val{x->kind, pass(x->dm, spec, cmps)};
   };
   const Node &ta = p.nodes[n.args[1]], &fb = p.nodes[n.args[2]];
@@ -589,14 +634,13 @@ FailureOr<Val> Lowering::select(const Node &n, ArrayRef<int64_t> tileIndex) {
       return failure();
     return binary("mul", *y, constTile(1, -1));
   }
-  // A logic op on `in` with an immediate per element: `whenGuarded` under the guard bits, `otherwise` elsewhere.
+  // A logic op on `in` with an immediate per element, as `br` branches.
   float ones = llvm::bit_cast<float>(~0u);
-  auto logic = [&](Value in, StringRef op, StringRef guard, float whenGuarded, float otherwise, ArrayAttr tags) {
+  auto logic = [&](Value in, StringRef op, ArrayAttr br, ArrayAttr tags) {
     AluSpec spec;
     spec.method = "vector_logic";
     spec.op = ("LogicBinaryOpF32::" + op).str();
-    spec.branches = b.getArrayAttr({b.getArrayAttr({b.getStringAttr(guard), b.getF32FloatAttr(whenGuarded)}),
-                                    b.getArrayAttr({b.getStringAttr("all"), b.getF32FloatAttr(otherwise)})});
+    spec.branches = br;
     return pass(in, spec, tags);
   };
   // select(x > -inf, x, -inf) (x < +inf, x, +inf; a NaN-skipping max or min's clean value) is two logic ops on the
@@ -604,11 +648,8 @@ FailureOr<Val> Lowering::select(const Node &n, ArrayRef<int64_t> tileIndex) {
   // (x | m) & m = m; where it holds, (x | 0) & ~0 = x. The second op carries no tags: it reads its pass's.
   if (n.args[1] == xs && !constFirst && fb.kind == Node::Const && std::isinf(fb.value) && fb.value == kn.value &&
       ((c.op == "cmp.ogt" && fb.value < 0) || (c.op == "cmp.olt" && fb.value > 0))) {
-    std::string fails = tag->second;
-    for (char &ch : fails)
-      ch = ch == '1' ? '0' : ch == '0' ? '1' : ch;
-    Value v = logic(x->dm, "BitOr", fails, fb.value, 0.0f, cmps);
-    return Val{x->kind, logic(v, "BitAnd", fails, fb.value, ones, ArrayAttr())};
+    Value v = logic(x->dm, "BitOr", branches(f32(0.0f), f32(fb.value), true), cmps);
+    return Val{x->kind, logic(v, "BitAnd", branches(f32(ones), f32(fb.value), true), ArrayAttr())};
   }
   // Otherwise each branch's value comes in under the tag: Max in Mode11 (op(b, b)) of a VRF tile or an
   // immediate, exact for any bits, so a NaN or infinity in the branch not taken cannot leak. Two tile branches
@@ -625,8 +666,8 @@ FailureOr<Val> Lowering::select(const Node &n, ArrayRef<int64_t> tileIndex) {
     return v.kind == Val::Scalar || cast<DmTensorType>(v.dm.getType()).getElement().size() * 4 <= 8192;
   };
   if (!fits(*a) || !fits(*bb)) {
-    Val m{x->kind, logic(logic(x->dm, "BitOr", tag->second, ones, 0.0f, cmps), "BitAnd", tag->second, ones, 0.0f,
-                         ArrayAttr())};
+    ArrayAttr mask = branches(f32(ones), f32(0.0f));
+    Val m{x->kind, logic(logic(x->dm, "BitOr", mask, cmps), "BitAnd", mask, ArrayAttr())};
     auto d = binary("xor", *a, *bb);
     if (failed(d))
       return failure();
@@ -645,13 +686,9 @@ FailureOr<Val> Lowering::select(const Node &n, ArrayRef<int64_t> tileIndex) {
     if (tile.kind == Val::Tile && x->kind != Val::Tile)
       return fail("a select whose key varies along less than its values");
     spec.vrf = vrfOf(tile.dm);
-    // The immediate comes first under its guard (the tag's bits, or their complement), the VRF after for the rest.
-    std::string guard = tag->second;
-    if (&k == &otherwise)
-      for (char &c : guard)
-        c = c == '1' ? '0' : c == '0' ? '1' : c;
-    spec.branches = b.getArrayAttr({b.getArrayAttr({b.getStringAttr(guard), b.getF32FloatAttr(k.value)}),
-                                    b.getArrayAttr({b.getStringAttr("all"), b.getStringAttr("rf")})});
+    // The immediate under its side's guards, the VRF for the rest.
+    Attribute rf = b.getStringAttr("rf");
+    spec.branches = &k == &whenTrue ? branches(f32(k.value), rf) : branches(rf, f32(k.value));
     return Val{x->kind, pass(x->dm, spec, cmps)};
   };
   if (a->kind == Val::Scalar || bb->kind == Val::Scalar)
