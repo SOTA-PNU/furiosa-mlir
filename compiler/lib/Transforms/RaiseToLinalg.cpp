@@ -1162,6 +1162,8 @@ private:
   FailureOr<AffineExpr> rewrite(Operation *at, const Gen &g, ArrayRef<Axis> env,
                                 std::function<AffineExpr(const Sym &)> select, Value v);
   FailureOr<AffineExpr> fitOrigins(Operation *at, const Gen &g, ArrayRef<int64_t> consts);
+  FailureOr<SmallVector<AffineExpr>> tripBounds(Gen &g, unsigned id);
+  FailureOr<Value> tripGuard(Gen &g, unsigned id, Value t);
   FailureOr<AffineExpr> rewriteSymbolic(Operation *at, const Gen &g, ArrayRef<Axis> env,
                                         std::function<AffineExpr(const Sym &)> select, Value v);
   Value index(Gen &g, unsigned dim);
@@ -2020,6 +2022,76 @@ FailureOr<AffineExpr> Raiser::fitOrigins(Operation *at, const Gen &g, ArrayRef<i
   return tidy(g, scale > 1 ? out.floorDiv(scale) : out);
 }
 
+/// The bounds iteration t of loop `id` must stay below to run in the instance at the current point of `g`: its trip
+/// count. A trip up to a min of bounds (rows from start to min(start + ROWS, M)) need not be affine in the tile
+/// origins where the distance to each term of the min is: then one bound per term, (term - lower bound) ceildiv step.
+FailureOr<SmallVector<AffineExpr>> Raiser::tripBounds(Gen &g, unsigned id) {
+  scf::ForOp loop;
+  for (auto [op, i] : loopIds)
+    if (i == id)
+      loop = cast<scf::ForOp>(op);
+  SmallVector<int64_t> trip;
+  for (Evaluator *ev : act)
+    trip.push_back(ev->trips.lookup(id));
+  SmallVector<Value> terms;
+  std::function<void(Value)> split = [&](Value v) {
+    if (auto m = v.getDefiningOp<arith::MinSIOp>()) {
+      split(m.getLhs());
+      split(m.getRhs());
+    } else {
+      terms.push_back(v);
+    }
+  };
+  split(loop.getUpperBound());
+  auto value = [](Evaluator *ev, Value v) -> std::optional<int64_t> {
+    if (const Sym *s = ev->get(v); s && s->kind == Sym::Int && s->data.empty())
+      if (auto c = dyn_cast<AffineConstantExpr>(s->expr))
+        return c.getValue();
+    return std::nullopt;
+  };
+  bool whole;
+  {
+    ScopedDiagnosticHandler quiet(ctx, [](Diagnostic &) { return success(); });
+    whole = terms.size() == 1 || succeeded(fitOrigins(loop, g, trip));
+  }
+  std::vector<SmallVector<int64_t>> trips;
+  if (whole)
+    trips.push_back(trip);
+  for (Value term : whole ? ArrayRef<Value>() : ArrayRef<Value>(terms)) {
+    SmallVector<int64_t> distance;
+    for (Evaluator *ev : act) {
+      auto lb = value(ev, loop.getLowerBound()), ub = value(ev, term), step = value(ev, loop.getStep());
+      if (!lb || !ub || !step)
+        return loop.emitError("furiosa: a loop bound term is not an index in every instance"), failure();
+      distance.push_back(floorDiv(*ub - *lb + *step - 1, *step));
+    }
+    trips.push_back(distance);
+  }
+  SmallVector<AffineExpr> out;
+  for (ArrayRef<int64_t> bound : trips) {
+    auto e = fitOrigins(loop, g, bound);
+    if (failed(e))
+      return failure();
+    if (auto c = dyn_cast<AffineConstantExpr>(*e); !whole && c && c.getValue() >= loopTrip[id])
+      continue; // every iteration is below it
+    out.push_back(*e);
+  }
+  return out;
+}
+
+/// Whether the instance at the current point of `g` runs iteration `t` of loop `id`.
+FailureOr<Value> Raiser::tripGuard(Gen &g, unsigned id, Value t) {
+  auto bounds = tripBounds(g, id);
+  if (failed(bounds))
+    return failure();
+  Value active;
+  for (AffineExpr e : *bounds) {
+    Value lt = arith::CmpIOp::create(*g.ob, loc, arith::CmpIPredicate::slt, t, exprValue(g, e));
+    active = active ? arith::AndIOp::create(*g.ob, loc, active, lt).getResult() : lt;
+  }
+  return active;
+}
+
 Value Raiser::index(Gen &g, unsigned dim) {
   if (!g.index[dim]) {
     Value i = linalg::IndexOp::create(*g.ob, loc, dim);
@@ -2221,6 +2293,27 @@ FailureOr<Value> Raiser::emitLoad(Gen &g, Read load, ArrayRef<Axis> env) {
   // A load in an iteration that a shorter trip masks off may leave its buffer: its value is discarded.
   bool guarded = llvm::any_of(g.loopPos, [&](auto kv) { return varTrip[kv.first]; }) ||
                  llvm::any_of(g.loopIv, [&](auto kv) { return varTrip[kv.first]; });
+  // A masked load that leaves its buffer in iterations a shorter trip masks off reads `other` there too (its value is
+  // discarded): the mask then bounds every index (rows up to the last band's end), so furiosa-structure promotes it.
+  if (on && guarded && mayLeave && !*data) {
+    auto mask = [&](unsigned l, AffineExpr t) -> LogicalResult {
+      auto bounds = tripBounds(g, l);
+      if (failed(bounds))
+        return failure();
+      for (AffineExpr e : *bounds) {
+        Value ok = arith::CmpIOp::create(ob, loc, arith::CmpIPredicate::sge, exprValue(g, tidy(g, e - t - 1)),
+                                         arith::ConstantIndexOp::create(ob, loc, 0));
+        on = arith::AndIOp::create(ob, loc, on, ok);
+      }
+      return success();
+    };
+    for (auto [l, pos] : g.loopPos)
+      if (varTrip[l] && failed(mask(l, getAffineDimExpr(pos, ctx))))
+        return failure();
+    for (auto [l, iv] : g.loopIv)
+      if (varTrip[l] && failed(mask(l, getAffineSymbolExpr(l, ctx))))
+        return failure();
+  }
   if (*data)
     i = arith::AddIOp::create(ob, loc, i, *data);
   if (mayLeave) {
@@ -2991,15 +3084,10 @@ FailureOr<Value> Raiser::materialize(Gen &g, Value v, ArrayRef<Axis> env) {
       for (auto [id, own] : loopDims) {
         if (!varTrip[id])
           continue;
-        SmallVector<int64_t> trips;
-        for (Evaluator *ev : act)
-          trips.push_back(ev->trips.lookup(id));
-        auto trip = fitOrigins(loop, gg, trips);
-        if (failed(trip))
+        auto lt = tripGuard(gg, id, index(gg, gg.loopPos[id]));
+        if (failed(lt))
           return failure();
-        Value lt = arith::CmpIOp::create(*gg.ob, loc, arith::CmpIPredicate::slt, index(gg, gg.loopPos[id]),
-                                         exprValue(gg, *trip));
-        active = active ? arith::AndIOp::create(*gg.ob, loc, active, lt).getResult() : lt;
+        active = active ? arith::AndIOp::create(*gg.ob, loc, active, *lt).getResult() : *lt;
       }
       if (!active)
         return next;
@@ -3413,17 +3501,11 @@ FailureOr<Value> Raiser::materializeState(Gen &g, scf::ForOp loop, unsigned resu
             auto n = emit(gg, yield.getOperand(j), kenvs[k]);
             if (failed(n) || !varTrip[id])
               return n;
-            SmallVector<int64_t> trips;
-            for (Evaluator *ev : act)
-              trips.push_back(ev->trips.lookup(id));
-            auto trip = fitOrigins(loop, gg, trips);
-            if (failed(trip))
-              return failure();
-            Value active = arith::CmpIOp::create(*gg.ob, loc, arith::CmpIPredicate::slt, iv, exprValue(gg, *trip));
+            auto active = tripGuard(gg, id, iv);
             auto old = emit(gg, loop.getRegionIterArgs()[j], kenvs[k]);
-            if (failed(old))
+            if (failed(active) || failed(old))
               return failure();
-            return arith::SelectOp::create(*gg.ob, loc, active, *n, *old).getResult();
+            return arith::SelectOp::create(*gg.ob, loc, *active, *n, *old).getResult();
           });
           if (failed(v)) {
             status = failure();
