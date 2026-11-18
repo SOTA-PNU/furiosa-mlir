@@ -6,7 +6,6 @@
 
 // CHECK-LABEL: func.func @by_column
 // CHECK: arith.remsi
-// CHECK: arith.select
 #id = affine_map<(d0, d1) -> (d0, d1)>
 module {
   func.func @by_column(%x: tensor<64x64xi32>, %y: tensor<64x64xi32>, %o: tensor<64x64xi32>) -> tensor<64x64xi32> attributes {furiosa.written = [2]} {

@@ -1538,6 +1538,55 @@ void relayoutReads(linalg::GenericOp g, function_ref<bool(linalg::GenericOp)> ma
   g.setIndexingMapsAttr(b.getAffineMapArrayAttr(maps));
 }
 
+/// A select keyed by an index-only condition between computed values, in a generic no class maps as it is, becomes
+/// the bitwise blend b ^ ((a ^ b) & m) under the index-only mask m = c ? ~0 : 0 (a table once hoisted, exact for any
+/// bits): the row-wise class selects by a streamed key and computes nothing along the columns alone, as tl.sort's
+/// direction bits are.
+void blendIndexSelects(linalg::GenericOp g, function_ref<bool(linalg::GenericOp)> mapsAlone) {
+  Block &body = g.getRegion().front();
+  llvm::DenseMap<Value, bool> memo;
+  std::function<bool(Value)> indexOnly = [&](Value v) {
+    if (isa<BlockArgument>(v))
+      return false;
+    if (auto it = memo.find(v); it != memo.end())
+      return it->second;
+    Operation *op = v.getDefiningOp();
+    bool only = op->getBlock() == &body ? llvm::all_of(op->getOperands(), indexOnly) : matchPattern(v, m_Constant());
+    return memo[v] = only;
+  };
+  SmallVector<arith::SelectOp> selects;
+  for (auto s : body.getOps<arith::SelectOp>())
+    if (s.getType().isIntOrFloat() && !s.getType().isInteger(1) && s.getType().getIntOrFloatBitWidth() <= 32 &&
+        indexOnly(s.getCondition()) && !indexOnly(s.getTrueValue()) && !indexOnly(s.getFalseValue()))
+      selects.push_back(s);
+  if (selects.empty() || !mapsAlone || mapsAlone(g))
+    return;
+  for (arith::SelectOp s : selects) {
+    OpBuilder b(s);
+    Location loc = s.getLoc();
+    Type t = s.getType(), f32 = b.getF32Type(), i32 = b.getI32Type();
+    // In 32 bits (narrower values widened exactly, as the device holds them): an i32 mask, an i32 blend.
+    auto bits = [&](Value v) -> Value {
+      if (isa<FloatType>(t))
+        return arith::BitcastOp::create(b, loc, i32, t == f32 ? v : arith::ExtFOp::create(b, loc, f32, v).getResult());
+      return t == i32 ? v : arith::ExtSIOp::create(b, loc, i32, v).getResult();
+    };
+    Value m = arith::SelectOp::create(b, loc, s.getCondition(), arith::ConstantIntOp::create(b, loc, i32, -1),
+                                      arith::ConstantIntOp::create(b, loc, i32, 0));
+    Value x = bits(s.getTrueValue()), y = bits(s.getFalseValue());
+    Value r = arith::XOrIOp::create(b, loc, y, arith::AndIOp::create(b, loc, arith::XOrIOp::create(b, loc, x, y), m));
+    if (isa<FloatType>(t)) {
+      r = arith::BitcastOp::create(b, loc, f32, r);
+      if (t != f32)
+        r = arith::TruncFOp::create(b, loc, t, r);
+    } else if (t != i32) {
+      r = arith::TruncIOp::create(b, loc, t, r);
+    }
+    s.replaceAllUsesWith(r);
+    s.erase();
+  }
+}
+
 /// A reduction no class maps whose inputs each vary along only some of its loops (tl.histogram: the values along
 /// the reduced loop, the bins along the other) reads the one spanning the reduced loops broadcast over the rest
 /// (a relayout, one DMA): the row-wise class streams a full tile of rows and columns. Only when that input is the
@@ -1975,6 +2024,7 @@ void mlir::furiosa::normalizeKernels(ModuleOp module, function_ref<bool(linalg::
   module.walk([&](linalg::GenericOp g) { generics.push_back(g); });
   for (linalg::GenericOp g : generics) {
     relayoutReads(g, mapsAlone);
+    blendIndexSelects(g, mapsAlone);
     broadcastStreams(g, mapsAlone);
   }
   // The slices and carriers the reads no longer use.
