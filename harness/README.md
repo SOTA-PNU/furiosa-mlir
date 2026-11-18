@@ -168,9 +168,7 @@ copy through `HARNESS_TRITON=<snap>`.
 Each run writes `harness/out/ops/<stage>.{json,md}`: an operator x dtype table and the failures grouped
 by the compiler's diagnostic. At the raise stage (raised IR on the CPU JIT) 905 of the 907 cases pass at 1805f3e;
 the other two, int32 sort at 256 and 1024 lanes, exceeded the 900 s limit in codegen and take seconds since f6ad81a.
-The npu stage at 1.2.0 (ce414f3): 879 of 907 pass. 2 differ on NaN inputs (`extra.maximum_nan`: the engine's max
-propagates NaN where the GPU's `maxnumf` skips it, outside the row-wise class). 26 do not compile: sort (20) and
-topk (4) exceeded the step splitter's time (on main since b8ee106 they fail to map in seconds), and `gather_data` (2) maps since 832a9e3.
+The npu stage at 1.3.0 (238dde6): all 907 cases pass.
 
 ## Running
 

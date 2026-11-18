@@ -4,7 +4,10 @@ main carries the next version as `X.Y.Z.dev0`. A release is a `release/X.Y.Z` br
 with the commit "Release X.Y.Z" and the tag `vX.Y.Z`. "On npu3" means harness level L4 (or the operator matrix's
 npu stage) against GPU goldens.
 
-## 1.3.0 (unreleased, main)
+## 1.3.0 (2026-11-18, release/1.3.0)
+
+Milestone: the whole operator matrix on npu3. All 907 operator matrix cases pass (879 in 1.2.0), and all 25 corpus
+cases pass L0 to L4.
 
 - tl.sort and tl.topk on npu3, exact for every dtype and shape (24 cases): compare-and-swap keys nest into selects in
   reduction terms (eed201e); a loop read by its floordiv/mod digits splits into them, so the reads are projections
