@@ -611,6 +611,10 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
         return failure();
       using P = arith::CmpFPredicate;
       P pred = c.getPredicate();
+      // Two constants (a constant fill compared, as an unrolled loop's first running max): the branch it takes.
+      if (dag.nodes[*x].kind == Node::Const && dag.nodes[*y].kind == Node::Const)
+        return arith::applyCmpPredicate(pred, llvm::APFloat(dag.nodes[*x].value), llvm::APFloat(dag.nodes[*y].value)) ? *a
+                                                                                                                        : *f;
       if (dag.nodes[*x].kind == Node::Const) {
         std::swap(x, y);
         pred = pred == P::OGT ? P::OLT : pred == P::OLT ? P::OGT : pred;

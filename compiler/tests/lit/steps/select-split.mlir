@@ -1,14 +1,16 @@
-// RUN: furiosa-mlir-opt --furiosa-split-steps %s | FileCheck %s --implicit-check-not=arith.select
+// RUN: furiosa-mlir-opt --furiosa-split-steps %s | FileCheck %s --implicit-check-not=arith.cmpi
 
 // A generic that maps no other way, whose select between computed values is keyed by a comparison one loop
-// decides (columns < 32: tl.maximum's NaN modes by column), splits there: each run computes its own side.
+// decides (columns < 32: tl.maximum's NaN modes by column), splits there: each run computes its own side (the
+// maxnumf one, guardNaNs's exact form: the cleaned maximumf, then -inf or NaN where neither operand is a number).
 
 // CHECK-LABEL: func.func private @by_column__s0
 // CHECK: arith.maximumf
 // CHECK-LABEL: func.func private @by_column__s{{[0-9]+}}
 // CHECK: tensor.insert_slice %{{.*}} into %{{.*}}[0, 0] [64, 32] [1, 1]
 // CHECK-LABEL: func.func private @by_column__s{{[0-9]+}}
-// CHECK: arith.maxnumf
+// CHECK: %[[R:.*]] = arith.maximumf
+// CHECK: arith.select %{{.*}}, %[[R]], %{{.*}}
 // CHECK-LABEL: func.func private @by_column__s{{[0-9]+}}
 // CHECK: tensor.insert_slice %{{.*}} into %{{.*}}[0, 32] [64, 32] [1, 1]
 #id = affine_map<(d0, d1) -> (d0, d1)>

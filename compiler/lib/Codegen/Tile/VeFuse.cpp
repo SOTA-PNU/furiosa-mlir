@@ -82,7 +82,7 @@ std::optional<Placed> place(VeOp ve, const PassState *st) {
       p = {ve, Clip, "ClipAdd", false, "vector_clip", "ClipBinaryOpF32::Add"};
   } else if (m == "vector_fp_div") {
     p.stage = FpDiv, p.alu = "ReduceFpDiv";
-  } else if (m == "vector_logic") {
+  } else if (m == "vector_logic" || m == "vector_logic_zip") {
     p.stage = Logic, p.alu = op.ends_with("BitAnd") ? "LogicAnd" : op.ends_with("BitOr") ? "LogicOr" : "LogicXor";
   } else if (m == "vector_clip" || m == "vector_clip_zip") {
     p.stage = Clip;

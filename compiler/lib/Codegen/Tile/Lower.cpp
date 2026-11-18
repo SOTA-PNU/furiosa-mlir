@@ -451,6 +451,10 @@ FailureOr<Val> Lowering::leaf(unsigned read, ArrayRef<int64_t> tileIndex) {
 FailureOr<Val> Lowering::binary(const std::string &op, Val l, Val r) {
   if (l.kind == Val::Scalar && r.kind == Val::Scalar) {
     double a = l.value, c = r.value;
+    if (op == "xor" || op == "and") {
+      uint32_t u = llvm::bit_cast<uint32_t>(float(a)), w = llvm::bit_cast<uint32_t>(float(c));
+      return Val{Val::Scalar, Value(), llvm::bit_cast<float>(op == "xor" ? u ^ w : u & w)};
+    }
     double v = op == "add" ? a + c : op == "sub" ? a - c : op == "mul" ? a * c : op == "div" ? a / c
                : op == "max" ? std::max(a, c) : std::min(a, c);
     return Val{Val::Scalar, Value(), v};
@@ -464,7 +468,7 @@ FailureOr<Val> Lowering::binary(const std::string &op, Val l, Val r) {
     return l;
   if (op == "mul" && l.kind == Val::Scalar && l.value == 1)
     return r;
-  bool commutative = op == "add" || op == "mul" || op == "max" || op == "min";
+  bool commutative = op == "add" || op == "mul" || op == "max" || op == "min" || op == "xor" || op == "and";
   // The stream is a tile over a vector or a constant, a vector over a constant.
   bool swapped = false;
   if ((r.kind == Val::Tile && l.kind != Val::Tile) || (r.kind == Val::Vec && l.kind == Val::Scalar)) {
@@ -498,6 +502,13 @@ FailureOr<Val> Lowering::binary(const std::string &op, Val l, Val r) {
       return Val{l.kind, zip(l.dm, r.dm, spec)};
     }
     spec.method = "vector_clip";
+  } else if (op == "xor" || op == "and") { // on the bits of the f32 values
+    spec.op = op == "xor" ? "LogicBinaryOpF32::BitXor" : "LogicBinaryOpF32::BitAnd";
+    if (r.kind == l.kind) {
+      spec.method = "vector_logic_zip";
+      return Val{l.kind, zip(l.dm, r.dm, spec)};
+    }
+    spec.method = "vector_logic";
   } else {
     return fail("no Vector Engine op for '" + op + "'");
   }
@@ -541,8 +552,16 @@ FailureOr<Val> Lowering::select(const Node &n, ArrayRef<int64_t> tileIndex) {
   auto x = evaluate(xs, tileIndex);
   if (failed(x))
     return failure();
-  if (x->kind == Val::Scalar)
-    return fail("a select over a constant condition");
+  if (x->kind == Val::Scalar) {
+    // A constant condition (a constant fill compared, as an unrolled loop's first running max) takes its branch.
+    double l = constFirst ? kn.value : x->value, r = constFirst ? x->value : kn.value;
+    StringRef pred = StringRef(c.op).drop_front(4), q = pred.size() == 3 ? pred.drop_front() : pred;
+    bool ordered = !std::isnan(l) && !std::isnan(r);
+    bool holds = ordered ? (q == "gt" ? l > r : q == "lt" ? l < r : q == "ge" ? l >= r : q == "le" ? l <= r
+                            : q == "eq" ? l == r : l != r)
+                         : pred.starts_with("u");
+    return evaluate(n.args[holds ? 1 : 2], tileIndex);
+  }
   ArrayAttr cmps = b.getStrArrayAttr({tag->first, "False", "False", "False"});
   // The chosen constant per element: max(k, k) with tag-branched immediates.
   auto constTile = [&](double whenTrue, double otherwise) {
@@ -570,6 +589,16 @@ FailureOr<Val> Lowering::select(const Node &n, ArrayRef<int64_t> tileIndex) {
       return failure();
     return binary("mul", *y, constTile(1, -1));
   }
+  // A logic op on `in` with an immediate per element: `whenGuarded` under the guard bits, `otherwise` elsewhere.
+  float ones = llvm::bit_cast<float>(~0u);
+  auto logic = [&](Value in, StringRef op, StringRef guard, float whenGuarded, float otherwise, ArrayAttr tags) {
+    AluSpec spec;
+    spec.method = "vector_logic";
+    spec.op = ("LogicBinaryOpF32::" + op).str();
+    spec.branches = b.getArrayAttr({b.getArrayAttr({b.getStringAttr(guard), b.getF32FloatAttr(whenGuarded)}),
+                                    b.getArrayAttr({b.getStringAttr("all"), b.getF32FloatAttr(otherwise)})});
+    return pass(in, spec, tags);
+  };
   // select(x > -inf, x, -inf) (x < +inf, x, +inf; a NaN-skipping max or min's clean value) is two logic ops on the
   // key, exact for any bits (a NaN's payload included): where the tag fails (x is NaN or the bound m),
   // (x | m) & m = m; where it holds, (x | 0) & ~0 = x. The second op carries no tags: it reads its pass's.
@@ -578,22 +607,14 @@ FailureOr<Val> Lowering::select(const Node &n, ArrayRef<int64_t> tileIndex) {
     std::string fails = tag->second;
     for (char &ch : fails)
       ch = ch == '1' ? '0' : ch == '0' ? '1' : ch;
-    auto logic = [&](Value in, StringRef op, float otherwise, ArrayAttr tags) {
-      AluSpec spec;
-      spec.method = "vector_logic";
-      spec.op = ("LogicBinaryOpF32::" + op).str();
-      spec.branches = b.getArrayAttr({b.getArrayAttr({b.getStringAttr(fails), b.getF32FloatAttr(fb.value)}),
-                                      b.getArrayAttr({b.getStringAttr("all"), b.getF32FloatAttr(otherwise)})});
-      return pass(in, spec, tags);
-    };
-    Value v = logic(x->dm, "BitOr", 0.0f, cmps);
-    return Val{x->kind, logic(v, "BitAnd", llvm::bit_cast<float>(~0u), ArrayAttr())};
+    Value v = logic(x->dm, "BitOr", fails, fb.value, 0.0f, cmps);
+    return Val{x->kind, logic(v, "BitAnd", fails, fb.value, ones, ArrayAttr())};
   }
   // Otherwise each branch's value comes in under the tag: Max in Mode11 (op(b, b)) of a VRF tile or an
   // immediate, exact for any bits, so a NaN or infinity in the branch not taken cannot leak. Two tile branches
   // take an op each, the other branch 0, and an add (shortcut: a -0.0 taken from either comes out +0.0).
-  // shortcut: a branch tile beyond the 8 KB VRF blends as a * s + b * (1 - s), s = select(c, 1, 0), exact unless the
-  // branch not taken holds a NaN or infinity; stream it instead (a stash) once VeFuse places vector_stash.
+  // A branch tile beyond the 8 KB VRF selects on the bits, exact too: b ^ ((a ^ b) & m), where the mask m = c ? ~0 : 0
+  // is two logic ops on the key ((x | m) & m, as the clean above) and each op between two tiles is a zip.
   auto branch = [&](unsigned arg, const Node &k) -> FailureOr<Val> {
     return k.kind == Node::Const ? FailureOr<Val>(Val{Val::Scalar, Value(), k.value}) : evaluate(arg, tileIndex);
   };
@@ -604,15 +625,15 @@ FailureOr<Val> Lowering::select(const Node &n, ArrayRef<int64_t> tileIndex) {
     return v.kind == Val::Scalar || cast<DmTensorType>(v.dm.getType()).getElement().size() * 4 <= 8192;
   };
   if (!fits(*a) || !fits(*bb)) {
-    if ((a->kind == Val::Scalar && !std::isfinite(a->value)) || (bb->kind == Val::Scalar && !std::isfinite(bb->value)))
-      return fail("a select between a tile beyond the VRF and an infinite constant");
-    auto as = binary("mul", *a, constTile(1, 0));
-    if (failed(as))
+    Val m{x->kind, logic(logic(x->dm, "BitOr", tag->second, ones, 0.0f, cmps), "BitAnd", tag->second, ones, 0.0f,
+                         ArrayAttr())};
+    auto d = binary("xor", *a, *bb);
+    if (failed(d))
       return failure();
-    auto bs = binary("mul", *bb, constTile(0, 1));
-    if (failed(bs))
+    auto e = binary("and", *d, m);
+    if (failed(e))
       return failure();
-    return binary("add", *as, *bs);
+    return binary("xor", *e, *bb);
   }
   auto by = [&](const Val &whenTrue, const Val &otherwise) -> FailureOr<Val> {
     AluSpec spec;

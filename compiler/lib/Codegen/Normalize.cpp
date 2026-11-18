@@ -1623,11 +1623,6 @@ void mlir::furiosa::guardNaNs(ModuleOp module) {
     Value x = op->getOperand(0), y = op->getOperand(1);
     Value acc = g.getNumReductionLoops() ? body.getArgument(body.getNumArguments() - 1) : Value();
     bool combiner = acc && (x == acc || y == acc);
-    // shortcut: two computed operands keep the engine's NaN-propagating max (attention's running max: the row-wise
-    // class does not yet plan a max of two cleaned row values); clean both, maximumf(clean(a), clean(b)), once it
-    // does.
-    if (!combiner && !number(x) && !number(y))
-      return;
     bool max = isa<arith::MaxNumFOp>(op);
     OpBuilder b(op);
     Location loc = op->getLoc();
@@ -1637,6 +1632,18 @@ void mlir::furiosa::guardNaNs(ModuleOp module) {
       Value keeps = arith::CmpFOp::create(b, loc, max ? arith::CmpFPredicate::OGT : arith::CmpFPredicate::OLT, v, bound);
       return arith::SelectOp::create(b, loc, keeps, v, bound).getResult();
     };
+    // Two computed operands (tl.maximum(x, y), attention's running max): r = maximumf(clean(x), clean(y)) is the
+    // answer unless both are -inf or NaN; then it is -inf unless both are NaN: r > -inf ? r : (x == -inf ? x : y).
+    if (!combiner && !number(x) && !number(y)) {
+      Value r = max ? arith::MaximumFOp::create(b, loc, clean(x), clean(y)).getResult()
+                    : arith::MinimumFOp::create(b, loc, clean(x), clean(y)).getResult();
+      Value some = arith::CmpFOp::create(b, loc, max ? arith::CmpFPredicate::OGT : arith::CmpFPredicate::OLT, r, bound);
+      Value xBound = arith::CmpFOp::create(b, loc, arith::CmpFPredicate::OEQ, x, bound);
+      Value none = arith::SelectOp::create(b, loc, xBound, x, y);
+      op->getResult(0).replaceAllUsesWith(arith::SelectOp::create(b, loc, some, r, none).getResult());
+      op->erase();
+      return;
+    }
     if (combiner ? x == acc : number(x))
       std::swap(x, y); // x the value to clean, y the accumulator or the number
     Value r = max ? arith::MaximumFOp::create(b, loc, clean(x), y).getResult()
