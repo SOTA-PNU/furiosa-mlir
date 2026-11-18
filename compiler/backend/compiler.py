@@ -1,7 +1,8 @@
 """Triton backend for the Furiosa RNGD NPU: TTIR -> whole-tensor linalg -> (later) fopt -> Rust.
 
-Kernels are compiled per launch: the driver (compiler/furiosa_compile) passes every scalar argument
-as a constexpr and records the launch grid, so the raising pass sees a kernel with constant shapes.
+Kernels are compiled per launch: the driver (compiler/furiosa_compile) passes every integer argument
+as a constexpr, every float one as an fp32 value it records, and the launch grid, so the raising pass
+sees a kernel with constant shapes.
 """
 
 import functools
@@ -48,6 +49,7 @@ class FuriosaOptions:
     # kind, dtype, shape) behind each pointer argument, as JSON.
     grid: Tuple[int, ...] = (1, 1, 1)
     buffers: str = "[]"
+    scalars: str = "[]"  # the values of the fp32 scalar arguments, in order, as JSON
 
     def hash(self):
         key = "_".join(f"{name}-{value}" for name, value in sorted(self.__dict__.items()))
@@ -113,7 +115,8 @@ class FuriosaBackend(BaseBackend):
     @staticmethod
     def make_linalg(mod, metadata, options):
         builder = ir.builder(mod.context)
-        launch = json.dumps({"grid": list(options.grid), "buffers": json.loads(options.buffers)})
+        launch = json.dumps({"grid": list(options.grid), "buffers": json.loads(options.buffers),
+                             "scalars": json.loads(options.scalars)})
         mod.set_attr("furiosa.launch", builder.get_string_attr(launch))
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()

@@ -1,14 +1,18 @@
 """Compiles a model file's launch graphs with the Furiosa Triton backend, one kernel per distinct
 launch specialization (see compiler/README.md for the output contract).
 
-Each launch is specialized harder than Triton's JIT would: every scalar argument becomes a constexpr
-and the grid is recorded, so the backend sees constant shapes, loop bounds and divisors. Pointer
+Each launch is specialized harder than Triton's JIT would: every integer argument becomes a constexpr
+and the grid is recorded, so the backend sees constant shapes, loop bounds and divisors. A float argument
+stays an fp32 argument, as Triton's JIT passes it, so arithmetic on it rounds to fp32 at every step (a
+constexpr float would fold in Python's double precision); its value goes with the launch and the raising
+pass binds it. Pointer
 arguments carry their buffer's kind, dtype and shape for the raising pass; buffer names are bound per
 launch in graph.json, so one compiled kernel serves every launch of the same shape.
 """
 
 import importlib.util
 import json
+import math
 import re
 import sys
 from dataclasses import dataclass
@@ -53,7 +57,7 @@ class Kernel:
 def specialize(launch):
     """The ASTSource, backend options, and buffer name per pointer argument of one launch."""
     fn = launch.kernel
-    signature, constexprs, attrs, buffers, names, pointer_args = {}, {}, {}, [], [], []
+    signature, constexprs, attrs, buffers, names, pointer_args, scalars = {}, {}, {}, [], [], [], []
     for i, (name, param) in enumerate(zip(fn.arg_names, fn.params)):
         if name in launch.args:
             value = launch.args[name]
@@ -64,15 +68,18 @@ def specialize(launch):
         if is_buffer(value):
             signature[name] = f"*{value.dtype}"
             attrs[(i,)] = [["tt.divisibility", 16]]
-            # TTIR keeps the pointer parameters alone (scalars are constexpr): its position among them.
+            # Its position among the pointer parameters (the raising pass binds the scalar ones).
             buffers.append({"arg": len(buffers), "kind": value.kind, "dtype": value.dtype, "shape": list(value.shape)})
             names.append(value.name)
             pointer_args.append(name)
+        elif isinstance(value, float) and math.isfinite(value) and not param.is_constexpr:
+            signature[name] = "fp32"
+            scalars.append(value)
         else:
             signature[name] = "constexpr"
             constexprs[(i,)] = value
     grid = tuple(launch.grid) + (1,) * (3 - len(launch.grid))
-    options = {"grid": grid, "buffers": json.dumps(buffers)}
+    options = {"grid": grid, "buffers": json.dumps(buffers), "scalars": json.dumps(scalars)}
     return ASTSource(fn, signature, constexprs, attrs), options, names, pointer_args
 
 
@@ -112,7 +119,8 @@ def compile_graphs(model_graphs, model: str, out: Path, keep_going: bool = False
         launches = []
         for launch in graph.launches:
             src, options, names, pointer_args = specialize(launch)
-            key = (launch.kernel, repr(sorted(src.constants.items(), key=str)), repr(src.signature), options["grid"], options["buffers"])
+            key = (launch.kernel, repr(sorted(src.constants.items(), key=str)), repr(src.signature), options["grid"],
+                   options["buffers"], options["scalars"])
             if key not in by_key:
                 name = launch.kernel.__name__
                 symbol = f"{name}_{counts.get(name, 0)}"

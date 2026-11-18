@@ -4,7 +4,7 @@ A Triton backend (`TRITON_PLUGIN_DIRS` plugin, built into libtriton) plus a driv
 model file into a furiosa-opt crate. Pipeline:
 
 ```
-model.py ── driver: one triton.compile per launch specialization, every scalar a constexpr
+model.py ── driver: one triton.compile per launch specialization, every integer scalar a constexpr
          ── backend stages: ttir ─▶ linalg (raise) ─▶ fopt (mapping) ─▶ rust
          ── driver: crate = kernels + run_graph host program from the launch graph
 ```
@@ -27,9 +27,10 @@ The compiler venv also needs CPU-only torch for `kernel[grid](...)` on host tens
 
 In the compiler venv the furiosa driver is always Triton's active driver (`compiler/backend/driver.py`), so
 calling a `@triton.jit` kernel, `kernel[grid](x, y, out, n, BLOCK=1024)`, runs it on npu3: Triton compiles its
-TTIR, then the launcher specializes the launch (scalars as constexprs, the grid, each tensor's dtype and
-shape), compiles it through every stage into a crate, builds it once per specialization under
-`~/.cache/furiosa-npu`, runs it on npu3 and copies the written tensors back (`furiosa_compiler/npu.py`).
+TTIR, then the launcher specializes the launch (integer scalars as constexprs, float ones as fp32 values the raise
+binds, the grid, each tensor's dtype and shape), compiles it through every stage into a crate, builds it once per
+specialization under `~/.cache/furiosa-npu`, runs it on npu3 and copies the written tensors back
+(`furiosa_compiler/npu.py`).
 Nothing falls back to the CPU or GPU: a kernel the compiler cannot map raises its diagnostic.
 `compiler/tests/test_npu_launch.py` checks it.
 
@@ -132,7 +133,7 @@ fp16 buffers live as f32 on the device (furiosa-opt has no f16): mapping a kerne
 `f32` and drops the conversions between them, and the crate converts F16 at the graph boundary (exactly in,
 round-to-nearest-even out); `steps.mlir` and the stages before it keep `f16`.
 
-A specialization is keyed by kernel, constexpr values, grid and the dtype/shape of each pointer
+A specialization is keyed by kernel, constexpr and float scalar values, grid and the dtype/shape of each pointer
 argument (not the buffer names), so one compiled kernel serves every launch with that shape; `graph.json`
 binds buffers per launch:
 

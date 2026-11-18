@@ -1,7 +1,7 @@
 """Runs one Triton launch, ``kernel[grid](...)``, on the NPU: the furiosa Triton driver's launcher calls
-``run``. The launch is specialized (scalars as constexprs, the grid, every tensor's dtype and shape),
-compiled through the whole pipeline into a crate, built once per specialization, and run on the NPU;
-the tensors the kernel writes are copied back. Nothing falls back to the CPU: a kernel the compiler
+``run``. The launch is specialized (integer scalars as constexprs, float ones as fp32 values, the grid, every
+tensor's dtype and shape), compiled through the whole pipeline into a crate, built once per specialization, and run
+on the NPU; the tensors the kernel writes are copied back. Nothing falls back to the CPU: a kernel the compiler
 cannot map raises with the compiler's diagnostic.
 """
 
@@ -110,7 +110,7 @@ def executable(launch: Launch) -> tuple[Path, Path]:
     src, options, _, _ = driver.specialize(launch)
     compiler = triton_key() + "".join(p.read_text() for p in sorted(Path(__file__).parent.glob("*.py")))
     key = repr((compiler, launch.kernel.cache_key, sorted(src.constants.items(), key=str), src.signature,
-                options["grid"], options["buffers"]))
+                options["grid"], options["buffers"], options["scalars"]))
     work = CACHE / f"{launch.kernel.__name__}-{hashlib.sha256(key.encode()).hexdigest()[:16]}"
     work.mkdir(parents=True, exist_ok=True)
     with open(work / ".lock", "w") as lock:

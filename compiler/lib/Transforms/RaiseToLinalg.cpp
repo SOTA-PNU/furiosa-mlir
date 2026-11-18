@@ -38,6 +38,7 @@
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
@@ -1236,6 +1237,27 @@ LogicalResult Raiser::parseLaunch() {
     for (const llvm::json::Value &d : *o->getArray("shape"))
       info.shape.push_back(*d.getAsInteger());
     buffers[*o->getInteger("arg")] = info;
+  }
+  // Float scalars arrive as fp32 arguments, as Triton's JIT passes them, so arithmetic on them rounds to fp32 at each
+  // step (a constexpr folds in Python's double): bind each to its launch value, in order, and fold what that fixes.
+  if (const llvm::json::Array *values = obj->getArray("scalars"); values && !values->empty()) {
+    OpBuilder ob = OpBuilder::atBlockBegin(&kernel.getBody().front());
+    llvm::BitVector bound(kernel.getNumArguments());
+    auto value = values->begin();
+    for (auto [i, arg] : llvm::enumerate(kernel.getArguments())) {
+      if (isa<tt::PointerType>(arg.getType()))
+        continue;
+      auto ft = dyn_cast<FloatType>(arg.getType());
+      if (!ft || value == values->end() || !value->getAsNumber())
+        return kernel.emitError("furiosa: argument ") << i << " is not a buffer or a float scalar of the launch";
+      arg.replaceAllUsesWith(arith::ConstantOp::create(ob, loc, FloatAttr::get(ft, *(value++)->getAsNumber())));
+      bound.set(i);
+    }
+    GreedyRewriteConfig foldOnly;
+    foldOnly.setRegionSimplificationLevel(GreedySimplifyRegionLevel::Disabled);
+    if (failed(kernel.eraseArguments(bound)) ||
+        failed(applyPatternsGreedily(kernel, FrozenRewritePatternSet(), foldOnly)))
+      return kernel.emitError("furiosa: binding the float scalars failed");
   }
   for (auto [i, arg] : llvm::enumerate(kernel.getArguments())) {
     auto ptr = dyn_cast<tt::PointerType>(arg.getType());
@@ -3916,8 +3938,10 @@ void Raiser::lowerScans() {
 }
 
 LogicalResult Raiser::run() {
+  if (failed(parseLaunch()))
+    return failure();
   lowerScans();
-  if (failed(parseLaunch()) || failed(evaluate()))
+  if (failed(evaluate()))
     return failure();
   b.setInsertionPointToEnd(module.getBody());
   SmallVector<Type> argTypes;
