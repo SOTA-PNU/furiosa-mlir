@@ -6,6 +6,10 @@ npu stage) against GPU goldens.
 
 ## 1.4.0 (unreleased, main)
 
+- Float-to-int casts are exact: the engine's conversion rounds where `fptosi` truncates, so row-wise converts only values
+  that are whole by construction (a clamped floor, a round) and truncates the rest first (`math.trunc` expands):
+  held-out int8 quantization passes L0 to L4 (fa006c8).
+- A buffer a kernel reads before anything wrote it starts as zeros in the crate, as the golden and L1 assume (812e42e).
 - A data-dependent read inside a computation (x[r, t[r]] in a loss) becomes a gather step of its own that the computation
   reads as an input; furiosa-opt's gather DMA takes power-of-two row counts, so other counts pad with row 0 (npu3
   rejected 3, 5 or 12 rows): held-out cross-entropy maps (2bb23f5).
