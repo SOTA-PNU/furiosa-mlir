@@ -1744,6 +1744,153 @@ void nestSelectKeys(ModuleOp module) {
   }
 }
 
+/// A data-dependent read in a generic that computes more than the read (a per-row target logit x[r, t[r]] used in
+/// a loss) moves into a generic of its own over the loops its address uses, which yields the element (what the
+/// gather class and splitElementGathers take); the generic reads its result as an input. Only where the generic
+/// does not map as a step as it is.
+void splitGathers(ModuleOp module, function_ref<bool(linalg::GenericOp)> mapsAlone) {
+  if (!mapsAlone)
+    return;
+  // The ops a read's address is computed from in `body`, in body order, or failure if it reads the output.
+  auto address = [](tensor::ExtractOp e, Block &body, unsigned numInputs) -> FailureOr<SmallVector<Operation *>> {
+    llvm::SetVector<Operation *> ops;
+    SmallVector<Value> work(e.getIndices());
+    bool data = false;
+    while (!work.empty()) {
+      Value v = work.pop_back_val();
+      if (auto arg = dyn_cast<BlockArgument>(v)) {
+        if (arg.getOwner() != &body)
+          continue;
+        if (arg.getArgNumber() >= numInputs)
+          return failure();
+        data = true;
+        continue;
+      }
+      Operation *op = v.getDefiningOp();
+      if (op && op->getBlock() == &body && ops.insert(op))
+        llvm::append_range(work, op->getOperands());
+    }
+    if (!data)
+      return failure();
+    SmallVector<Operation *> sorted(ops.begin(), ops.end());
+    llvm::sort(sorted, [](Operation *a, Operation *b) { return a->isBeforeInBlock(b); });
+    return sorted;
+  };
+  SmallVector<linalg::GenericOp> found;
+  module.walk([&](linalg::GenericOp g) {
+    Block &body = g.getRegion().front();
+    if (g.getNumDpsInits() != 1 || !g.getNumLoops() || !g.hasPureTensorSemantics() ||
+        body.getTerminator()->getOperand(0).getDefiningOp<tensor::ExtractOp>())
+      return;
+    bool any = false;
+    for (auto e : body.getOps<tensor::ExtractOp>())
+      any |= !g.getRegion().isAncestor(e.getTensor().getParentRegion()) &&
+             succeeded(address(e, body, g.getNumDpsInputs()));
+    if (any && !mapsAlone(g))
+      found.push_back(g);
+  });
+  for (linalg::GenericOp g : found) {
+    Block &body = g.getRegion().front();
+    unsigned numInputs = g.getNumDpsInputs(), numLoops = g.getNumLoops();
+    SmallVector<int64_t> ranges = g.getStaticLoopRanges();
+    SmallVector<AffineMap> maps = g.getIndexingMapsArray();
+    OpBuilder b(g);
+    Location loc = g.getLoc();
+    SmallVector<Value> inputs(g.getDpsInputs());
+    SmallVector<AffineMap> allMaps(maps.begin(), maps.begin() + numInputs);
+    SmallVector<tensor::ExtractOp> moved;
+    for (auto e : llvm::to_vector(body.getOps<tensor::ExtractOp>())) {
+      FailureOr<SmallVector<Operation *>> ops = address(e, body, numInputs);
+      if (g.getRegion().isAncestor(e.getTensor().getParentRegion()) || failed(ops))
+        continue;
+      // The loops the address uses; none (one data-dependent address): one loop of one iteration, along which
+      // the reads at 0 of one-entry dims run (and the generic reads the element along a loop of its own of one
+      // iteration, if it has one).
+      llvm::SmallBitVector used(numLoops);
+      SetVector<unsigned> args;
+      for (Operation *op : *ops) {
+        if (auto index = dyn_cast<linalg::IndexOp>(op))
+          used.set(index.getDim());
+        for (Value o : op->getOperands())
+          if (auto arg = dyn_cast<BlockArgument>(o); arg && arg.getOwner() == &body)
+            args.insert(arg.getArgNumber());
+      }
+      for (Value o : e.getIndices())
+        if (auto arg = dyn_cast<BlockArgument>(o); arg && arg.getOwner() == &body)
+          args.insert(arg.getArgNumber());
+      for (unsigned a : args)
+        for (unsigned d = 0; d < numLoops; ++d)
+          if (maps[a].isFunctionOfDim(d))
+            used.set(d);
+      bool one = used.none();
+      llvm::SmallBitVector unused = ~used;
+      SmallVector<int64_t> shape;
+      SmallVector<AffineExpr> kept;
+      DenseMap<unsigned, unsigned> dimOf;
+      for (unsigned d : used.set_bits()) {
+        dimOf[d] = shape.size();
+        shape.push_back(ranges[d]);
+        kept.push_back(b.getAffineDimExpr(d));
+      }
+      if (one) {
+        shape.push_back(1);
+        auto unit = llvm::find(ranges, 1);
+        kept.push_back(unit != ranges.end() ? b.getAffineDimExpr(unit - ranges.begin()) : b.getAffineConstantExpr(0));
+      }
+      SmallVector<Value> ins;
+      SmallVector<AffineMap> gMaps;
+      for (unsigned a : args) {
+        ins.push_back(g.getDpsInputs()[a]);
+        AffineMap m = compressDims(maps[a], unused);
+        if (one) {
+          auto type = cast<RankedTensorType>(ins.back().getType());
+          SmallVector<AffineExpr> exprs;
+          for (auto [k, x] : llvm::enumerate(m.getResults())) {
+            auto c = dyn_cast<AffineConstantExpr>(x);
+            exprs.push_back(c && c.getValue() == 0 && type.getDimSize(k) == 1 ? b.getAffineDimExpr(0) : x);
+          }
+          m = AffineMap::get(1, 0, exprs, b.getContext());
+        }
+        gMaps.push_back(m);
+      }
+      gMaps.push_back(b.getMultiDimIdentityMap(shape.size()));
+      Value empty = tensor::EmptyOp::create(b, loc, shape, e.getType());
+      auto gather = linalg::GenericOp::create(
+          b, loc, TypeRange{empty.getType()}, ins, ValueRange{empty}, gMaps,
+          SmallVector<utils::IteratorType>(shape.size(), utils::IteratorType::parallel),
+          [&](OpBuilder &nb, Location l, ValueRange blockArgs) {
+            IRMapping map;
+            for (auto [k, a] : llvm::enumerate(args))
+              map.map(body.getArgument(a), blockArgs[k]);
+            for (Operation *op : *ops) {
+              if (auto index = dyn_cast<linalg::IndexOp>(op))
+                map.map(index.getResult(), linalg::IndexOp::create(nb, l, dimOf[index.getDim()]).getResult());
+              else
+                nb.clone(*op, map);
+            }
+            linalg::YieldOp::create(nb, l, nb.clone(*e, map)->getResult(0));
+          });
+      inputs.push_back(gather.getResult(0));
+      allMaps.push_back(AffineMap::get(numLoops, 0, kept, b.getContext()));
+      moved.push_back(e);
+    }
+    for (OpOperand &out : g.getDpsInitsMutable())
+      allMaps.push_back(g.getMatchingIndexingMap(&out));
+    auto replacement = linalg::GenericOp::create(b, loc, g.getResultTypes(), inputs, g.getDpsInits(), allMaps,
+                                                 g.getIteratorTypesArray());
+    replacement->setDiscardableAttrs(g->getDiscardableAttrDictionary());
+    replacement.getRegion().takeBody(g.getRegion());
+    Block &rb = replacement.getRegion().front();
+    for (auto [k, e] : llvm::enumerate(moved)) {
+      BlockArgument arg = rb.insertArgument(numInputs + k, e.getType(), e.getLoc());
+      e.replaceAllUsesWith(Value(arg));
+      e.erase();
+    }
+    g.replaceAllUsesWith(replacement.getResults());
+    g.erase();
+  }
+}
+
 /// A generic yielding one element a data-dependent address reads (tl.gather by data: out[i, j] = x[i, f(x[i, j])])
 /// that the gather class cannot move (a DMA moves 8-byte units) gathers rows of 8 bytes instead: the address a
 /// splits into a row a / g and a lane a % g of g = 8 / (element bytes on the device) elements; the gather class
@@ -1808,9 +1955,27 @@ void splitElementGathers(ModuleOp module, function_ref<bool(linalg::GenericOp)> 
       sb.getTerminator()->setOperand(0, arith::IndexCastOp::create(eb, loc, i32, a));
       ex.erase();
     }
+    // The gather DMA takes a power of two of rows below 256 slices (whole 256s past): other counts gather the rows of
+    // the addresses padded with 0 (row 0) and keep the first.
+    int64_t count = outType.getNumElements();
+    int64_t lines = count < 256 ? int64_t(llvm::PowerOf2Ceil(count)) : int64_t(llvm::alignTo(count, 256));
+    SmallVector<int64_t> lineShape(outType.getShape());
+    Value addresses = address.getResult(0);
+    AffineMap lineId = id;
+    if (lines != count) {
+      lineShape = {lines};
+      lineId = b.getMultiDimIdentityMap(1);
+      Value flat = furiosa::reshapeTo(b, loc, addresses, RankedTensorType::get({count}, i32));
+      Value zero = arith::ConstantIntOp::create(b, loc, i32, 0);
+      addresses = tensor::PadOp::create(b, loc, RankedTensorType::get({lines}, i32), flat,
+                                        ArrayRef<OpFoldResult>{b.getIndexAttr(0)},
+                                        ArrayRef<OpFoldResult>{b.getIndexAttr(lines - count)}, zero);
+    }
+    unsigned lineRank = lineShape.size();
     auto row = linalg::GenericOp::create(
-        b, loc, TypeRange{outType.clone(i32)}, ValueRange{address.getResult(0)},
-        ValueRange{empty(outType.getShape(), i32)}, ArrayRef<AffineMap>{id, id}, parallel,
+        b, loc, TypeRange{RankedTensorType::get(lineShape, i32)}, ValueRange{addresses},
+        ValueRange{empty(lineShape, i32)}, ArrayRef<AffineMap>{lineId, lineId},
+        SmallVector<utils::IteratorType>(lineRank, utils::IteratorType::parallel),
         [&](OpBuilder &nb, Location l, ValueRange args) {
           Value log = arith::ConstantIntOp::create(nb, l, nb.getI32Type(), llvm::Log2_64(group));
           linalg::YieldOp::create(nb, l, arith::ShRSIOp::create(nb, l, args[0], log).getResult());
@@ -1823,37 +1988,40 @@ void splitElementGathers(ModuleOp module, function_ref<bool(linalg::GenericOp)> 
                                                  0, table.getRank()))});
     rows = tensor::ExpandShapeOp::create(b, loc, RankedTensorType::get({n / group, group}, et), rows,
                                          SmallVector<ReassociationIndices>{{0, 1}});
-    SmallVector<int64_t> pairShape(outType.getShape());
+    SmallVector<int64_t> pairShape(lineShape);
     pairShape.push_back(group);
     SmallVector<AffineExpr> lead;
-    for (unsigned d = 0; d < rank; ++d)
+    for (unsigned d = 0; d < lineRank; ++d)
       lead.push_back(b.getAffineDimExpr(d));
     auto gather = linalg::GenericOp::create(
         b, loc, TypeRange{RankedTensorType::get(pairShape, et)}, ValueRange{row.getResult(0)},
         ValueRange{empty(pairShape, et)},
-        ArrayRef<AffineMap>{AffineMap::get(rank + 1, 0, lead, b.getContext()), b.getMultiDimIdentityMap(rank + 1)},
-        SmallVector<utils::IteratorType>(rank + 1, utils::IteratorType::parallel),
+        ArrayRef<AffineMap>{AffineMap::get(lineRank + 1, 0, lead, b.getContext()),
+                            b.getMultiDimIdentityMap(lineRank + 1)},
+        SmallVector<utils::IteratorType>(lineRank + 1, utils::IteratorType::parallel),
         [&](OpBuilder &nb, Location l, ValueRange args) {
           Value r = arith::IndexCastOp::create(nb, l, nb.getIndexType(), args[0]);
-          Value p = linalg::IndexOp::create(nb, l, rank);
+          Value p = linalg::IndexOp::create(nb, l, lineRank);
           linalg::YieldOp::create(nb, l, tensor::ExtractOp::create(nb, l, rows, ValueRange{r, p}).getResult());
         });
     // Each lane a box of the rows; a select by the lane takes it.
     SmallVector<Value> ins{address.getResult(0)};
-    SmallVector<ReassociationIndices> drop;
-    for (unsigned d = 0; d < rank; ++d)
-      drop.push_back({int64_t(d)});
-    drop.back().push_back(rank);
-    SmallVector<int64_t> boxShape(outType.getShape());
+    SmallVector<int64_t> boxShape(lines != count ? ArrayRef<int64_t>{count} : outType.getShape());
     boxShape.push_back(1);
+    SmallVector<ReassociationIndices> drop;
+    for (unsigned d = 0; d + 1 < boxShape.size(); ++d)
+      drop.push_back({int64_t(d)});
+    drop.back().push_back(lineRank);
     for (int64_t k = 0; k < group; ++k) {
-      SmallVector<OpFoldResult> offs(rank + 1, b.getIndexAttr(0)), sizes, strides(rank + 1, b.getIndexAttr(1));
-      offs[rank] = b.getIndexAttr(k);
+      SmallVector<OpFoldResult> offs(lineRank + 1, b.getIndexAttr(0)), sizes, strides(lineRank + 1, b.getIndexAttr(1));
+      offs[lineRank] = b.getIndexAttr(k);
       for (int64_t e : boxShape)
         sizes.push_back(b.getIndexAttr(e));
       Value box = tensor::ExtractSliceOp::create(b, loc, RankedTensorType::get(boxShape, et), gather.getResult(0), offs,
                                                  sizes, strides);
-      ins.push_back(tensor::CollapseShapeOp::create(b, loc, outType, box, drop));
+      Value lane = tensor::CollapseShapeOp::create(
+          b, loc, RankedTensorType::get(ArrayRef(boxShape).drop_back(), et), box, drop);
+      ins.push_back(furiosa::reshapeTo(b, loc, lane, outType));
     }
     auto pick = linalg::GenericOp::create(
         b, loc, TypeRange{outType}, ins, ValueRange{empty(outType.getShape(), et)},
@@ -2097,6 +2265,7 @@ void mlir::furiosa::normalizeKernels(ModuleOp module, function_ref<bool(linalg::
   module.walk([&](linalg::GenericOp g) { reading.push_back(g); });
   for (linalg::GenericOp g : reading)
     promoteExtracts(g);
+  splitGathers(module, mapsAlone);
   splitElementGathers(module, mapsAlone);
   splitIndexSelects(module, mapsAlone);
   selectionReductions(module);

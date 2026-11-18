@@ -261,8 +261,9 @@ LogicalResult map(RaisedKernel &kernel) {
     return func.emitError("gather: a row of ") << g.rowSize << " elements is not a whole number of 8-byte DMA words";
   if (g.count > kSlices && g.count % kSlices)
     return func.emitError("gather: ") << g.count << " rows do not spread evenly over " << kSlices << " slices";
-  if (g.count > 8 && g.count % 8)
-    return func.emitError("gather: an index list of ") << g.count << " entries is not a whole number of flits";
+  // furiosa-opt's gather DMA partitions the slices by a power of two of rows (it rejects 12 rows on npu3).
+  if (g.count < kSlices && !llvm::isPowerOf2_64(g.count))
+    return func.emitError("gather: ") << g.count << " rows: the gather DMA takes a power of two below " << kSlices;
 
   KernelBuilder kb(kernel);
   MLIRContext *ctx = kb.getContext();
