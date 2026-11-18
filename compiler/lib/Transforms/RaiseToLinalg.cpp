@@ -902,6 +902,9 @@ struct BufferInfo {
 /// and swap (val where old == cmp).
 struct Write {
   Operation *op;
+  // An atomic every instance applies to the same elements: one write of old (op) each instance's value,
+  // reduced over the program ids in program order (raiseStore).
+  bool overPrograms = false;
   Value getPtr() const {
     if (auto cas = dyn_cast<tt::AtomicCASOp>(op))
       return cas.getPtr();
@@ -956,6 +959,7 @@ struct StoreSpace {
   // Per instance: the origin of each stored axis, then the coordinate of each free dim.
   std::vector<SmallVector<int64_t>> origin;
   SmallVector<Value> dataMask; // mask terms that depend on data: the write keeps the old value where one fails
+  unsigned programDims = 0;    // trailing view dims that are program ids (free dims), reduced over
 };
 
 /// A write mask taken apart over its `and`s: the index predicates (conds, never) decide where it can
@@ -3681,6 +3685,35 @@ FailureOr<Value> Raiser::materializeState(Gen &g, scf::ForOp loop, unsigned resu
 }
 
 LogicalResult Raiser::raiseStore(Write store) {
+  if (store.overPrograms) {
+    // The space one instance writes, plus a free view dim per program id the instances vary along (z, y,
+    // then x: x innermost, so the reduction runs in program order).
+    SmallVector<Evaluator *> all = act;
+    act = {all[0]};
+    auto sp = storeSpace(store);
+    act = all;
+    if (failed(sp))
+      return failure();
+    SmallVector<int64_t> origin0 = sp->origin[0];
+    sp->origin.assign(all.size(), origin0);
+    for (int d = 2; d >= 0; --d) {
+      int64_t lo = all[0]->programId()[d], hi = lo;
+      for (Evaluator *ev : all) {
+        lo = std::min(lo, ev->programId()[d]);
+        hi = std::max(hi, ev->programId()[d]);
+      }
+      if (lo == hi)
+        continue;
+      sp->freeDims.push_back(sp->viewShape.size());
+      sp->viewShape.push_back(hi - lo + 1);
+      sp->boxLo.push_back(lo);
+      sp->boxHi.push_back(hi);
+      ++sp->programDims;
+      for (auto [n, ev] : llvm::enumerate(all))
+        sp->origin[n].push_back(ev->programId()[d]);
+    }
+    return raiseStoreIn(store, *sp);
+  }
   auto sp = storeSpace(store);
   if (failed(sp))
     return failure();
@@ -3745,7 +3778,9 @@ LogicalResult Raiser::raiseStoreIn(Write store, const StoreSpace &spRef) {
   const StoreSpace *sp = &spRef;
   space = sp;
   int arg = sp->arg;
-  unsigned nd = sp->viewShape.size();
+  unsigned nd = sp->viewShape.size(), nv = nd - sp->programDims; // view dims of the buffer, then program ids
+  SmallVector<int64_t> viewShape(sp->viewShape.begin(), sp->viewShape.begin() + nv);
+  SmallVector<int64_t> boxLo(sp->boxLo.begin(), sp->boxLo.begin() + nv);
   SmallVector<Axis> env;
   for (unsigned i = sp->loops.size(); i < sp->global.size(); ++i) {
     Axis a;
@@ -3766,28 +3801,53 @@ LogicalResult Raiser::raiseStoreIn(Write store, const StoreSpace &spRef) {
   Operation *anchor = arith::ConstantIndexOp::create(b, loc, 0);
   root.anchor = anchor;
   Type elem = buffers[arg].elem;
-  SmallVector<unsigned> all;
-  for (unsigned j = 0; j < nd; ++j)
-    all.push_back(j);
-  // The stored value, as a parallel generic over every view dim (no pruning: it fills the box).
+  // The stored value, as a parallel generic over every view dim (no pruning: it fills the box). With program
+  // dims, that is each instance's value, and one reduction then combines them into the old value in program order.
   OpBuilder::InsertionGuard guard(b);
   b.setInsertionPoint(anchor);
-  SmallVector<int64_t> box(root.extent);
+  SmallVector<int64_t> box(root.extent.begin(), root.extent.begin() + nv);
   auto rmw = dyn_cast<tt::AtomicRMWOp>(store.getOperation());
   auto cas = dyn_cast<tt::AtomicCASOp>(store.getOperation());
   // An atomic, or a write whose mask depends on data, starts from what the box holds.
   bool keepsOld = rmw || cas || !sp->dataMask.empty();
   Value init = !keepsOld ? tensor::EmptyOp::create(b, loc, box, elem).getResult()
-               : sp->full ? reshape(current[arg], sp->viewShape)
-                          : tensor::ExtractSliceOp::create(b, loc, reshape(current[arg], sp->viewShape),
-                                                           getAsIndexOpFoldResult(ctx, sp->boxLo),
+               : sp->full ? reshape(current[arg], viewShape)
+                          : tensor::ExtractSliceOp::create(b, loc, reshape(current[arg], viewShape),
+                                                           getAsIndexOpFoldResult(ctx, boxLo),
                                                            getAsIndexOpFoldResult(ctx, box),
-                                                           getAsIndexOpFoldResult(ctx, SmallVector<int64_t>(nd, 1)))
+                                                           getAsIndexOpFoldResult(ctx, SmallVector<int64_t>(nv, 1)))
                                 .getResult();
+  // old (op) x, the atomic's combine.
+  auto combine = [&](OpBuilder &ob, Value old, Value x) -> Value {
+    bool fp = isa<FloatType>(x.getType());
+    switch (rmw.getAtomicRmwOp()) {
+    case tt::RMWOp::ADD:
+    case tt::RMWOp::FADD:
+      return fp ? arith::AddFOp::create(ob, loc, old, x).getResult() : arith::AddIOp::create(ob, loc, old, x).getResult();
+    case tt::RMWOp::MAX:
+      return fp ? arith::MaxNumFOp::create(ob, loc, old, x).getResult() : arith::MaxSIOp::create(ob, loc, old, x).getResult();
+    case tt::RMWOp::MIN:
+      return fp ? arith::MinNumFOp::create(ob, loc, old, x).getResult() : arith::MinSIOp::create(ob, loc, old, x).getResult();
+    case tt::RMWOp::UMAX:
+      return arith::MaxUIOp::create(ob, loc, old, x);
+    case tt::RMWOp::UMIN:
+      return arith::MinUIOp::create(ob, loc, old, x);
+    case tt::RMWOp::AND:
+      return arith::AndIOp::create(ob, loc, old, x);
+    case tt::RMWOp::OR:
+      return arith::OrIOp::create(ob, loc, old, x);
+    case tt::RMWOp::XOR:
+      return arith::XOrIOp::create(ob, loc, old, x);
+    case tt::RMWOp::XCHG:
+      return x;
+    }
+    llvm_unreachable("an atomic read-modify-write kind");
+  };
+  Value values = sp->programDims ? tensor::EmptyOp::create(b, loc, root.extent, elem).getResult() : init;
   LogicalResult status = success();
   Gen g = root;
-  auto op = linalg::GenericOp::create(b, 
-      loc, TypeRange{init.getType()}, ValueRange{}, ValueRange{init},
+  auto op = linalg::GenericOp::create(b,
+      loc, TypeRange{values.getType()}, ValueRange{}, ValueRange{values},
       ArrayRef<AffineMap>{AffineMap::getMultiDimIdentityMap(nd, ctx)},
       SmallVector<utils::IteratorType>(nd, utils::IteratorType::parallel), [&](OpBuilder &ob, Location, ValueRange args) {
         g.ob = &ob;
@@ -3799,42 +3859,16 @@ LogicalResult Raiser::raiseStoreIn(Write store, const StoreSpace &spRef) {
           return;
         }
         Value out = *v;
+        if (sp->programDims) {
+          linalg::YieldOp::create(ob, loc, ValueRange{out});
+          return;
+        }
         Type vt = out.getType(); // the buffer's type, or one of its width through a pointer bitcast
         Value old = args[0];
         if (vt != elem)
           old = arith::BitcastOp::create(ob, loc, vt, old);
-        if (rmw) {
-          bool fp = isa<FloatType>(vt);
-          switch (rmw.getAtomicRmwOp()) {
-          case tt::RMWOp::ADD:
-          case tt::RMWOp::FADD:
-            out = fp ? arith::AddFOp::create(ob, loc, old, out).getResult() : arith::AddIOp::create(ob, loc, old, out).getResult();
-            break;
-          case tt::RMWOp::MAX:
-            out = fp ? arith::MaxNumFOp::create(ob, loc, old, out).getResult() : arith::MaxSIOp::create(ob, loc, old, out).getResult();
-            break;
-          case tt::RMWOp::MIN:
-            out = fp ? arith::MinNumFOp::create(ob, loc, old, out).getResult() : arith::MinSIOp::create(ob, loc, old, out).getResult();
-            break;
-          case tt::RMWOp::UMAX:
-            out = arith::MaxUIOp::create(ob, loc, old, out);
-            break;
-          case tt::RMWOp::UMIN:
-            out = arith::MinUIOp::create(ob, loc, old, out);
-            break;
-          case tt::RMWOp::AND:
-            out = arith::AndIOp::create(ob, loc, old, out);
-            break;
-          case tt::RMWOp::OR:
-            out = arith::OrIOp::create(ob, loc, old, out);
-            break;
-          case tt::RMWOp::XOR:
-            out = arith::XOrIOp::create(ob, loc, old, out);
-            break;
-          case tt::RMWOp::XCHG:
-            break;
-          }
-        }
+        if (rmw)
+          out = combine(ob, old, out);
         if (cas) { // val where the old value's bits equal cmp's
           auto cmp = emit(g, cas.getCmp(), env);
           if (failed(cmp)) {
@@ -3866,12 +3900,23 @@ LogicalResult Raiser::raiseStoreIn(Write store, const StoreSpace &spRef) {
   }
   b.setInsertionPoint(anchor);
   Value result = op.getResult(0);
-  Value view = reshape(current[arg], sp->viewShape);
+  if (sp->programDims) {
+    SmallVector<utils::IteratorType> iters(nv, utils::IteratorType::parallel);
+    iters.append(sp->programDims, utils::IteratorType::reduction);
+    AffineMap all = AffineMap::getMultiDimIdentityMap(nd, ctx);
+    result = linalg::GenericOp::create(b, loc, TypeRange{init.getType()}, ValueRange{result}, ValueRange{init},
+                                       ArrayRef<AffineMap>{all, all.getMajorSubMap(nv)}, iters,
+                                       [&](OpBuilder &ob, Location, ValueRange args) {
+                                         linalg::YieldOp::create(ob, loc, combine(ob, args[1], args[0]));
+                                       })
+                 .getResult(0);
+  }
+  Value view = reshape(current[arg], viewShape);
   Value updated = sp->full ? result
                            : tensor::InsertSliceOp::create(b, loc, result, view,
-                                                             getAsIndexOpFoldResult(ctx, sp->boxLo),
+                                                             getAsIndexOpFoldResult(ctx, boxLo),
                                                              getAsIndexOpFoldResult(ctx, box),
-                                                             getAsIndexOpFoldResult(ctx, SmallVector<int64_t>(nd, 1)))
+                                                             getAsIndexOpFoldResult(ctx, SmallVector<int64_t>(nv, 1)))
                                  .getResult();
   current[arg] = reshape(updated, buffers[arg].shape);
   stores.push_back({store.getOperation(), arg, current[arg]});
@@ -4046,6 +4091,11 @@ LogicalResult Raiser::run() {
       std::vector<std::set<int64_t>> roundAddrs;
       std::vector<SmallVector<Evaluator *>> rounds;
       SmallVector<int64_t> shape = shapeOf(st.getValue().getType());
+      std::set<int64_t> firstAddrs;
+      // Every instance writes the same elements through the same address, of the buffer's own type, with no
+      // mask on data (Triton's float max/min through an i32 pointer and a sign mask stays in rounds).
+      const Sym *p0 = instances[0]->get(st.getPtr());
+      bool sameElements = getElementTypeOrSelf(st.getValue().getType()) == buffers[p0->base].elem;
       for (Evaluator *ev : instances) {
         const Sym *p = ev->get(st.getPtr());
         if (!p->data.empty())
@@ -4055,6 +4105,7 @@ LogicalResult Raiser::run() {
         SmallVector<Value> data;
         if (st.getMask())
           splitMask(st.getMask(), [&](Value v) { return ev->get(v); }, conds, never, data);
+        sameElements &= data.empty();
         std::set<int64_t> addrs;
         SmallVector<int64_t> at(shape.size(), 0);
         for (bool more = !never; more;) {
@@ -4064,6 +4115,10 @@ LogicalResult Raiser::run() {
           for (int k = shape.size() - 1; k >= 0 && !more; --k)
             more = ++at[k] < shape[k] || (at[k] = 0, false);
         }
+        if (ev == instances[0])
+          firstAddrs = addrs;
+        else
+          sameElements &= addrs == firstAddrs && p->expr == p0->expr;
         unsigned r = 0;
         while (r < rounds.size() && llvm::any_of(addrs, [&](int64_t a) { return roundAddrs[r].count(a); }))
           ++r;
@@ -4073,6 +4128,24 @@ LogicalResult Raiser::run() {
         }
         rounds[r].push_back(ev);
         roundAddrs[r].insert(addrs.begin(), addrs.end());
+      }
+      // When every instance combines into the same elements and the old value is unused, the rounds are one
+      // write: old (op) each instance's value in program order, a reduction over the program ids (they must
+      // fill a box) of a value computed once for all of them.
+      auto rmw = dyn_cast<tt::AtomicRMWOp>(st.getOperation());
+      int64_t box = 1;
+      for (unsigned d = 0; d < 3; ++d) {
+        auto [lo, hi] = std::minmax_element(instances.begin(), instances.end(), [&](Evaluator *x, Evaluator *y) {
+          return x->programId()[d] < y->programId()[d];
+        });
+        box *= (*hi)->programId()[d] - (*lo)->programId()[d] + 1;
+      }
+      if (rounds.size() > 1 && sameElements && rmw && rmw.getAtomicRmwOp() != tt::RMWOp::XCHG && st->use_empty() &&
+          box == (int64_t)instances.size()) {
+        Write once = st;
+        once.overPrograms = true;
+        parts.push_back({once, instances});
+        continue;
       }
       // Its old value is the buffer before it writes: one value only if every instance writes alone.
       if (rounds.size() > 1 && !st->use_empty())

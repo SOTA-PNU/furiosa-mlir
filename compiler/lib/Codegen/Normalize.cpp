@@ -762,6 +762,50 @@ void treeReductions(ModuleOp module) {
   }
 }
 
+/// A reduction that starts from a computed value, not a constant fill (an atomic's old value, combined with every
+/// program's value) and maps no other way reduces from the identity, as the row-wise class does, and the value joins
+/// the total after. The combiner is associative and commutative (beyond float rounding, which the Vector Engine's
+/// reduction tree reorders anyway).
+void initsAfterReductions(ModuleOp module, function_ref<bool(linalg::GenericOp)> mapsAlone) {
+  SmallVector<linalg::GenericOp> generics;
+  module.walk([&](linalg::GenericOp g) { generics.push_back(g); });
+  for (linalg::GenericOp g : generics) {
+    if (g.getNumDpsInits() != 1 || !g.getNumReductionLoops())
+      continue;
+    Block &body = *g.getBody();
+    Value out = body.getArgument(g.getNumDpsInputs());
+    Operation *comb = cast<linalg::YieldOp>(body.getTerminator()).getOperand(0).getDefiningOp();
+    if (!comb || !isa<arith::AddFOp, arith::MaxNumFOp, arith::MinNumFOp, arith::AddIOp, arith::MaxSIOp, arith::MinSIOp>(comb) ||
+        !out.hasOneUse() || (comb->getOperand(0) != out && comb->getOperand(1) != out))
+      continue;
+    std::optional<TypedAttr> neutral = arith::getNeutralElement(comb);
+    Value init = g.getDpsInits()[0];
+    auto fill = init.getDefiningOp<linalg::FillOp>();
+    if (!neutral || (fill && matchPattern(fill.getInputs()[0], m_Constant())) || !mapsAlone || mapsAlone(g))
+      continue;
+    OpBuilder b(g);
+    Location loc = g.getLoc();
+    auto t = cast<RankedTensorType>(init.getType());
+    Value identity = arith::ConstantOp::create(b, loc, *neutral);
+    g.getDpsInitsMutable()[0].set(
+        linalg::FillOp::create(b, loc, identity, tensor::EmptyOp::create(b, loc, t.getShape(), t.getElementType()).getResult())
+            .getResult(0));
+    b.setInsertionPointAfter(g);
+    AffineMap id = AffineMap::getMultiDimIdentityMap(t.getRank(), g.getContext());
+    auto total = linalg::GenericOp::create(
+        b, loc, TypeRange{t}, ValueRange{init, g.getResult(0)},
+        ValueRange{tensor::EmptyOp::create(b, loc, t.getShape(), t.getElementType())}, ArrayRef<AffineMap>{id, id, id},
+        SmallVector<utils::IteratorType>(t.getRank(), utils::IteratorType::parallel),
+        [&](OpBuilder &nb, Location l, ValueRange args) {
+          IRMapping m;
+          m.map(out, args[0]);
+          m.map(comb->getOperand(0) == out ? comb->getOperand(1) : comb->getOperand(0), args[1]);
+          linalg::YieldOp::create(nb, l, nb.clone(*comb, m)->getResult(0));
+        });
+    g.getResult(0).replaceAllUsesExcept(total.getResult(0), total);
+  }
+}
+
 /// The least and greatest values of a linear form over loops ranging over [0, ranges[d]).
 std::pair<int64_t, int64_t> span(const std::pair<int64_t, std::map<unsigned, int64_t>> &lin, ArrayRef<int64_t> ranges) {
   int64_t lo = lin.first, hi = lin.first;
@@ -2270,6 +2314,7 @@ void mlir::furiosa::normalizeKernels(ModuleOp module, function_ref<bool(linalg::
   splitIndexSelects(module, mapsAlone);
   selectionReductions(module);
   treeReductions(module);
+  initsAfterReductions(module, mapsAlone);
   copiesToReshapes(module);
   splitLongReductions(module);
   padsToInserts(module);
