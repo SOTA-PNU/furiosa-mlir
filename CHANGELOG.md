@@ -6,6 +6,9 @@ npu stage) against GPU goldens.
 
 ## 1.4.0 (unreleased, main)
 
+- A reduction without a Vector Engine reduction (xor, and, or, a product) over a width that is not a power of two pads
+  with the combiner's identity to one before its tree: xor_sum at 2x7x33, which d6133de's live-prefix reductions had
+  broken, maps again (cc4fe5b).
 - Atomics every program applies to the same elements (add, max, min, and, or, xor) raise as one reduction over the
   program ids, folded into the old value in program order (bit-identical to the rounds), instead of a round per
   program recomputing its whole computation; a reduction that starts from a computed value no class maps reduces
