@@ -6,6 +6,8 @@ npu stage) against GPU goldens.
 
 ## 1.4.0 (unreleased, main)
 
+- Raise: a loop up to a min of bounds (`range(start, min(start + ROWS, M))`) guards each iteration by every term, and a
+  masked load past such a trip reads its `other`: held-out rmsnorm backward passes L1 to L4 (d4295da).
 - Release binaries on GitHub: `scripts/package.sh` builds a wheel (`furiosa_mlir-<version>-cp312-cp312-linux_x86_64.whl`)
   beside the tarball; neither bundles FuriosaAI's furiosa-opt tools (`install.sh` installs `cargo-furiosa-opt` 0.10.0
   from crates.io with the crates' toolchain); both carry Triton's and LLVM's licenses and copy the targets of the
