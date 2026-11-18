@@ -6,6 +6,12 @@ npu stage) against GPU goldens.
 
 ## 1.4.0 (unreleased, main)
 
+- Float scalar arguments stay fp32 values: the driver made every scalar a constexpr, so Triton folded float arguments in
+  Python's double precision (1 - beta2 at 0.999 became 1e-3; the GPU computes 1 - 0.999f = 0.00099998713). A float
+  argument not marked tl.constexpr is now an fp32 argument whose value the launch records and the raise binds and folds
+  in fp32: held-out AdamW passes L1 to L4; attention backward's `_scale` is closer to the GPU (50b66a6).
+- The step splitter remembers which candidate steps map (by their outlined text): splits byte-identical, about 2.4x
+  faster on many-step kernels (2e8c484).
 - Raise: store tiles masked to a prefix may step by the prefix (a 4-channel tile masked to a group's 3 channels starts
   every 3): held-out group norm passes L1 (8c925d8).
 - Raise: a loop up to a min of bounds (`range(start, min(start + ROWS, M))`) guards each iteration by every term, and a
