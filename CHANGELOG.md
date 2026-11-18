@@ -6,6 +6,8 @@ npu stage) against GPU goldens.
 
 ## 1.4.0 (unreleased, main)
 
+- Raise: store tiles masked to a prefix may step by the prefix (a 4-channel tile masked to a group's 3 channels starts
+  every 3): held-out group norm passes L1 (8c925d8).
 - Raise: a loop up to a min of bounds (`range(start, min(start + ROWS, M))`) guards each iteration by every term, and a
   masked load past such a trip reads its `other`: held-out rmsnorm backward passes L1 to L4 (d4295da).
 - Release binaries on GitHub: `scripts/package.sh` builds a wheel (`furiosa_mlir-<version>-cp312-cp312-linux_x86_64.whl`)
