@@ -6,6 +6,12 @@ npu stage) against GPU goldens.
 
 ## 1.5.0 (unreleased, main)
 
+- A third held-out batch (`heldout3_*`, e1ca4c1: sliding-window attention, scatter-add, batch-norm statistics, avg pool
+  with padding, bilinear upsampling, MoE top-2 gating, segment sum, an fp8 scaled matmul, residual add with layer
+  norm, scans) and a held-out model, ViT-B/16 in pure Triton with torchvision's weights (9a6ee09). First try at 1.4.0:
+  1 of 10 kernels passes L4; ViT stops at L1 (its patch-embedding store remaps rows by // and % across 64-row
+  blocks). The fp8 matmul gives a wrong result without a diagnostic (the rounding to e4m3 is dropped): a fix is in
+  progress.
 ## 1.4.0 (2026-11-18, release/1.4.0)
 
 Milestone: kernels the compiler was not written for. The second held-out batch (ten standard ML ops written from their

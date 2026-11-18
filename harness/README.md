@@ -138,7 +138,8 @@ The compiler must handle Triton code it has never seen, so it may not recognise 
   at first try in 5 of 10 (layer norm and softmax backward, RoPE, a matmul epilogue at 96x80x200, a direct 3x3
   conv); the rest found a `min` loop bound, tiles stepped by a masked prefix, fp32 scalars folded in higher precision,
   a per-row data gather with per-program atomics, and float-to-int casts, all fixed by general mechanisms: at
-  1.4.0 all ten pass L4.
+  1.4.0 all ten pass L4. The third batch (`heldout3_*`, ten more ops) and a held-out model (ViT-B/16) passed at
+  first try with 1.4.0 in 1 of 10 and none.
 
 ## Operator matrix (harness/ops)
 
