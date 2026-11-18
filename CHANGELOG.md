@@ -10,8 +10,16 @@ npu stage) against GPU goldens.
   with padding, bilinear upsampling, MoE top-2 gating, segment sum, an fp8 scaled matmul, residual add with layer
   norm, scans) and a held-out model, ViT-B/16 in pure Triton with torchvision's weights (9a6ee09). First try at 1.4.0:
   1 of 10 kernels passes L4; ViT stops at L1 (its patch-embedding store remaps rows by // and % across 64-row
-  blocks). The fp8 matmul gives a wrong result without a diagnostic (the rounding to e4m3 is dropped): a fix is in
-  progress.
+  blocks). The fp8 matmul gave a wrong result without a diagnostic (the rounding to e4m3 was dropped): fixed below.
+- Truncations to fp8 round as the GPU converts (931abfb): mapping widens fp8 to f32 and had dropped the casts, so a
+  `tl.dot` on `x.to(tl.float8e4nv)` ran on the unquantized values. A truncation to e4m3fn or e5m2 now rounds in f32
+  ops the Vector Engine has (nearest even, saturating; exact for every bf16 and 2M random f32 against ml_dtypes), and
+  L1's JIT encodes it. `heldout3_fp8_matmul` passes L1 to L4 (rel 0).
+- A contraction factor the body computes from a weight laid out [k, n] reads the weight relaid out (a transpose step),
+  padded after when K is masked (21f5bd3).
+- Raise: a store whose rows are remapped by `//` and `%` by a constant its tile crosses keeps the digits in every
+  program instance (6f360ee; ViT's patch rows `n * 197 + 1 + p`). ViT's 88 launches pass L1; its patch embedding then
+  stops in codegen (an assertion in the K-loop digit split).
 ## 1.4.0 (2026-11-18, release/1.4.0)
 
 Milestone: kernels the compiler was not written for. The second held-out batch (ten standard ML ops written from their
