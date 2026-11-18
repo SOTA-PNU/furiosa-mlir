@@ -1399,7 +1399,7 @@ FailureOr<StoreSpace> Raiser::storeSpace(Write store, ArrayRef<int64_t> extraStr
     auto it = llvm::find(encl, l);
     toSyms.push_back(it != encl.end() ? getAffineDimExpr(it - encl.begin(), ctx) : getAffineConstantExpr(0, ctx));
   }
-  std::vector<AffineExpr> address(act.size());
+  std::vector<AffineExpr> address(act.size()), unresolved(act.size());
   SmallVector<Value> dataMask;
   std::vector<SmallVector<AffineExpr>> maskConds(act.size());
   std::vector<bool> maskNever(act.size(), false);
@@ -1416,8 +1416,8 @@ FailureOr<StoreSpace> Raiser::storeSpace(Write store, ArrayRef<int64_t> extraStr
     SmallVector<Interval> ranges;
     for (int64_t e : extentsOf[n])
       ranges.push_back({0, std::max<int64_t>(e - 1, 0)});
-    address[n] = simplify(resolveDigits(simplify(p->expr.replaceDimsAndSymbols(toDims, toSyms), rank, 0), ranges, {}),
-                          rank, 0);
+    unresolved[n] = simplify(p->expr.replaceDimsAndSymbols(toDims, toSyms), rank, 0);
+    address[n] = simplify(resolveDigits(unresolved[n], ranges, {}), rank, 0);
     if (store.getMask()) {
       SmallVector<AffineExpr> conds;
       bool never = false;
@@ -1437,40 +1437,50 @@ FailureOr<StoreSpace> Raiser::storeSpace(Write store, ArrayRef<int64_t> extraStr
   SmallVector<bool> isDigit(rank, false);
   SmallVector<AffineExpr> rest(act.size());
   SmallVector<int64_t> constant(act.size());
-  for (auto [n, ev] : llvm::enumerate(act)) {
-    SmallVector<AffineExpr> inner;
-    atoms(address[n], inner);
-    SmallVector<bool> seen(rank, false);
-    for (AffineExpr form : inner) {
-      auto lin = linearize(form, rank);
-      if (!lin)
-        return store.emitError("furiosa: a store address digit is not linear in one axis"), failure();
-      int axis = -1;
+  auto explain = [&]() -> const char * {
+    for (auto [n, ev] : llvm::enumerate(act)) {
+      SmallVector<AffineExpr> inner;
+      atoms(address[n], inner);
+      SmallVector<bool> seen(rank, false);
+      for (AffineExpr form : inner) {
+        auto lin = linearize(form, rank);
+        if (!lin)
+          return "a store address digit is not linear in one axis";
+        int axis = -1;
+        for (unsigned i = 0; i < rank; ++i)
+          if (lin->first[i]) {
+            if (axis >= 0 || lin->first[i] != 1)
+              return "a store address digit mixes axes or scales one";
+            axis = i;
+          }
+        if (axis < 0)
+          continue;
+        if (seen[axis] && digitOrigin[n][axis] != lin->second)
+          return "a store axis has inconsistent digit origins";
+        seen[axis] = true;
+        digitOrigin[n][axis] = lin->second;
+      }
+      if (n == 0)
+        isDigit = seen;
+      else if (seen != isDigit)
+        return "store addresses differ between program instances";
+      SmallVector<AffineExpr> sub;
       for (unsigned i = 0; i < rank; ++i)
-        if (lin->first[i]) {
-          if (axis >= 0 || lin->first[i] != 1)
-            return store.emitError("furiosa: a store address digit mixes axes or scales one"), failure();
-          axis = i;
-        }
-      if (axis < 0)
-        continue;
-      if (seen[axis] && digitOrigin[n][axis] != lin->second)
-        return store.emitError("furiosa: a store axis has inconsistent digit origins"), failure();
-      seen[axis] = true;
-      digitOrigin[n][axis] = lin->second;
+        sub.push_back(getAffineDimExpr(i, ctx) - (isDigit[i] ? digitOrigin[n][i] : 0));
+      auto [r, c] = splitConstant(simplify(address[n].replaceDims(sub), rank, 0));
+      if (n && r != rest[0])
+        return "store addresses differ between program instances";
+      rest[n] = r;
+      constant[n] = c;
     }
-    if (n == 0)
-      isDigit = seen;
-    else if (seen != isDigit)
-      return store.emitError("furiosa: store addresses differ between program instances"), failure();
-    SmallVector<AffineExpr> sub;
-    for (unsigned i = 0; i < rank; ++i)
-      sub.push_back(getAffineDimExpr(i, ctx) - (isDigit[i] ? digitOrigin[n][i] : 0));
-    auto [r, c] = splitConstant(simplify(address[n].replaceDims(sub), rank, 0));
-    if (n && r != rest[0])
-      return store.emitError("furiosa: store addresses differ between program instances"), failure();
-    rest[n] = r;
-    constant[n] = c;
+    return nullptr;
+  };
+  // A tile that crosses a divisor in some instances only (a 64-row block of 196 patch rows per image)
+  // keeps digits there that the other instances' ranges resolve: then every instance keeps them all.
+  if (const char *why = explain()) {
+    address = unresolved;
+    if (explain())
+      return store.emitError("furiosa: ") << why, failure();
   }
   SmallVector<Component> terms;
   if (!components(rest[0], 1, terms))
@@ -1560,23 +1570,29 @@ FailureOr<StoreSpace> Raiser::storeSpace(Write store, ArrayRef<int64_t> extraStr
     for (unsigned j = 0; j < nd; ++j)
       if (!used[j])
         sp.freeDims.push_back(j);
-    // Linear axes and free dims take their origins from the constant; digits carry their own.
+    // Linear axes and free dims take their origins from the constant; digits carry their own. The
+    // constant's share on a digit's view dim shifts the dim by instance 0's share in every instance
+    // (digits stored past a leading row, a class token's); the rest moves the instance's digit origin
+    // (simplification folds (12 + i) floordiv 6 into 2 + i floordiv 6).
     bool ok = true;
+    SmallVector<int64_t> shift;
     for (auto [n, ev] : llvm::enumerate(act)) {
       SmallVector<int64_t> viewOrigin(nd, 0);
       int64_t c = constant[n];
       for (unsigned j = 0; j < nd; ++j) {
-        bool digitDim = llvm::any_of(llvm::enumerate(comps), [&](auto kc) { return dimOf[kc.index()] == (int)j && kc.value().digit; });
-        if (digitDim)
-          continue;
         viewOrigin[j] = floorDiv(c, st[j]);
         c -= viewOrigin[j] * st[j];
       }
+      if (n == 0)
+        shift = viewOrigin;
       ok &= (c == 0);
       SmallVector<int64_t> origin(rank, 0);
+      for (auto [k, cmp] : llvm::enumerate(comps))
+        if (cmp.digit)
+          origin[cmp.axis] += (viewOrigin[dimOf[k]] - shift[dimOf[k]]) * cmp.a;
       for (unsigned i = 0; i < rank; ++i) {
         if (isDigit[i])
-          origin[i] = digitOrigin[n][i];
+          origin[i] += digitOrigin[n][i];
         else
           for (auto [k, cmp] : llvm::enumerate(comps))
             if (cmp.axis == (int)i && !cmp.digit)
@@ -1593,6 +1609,9 @@ FailureOr<StoreSpace> Raiser::storeSpace(Write store, ArrayRef<int64_t> extraStr
       why = "store origins do not fit the view";
       return std::nullopt;
     }
+    for (auto [k, cmp] : llvm::enumerate(comps))
+      if (cmp.digit)
+        sp.global[cmp.axis] = sp.global[cmp.axis] - shift[dimOf[k]] * cmp.a;
 
     // Enumerate every point: it must land where the view says, once.
     std::vector<uint8_t> covered(numel, 0);
