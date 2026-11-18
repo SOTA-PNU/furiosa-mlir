@@ -402,13 +402,12 @@ class RunGraph:
         )
 
     def analyze(self, symbol: str, launch: dict, graph: dict):
-        """A kernel's pointer arguments: those its steps read before writing fresh (with whether one is updated
-        in place), those they write fresh, and their dtypes and sizes (from a launch: every launch of a kernel
-        binds buffers of one shape)."""
+        """A kernel's pointer arguments: those its steps read before writing fresh, those they write fresh,
+        and their dtypes and sizes (from a launch: every launch of a kernel binds buffers of one shape)."""
         if symbol in self.kernel_args:
             return
         plan = self.plans[symbol]
-        reads, writes, mutable = [], [], set()
+        reads, writes = [], []
 
         def flat(steps: list) -> list:
             return [s for step in steps for s in (flat(step["loop"]["steps"]) if "loop" in step else [step])]
@@ -416,12 +415,10 @@ class RunGraph:
         for step in flat(plan["steps"]):
             sig = self.signatures[step["module"]]
             where = lambda arg: {"buffer": arg} if step["args"] is None else step["args"][arg]  # noqa: E731
-            for p, arg in enumerate(sig["inputs"]):
+            for arg in sig["inputs"]:
                 a = where(arg).get("buffer")
                 if a is not None and a not in writes and a not in reads:
                     reads.append(a)
-                if a is not None and p in sig.get("inouts", []):
-                    mutable.add(a)
             for arg in sig["outputs"]:
                 a = where(arg).get("buffer")
                 if a is not None and a not in writes:
@@ -433,7 +430,7 @@ class RunGraph:
             if d not in RUST_DTYPES:
                 raise CrateError(f"buffer {buffer}: dtype {d} has no furiosa-opt host type")
             dtypes[a], elements[a] = RUST_DTYPES[d], math.prod(graph["buffers"][buffer]["shape"])
-        self.kernel_args[symbol] = {"reads": reads, "writes": writes, "mutable": mutable, "dtypes": dtypes,
+        self.kernel_args[symbol] = {"reads": reads, "writes": writes, "dtypes": dtypes,
                                     "elements": elements}
 
     def graph_fn(self, g: int, graph: dict) -> str:
@@ -475,9 +472,8 @@ class RunGraph:
             for a in info["reads"]:
                 name = variable(launch["args"][a])
                 if name not in defined:
-                    # Only a buffer the kernel updates in place may start as zeros; a read one must exist.
-                    if a not in info["mutable"]:
-                        raise CrateError(f"graph {g} launch {i}: {name} is read before anything writes it")
+                    # A buffer nothing wrote yet holds zeros, as golden and L1 start every buffer that is not an
+                    # input (an atomic accumulates into an output).
                     axis = f"Z{info['elements'][a]}"
                     if (axis, info["elements"][a]) not in self.axes:
                         self.axes.append((axis, info["elements"][a]))
