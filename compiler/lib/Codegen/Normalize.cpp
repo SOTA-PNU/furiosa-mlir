@@ -770,8 +770,8 @@ std::pair<int64_t, int64_t> span(const std::pair<int64_t, std::map<unsigned, int
   return {lo, hi};
 }
 
-/// `e` with each mod and floordiv by a constant whose linear dividend stays within one period over the loop
-/// ranges replaced by the linear expression it equals there.
+/// `e` with each mod and floordiv by a constant k of a linear dividend resolved where the loop ranges decide it:
+/// the terms k divides go to the quotient whole, and the rest must stay within one period, [m k, (m + 1) k).
 AffineExpr withinRanges(AffineExpr e, ArrayRef<int64_t> ranges) {
   auto bin = dyn_cast<AffineBinaryOpExpr>(e);
   if (!bin)
@@ -781,10 +781,21 @@ AffineExpr withinRanges(AffineExpr e, ArrayRef<int64_t> ranges) {
   auto lin = linearForm(l);
   if ((e.getKind() == AffineExprKind::Mod || e.getKind() == AffineExprKind::FloorDiv) && c && c.getValue() > 0 &&
       succeeded(lin)) {
-    auto [lo, hi] = span(*lin, ranges);
-    int64_t q = llvm::divideFloorSigned(lo, c.getValue());
-    if (q == llvm::divideFloorSigned(hi, c.getValue()))
-      return e.getKind() == AffineExprKind::Mod ? l - q * c.getValue() : getAffineConstantExpr(q, e.getContext());
+    int64_t k = c.getValue();
+    AffineExpr q = getAffineConstantExpr(0, e.getContext()), rest = getAffineConstantExpr(lin->first, e.getContext());
+    std::pair<int64_t, std::map<unsigned, int64_t>> restForm{lin->first, {}};
+    for (auto [d, coef] : lin->second) {
+      if (coef % k == 0) {
+        q = q + getAffineDimExpr(d, e.getContext()) * (coef / k);
+        continue;
+      }
+      rest = rest + getAffineDimExpr(d, e.getContext()) * coef;
+      restForm.second[d] = coef;
+    }
+    auto [lo, hi] = span(restForm, ranges);
+    int64_t m = llvm::divideFloorSigned(lo, k);
+    if (m == llvm::divideFloorSigned(hi, k))
+      return e.getKind() == AffineExprKind::Mod ? rest - m * k : q + m;
   }
   return getAffineBinaryOpExpr(e.getKind(), l, r);
 }
@@ -1210,6 +1221,114 @@ linalg::GenericOp initsToInputs(linalg::GenericOp g) {
   BlockArgument out = body.getArgument(body.getNumArguments() - 1);
   out.replaceAllUsesWith(body.insertArgument(out.getArgNumber(), t.getElementType(), g.getLoc()));
   g.getResult(0).replaceAllUsesWith(fresh.getResult(0));
+  g.erase();
+  return fresh;
+}
+
+/// A loop that reads take apart with floordiv or mod (a row index read as the bits of tl.sort's [2, ..., 2]
+/// stages) splits into those digits when every read is linear afterwards (delinearizeRead then projects it): the
+/// places are k / c for each floordiv or mod by k of a dividend holding the loop at coefficient c, nesting and
+/// dividing its extent. Outputs spanning the loop are reshaped by its digits.
+linalg::GenericOp splitLoopDigits(linalg::GenericOp g) {
+  MLIRContext *ctx = g.getContext();
+  SmallVector<int64_t> ranges = g.getStaticLoopRanges();
+  if (ShapedType::isDynamicShape(ranges))
+    return g;
+  std::map<unsigned, SmallVector<int64_t>> places;
+  for (OpOperand *in : g.getDpsInputOperands())
+    for (AffineExpr e : g.getMatchingIndexingMap(in).getResults())
+      e.walk([&](AffineExpr x) {
+        auto bin = dyn_cast<AffineBinaryOpExpr>(x);
+        auto k = bin ? dyn_cast<AffineConstantExpr>(bin.getRHS()) : AffineConstantExpr();
+        if (!k || (x.getKind() != AffineExprKind::FloorDiv && x.getKind() != AffineExprKind::Mod))
+          return;
+        auto lin = linearForm(bin.getLHS());
+        for (auto [d, c] : succeeded(lin) ? lin->second : std::map<unsigned, int64_t>{})
+          if (c > 0 && k.getValue() % c == 0 && k.getValue() / c > 1 && ranges[d] % (k.getValue() / c) == 0 &&
+              k.getValue() / c < ranges[d] && !llvm::is_contained(places[d], k.getValue() / c))
+            places[d].push_back(k.getValue() / c);
+      });
+  // The new loops: each loop's digits in its place, outermost first, and its value over them.
+  SmallVector<AffineExpr> value;
+  SmallVector<SmallVector<unsigned>> digits;
+  SmallVector<int64_t> newRanges;
+  SmallVector<utils::IteratorType> iters;
+  bool split = false;
+  for (auto [d, n] : llvm::enumerate(ranges)) {
+    SmallVector<int64_t> chain = places[d];
+    llvm::sort(chain);
+    for (unsigned i = 0; i + 1 < chain.size(); ++i)
+      if (chain[i + 1] % chain[i])
+        chain.clear();
+    split |= !chain.empty();
+    chain.insert(chain.begin(), 1);
+    chain.push_back(n);
+    value.push_back(getAffineConstantExpr(0, ctx));
+    digits.emplace_back();
+    for (int i = chain.size() - 2; i >= 0; --i) {
+      digits.back().push_back(newRanges.size());
+      value.back() = value.back() + getAffineDimExpr(newRanges.size(), ctx) * chain[i];
+      newRanges.push_back(chain[i + 1] / chain[i]);
+      iters.push_back(g.getIteratorTypesArray()[d]);
+    }
+  }
+  if (!split)
+    return g;
+  unsigned nd = newRanges.size();
+  SmallVector<AffineMap> maps;
+  for (OpOperand *in : g.getDpsInputOperands()) {
+    SmallVector<AffineExpr> exprs;
+    for (AffineExpr e : g.getMatchingIndexingMap(in).getResults()) {
+      AffineExpr r = withinRanges(simplifyAffineExpr(e.replaceDimsAndSymbols(value, {}), nd, 0), newRanges);
+      if (failed(linearForm(r)))
+        return g;
+      exprs.push_back(simplifyAffineExpr(r, nd, 0));
+    }
+    maps.push_back(AffineMap::get(nd, 0, exprs, ctx));
+  }
+  for (OpOperand &out : g.getDpsInitsMutable())
+    if (!g.getMatchingIndexingMap(&out).isProjectedPermutation())
+      return g;
+  OpBuilder b(g);
+  Location loc = g.getLoc();
+  SmallVector<Value> inits;
+  SmallVector<SmallVector<ReassociationIndices>> groups;
+  for (OpOperand &out : g.getDpsInitsMutable()) {
+    SmallVector<AffineExpr> exprs;
+    SmallVector<int64_t> shape;
+    groups.emplace_back();
+    for (AffineExpr r : g.getMatchingIndexingMap(&out).getResults()) {
+      groups.back().emplace_back();
+      for (unsigned k : digits[cast<AffineDimExpr>(r).getPosition()]) {
+        groups.back().back().push_back(shape.size());
+        exprs.push_back(getAffineDimExpr(k, ctx));
+        shape.push_back(newRanges[k]);
+      }
+    }
+    maps.push_back(AffineMap::get(nd, 0, exprs, ctx));
+    auto t = cast<RankedTensorType>(out.get().getType()).clone(shape);
+    inits.push_back(out.get().getDefiningOp<tensor::EmptyOp>()
+                        ? tensor::EmptyOp::create(b, loc, shape, t.getElementType()).getResult()
+                        : tensor::ExpandShapeOp::create(b, loc, t, out.get(), groups.back()).getResult());
+  }
+  auto fresh = linalg::GenericOp::create(b, loc, TypeRange(ValueRange(inits)), g.getDpsInputs(), inits, maps, iters);
+  fresh->setDiscardableAttrs(g->getDiscardableAttrDictionary());
+  fresh.getRegion().takeBody(g.getRegion());
+  for (auto index : llvm::to_vector(fresh.getRegion().front().getOps<linalg::IndexOp>())) {
+    OpBuilder ib(index);
+    Value v;
+    for (unsigned k : digits[index.getDim()]) {
+      Value i = linalg::IndexOp::create(ib, loc, k);
+      Value scaled = v ? arith::MulIOp::create(ib, loc, v, arith::ConstantIndexOp::create(ib, loc, newRanges[k])) : v;
+      v = v ? arith::AddIOp::create(ib, loc, scaled, i).getResult() : i;
+    }
+    index.replaceAllUsesWith(v);
+    index.erase();
+  }
+  for (auto [old, now, group] : llvm::zip(g.getResults(), fresh.getResults(), groups))
+    old.replaceAllUsesWith(old.getType() == now.getType()
+                               ? Value(now)
+                               : tensor::CollapseShapeOp::create(b, loc, old.getType(), now, group).getResult());
   g.erase();
   return fresh;
 }
@@ -1685,7 +1804,7 @@ void mlir::furiosa::normalizeKernels(ModuleOp module, function_ref<bool(linalg::
   SmallVector<linalg::GenericOp> generics;
   module.walk([&](linalg::GenericOp g) { generics.push_back(g); });
   for (linalg::GenericOp g : generics) {
-    g = initsToInputs(dropUnitReductions(promoteExtracts(g)));
+    g = splitLoopDigits(initsToInputs(dropUnitReductions(promoteExtracts(g))));
     for (unsigned i = 0; i < g.getNumDpsInputs(); ++i) {
       delinearizeRead(g, i);
       maskToPad(g, i);
