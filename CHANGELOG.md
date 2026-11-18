@@ -6,6 +6,11 @@ npu stage) against GPU goldens.
 
 ## 1.4.0 (unreleased, main)
 
+- Atomics every program applies to the same elements (add, max, min, and, or, xor) raise as one reduction over the
+  program ids, folded into the old value in program order (bit-identical to the rounds), instead of a round per
+  program recomputing its whole computation; a reduction that starts from a computed value no class maps reduces
+  from its identity and combines after. Held-out cross-entropy (45 programs adding into one mean) passes L0 to L4: its
+  crate went from 919 kernel modules (a 49-minute build) to 22 (f4a5660).
 - Float-to-int casts are exact: the engine's conversion rounds where `fptosi` truncates, so row-wise converts only values
   that are whole by construction (a clamped floor, a round) and truncates the rest first (`math.trunc` expands):
   held-out int8 quantization passes L0 to L4 (fa006c8).
