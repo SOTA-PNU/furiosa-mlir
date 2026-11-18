@@ -536,9 +536,9 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
                                           : "";
                              })
                              .Case<math::RoundOp>([](math::RoundOp r) { return r.getType().isF32() ? "round" : ""; })
-                             // An integral f32 (rounded) converts to its i32 exactly whichever way it rounds.
+                             // An integral f32 converts to its i32 exactly whichever way it rounds.
                              .Case<arith::FPToSIOp>([](arith::FPToSIOp c) {
-                               return c.getIn().getDefiningOp<math::RoundOp>() && c.getIn().getType().isF32() ? "ftoi" : "";
+                               return isIntegral(c.getIn()) && c.getIn().getType().isF32() ? "ftoi" : "";
                              })
                              .Case<arith::SIToFPOp>([](arith::SIToFPOp c) {
                                return c.getIn().getType().isInteger(32) && c.getType().isF32() ? "itof" : "";

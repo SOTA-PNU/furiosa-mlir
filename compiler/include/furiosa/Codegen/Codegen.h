@@ -64,6 +64,10 @@ void normalizeKernels(ModuleOp module, function_ref<bool(linalg::GenericOp)> map
 /// row of NaN alone reduces to -inf). Runs on every kernel, before any is mapped whole (lib/Codegen/Normalize.cpp).
 void guardNaNs(ModuleOp module);
 
+/// Whether float `v` holds an integer by construction: rounded, converted from an integer, an integral constant,
+/// or sums, products, negations, min/max and selects of such (lib/Codegen/Normalize.cpp).
+bool isIntegral(Value v);
+
 /// Takes contractions apart into the 2-D form op classes map: computed factors become producers, a non-zero
 /// start is added after, batch dims split into slices, dims collapse (lib/Codegen/Contract.cpp).
 /// `mapsAlone` says whether a batched contraction maps as a step of its own, so it need not be unbatched.

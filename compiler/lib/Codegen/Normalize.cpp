@@ -1875,9 +1875,11 @@ void splitElementGathers(ModuleOp module, function_ref<bool(linalg::GenericOp)> 
 /// Math ops the Vector Engine lacks, in ones it has: asin, acos, atan and atan2 by MLIR's polynomial
 /// approximations (whose fma and copysign expand below), copysign(a, b) = b < 0 ? -|a| : |a|, fma(a, b, c) =
 /// a*b + c (rounded twice), log2(x) = ln(x) * log2(e) (within the engine's ln ulp budget, not bit-exact), and
-/// floor/ceil from the nearest integer t (the engine converts to integers rounding to nearest): floor =
-/// t - (t > x), ceil = t + (t < x), exact for any integer t within 1 of x; values beyond 2^(mantissa bits) are
-/// integers already and pass through (the conversion would saturate). Unsigned i32 min and max compare signed with
+/// floor/ceil/trunc from the nearest integer t (the engine converts to integers rounding to nearest): floor =
+/// t - (t > x), ceil = t + (t < x), trunc = x < 0 ? ceil : floor, exact for any integer t within 1 of x; values
+/// beyond 2^(mantissa bits) are integers already and pass through (the conversion would saturate). fptosi
+/// truncates toward zero while the engine's conversion rounds, which agree on integers: a float->int cast of a
+/// value not known to be integral truncates it first. Unsigned i32 min and max compare signed with
 /// the sign bits flipped (which maps unsigned order onto signed order): minui(a, b) = minsi(a ^ s, b ^ s) ^ s. An
 /// i32 mului_extended (tl.umulhi) is the wrapping product and its high half from 16-bit limbs (the engine's
 /// integer multiply wraps). A widened i1 is a select: extui(c) = c ? 1 : 0, extsi(c) = c ? -1 : 0. A signed
@@ -1941,9 +1943,14 @@ void expandMath(ModuleOp module) {
     op.getLow().replaceAllUsesWith(mul(x, y));
     op.erase();
   });
+  module.walk([&](arith::FPToSIOp op) {
+    OpBuilder b(op);
+    if (!furiosa::isIntegral(op.getIn()))
+      op.getInMutable().assign(math::TruncOp::create(b, op.getLoc(), op.getIn()));
+  });
   SmallVector<Operation *> ops;
   module.walk([&](Operation *op) {
-    if (isa<math::FmaOp, math::Log2Op, math::FloorOp, math::CeilOp, math::CopySignOp>(op) &&
+    if (isa<math::FmaOp, math::Log2Op, math::FloorOp, math::CeilOp, math::TruncOp, math::CopySignOp>(op) &&
         isa<FloatType>(op->getResult(0).getType()))
       ops.push_back(op);
   });
@@ -1964,15 +1971,21 @@ void expandMath(ModuleOp module) {
     } else if (isa<math::Log2Op>(op)) {
       v = arith::MulFOp::create(b, loc, math::LogOp::create(b, loc, x), constant(1.4426950408889634));
     } else {
-      bool floor = isa<math::FloorOp>(op);
       using P = arith::CmpFPredicate;
       Value t = math::RoundOp::create(b, loc, x);
       // shortcut: the engine compares t with x through t - x, which flushes subnormals, so floor of a negative
       // subnormal gives -0 (not -1); compare the operands themselves if such inputs matter.
-      Value past = arith::CmpFOp::create(b, loc, floor ? P::OGT : P::OLT, t, x);
-      Value step = arith::SelectOp::create(b, loc, past, constant(1.0), constant(0.0));
-      Value near = floor ? arith::SubFOp::create(b, loc, t, step).getResult()
-                         : arith::AddFOp::create(b, loc, t, step).getResult();
+      auto toward = [&](bool floor) -> Value {
+        Value past = arith::CmpFOp::create(b, loc, floor ? P::OGT : P::OLT, t, x);
+        Value step = arith::SelectOp::create(b, loc, past, constant(1.0), constant(0.0));
+        return floor ? arith::SubFOp::create(b, loc, t, step).getResult()
+                     : arith::AddFOp::create(b, loc, t, step).getResult();
+      };
+      Value near = isa<math::TruncOp>(op)
+                       ? arith::SelectOp::create(b, loc, arith::CmpFOp::create(b, loc, P::OLT, x, constant(0.0)),
+                                                 toward(false), toward(true))
+                             .getResult()
+                       : toward(isa<math::FloorOp>(op));
       double integral = std::ldexp(1.0, int(APFloat::semanticsPrecision(ft.getFloatSemantics())) - 1);
       Value low = arith::CmpFOp::create(b, loc, P::OLT, x, constant(-integral));
       Value high = arith::CmpFOp::create(b, loc, P::OGT, x, constant(integral));
@@ -1984,6 +1997,45 @@ void expandMath(ModuleOp module) {
 }
 
 } // namespace
+
+bool mlir::furiosa::isIntegral(Value v) {
+  DenseMap<Value, bool> memo; // bodies are DAGs
+  std::function<bool(Value)> integral = [&](Value v) -> bool {
+    if (auto it = memo.find(v); it != memo.end())
+      return it->second;
+    memo[v] = false;
+    FloatAttr f;
+    Operation *op = v.getDefiningOp();
+    bool r = false;
+    if (matchPattern(v, m_Constant(&f)))
+      r = f.getValue().isInteger();
+    else if (isa_and_nonnull<math::RoundOp, math::RoundEvenOp, math::FloorOp, math::CeilOp, math::TruncOp,
+                             arith::SIToFPOp, arith::UIToFPOp>(op))
+      r = true;
+    // Sums, products and the rest of integers round to integers: an f32 beyond 2^24 is even.
+    else if (isa_and_nonnull<arith::AddFOp, arith::SubFOp, arith::MulFOp, arith::NegFOp, math::AbsFOp,
+                             arith::MaximumFOp, arith::MinimumFOp, arith::MaxNumFOp, arith::MinNumFOp>(op))
+      r = llvm::all_of(op->getOperands(), integral);
+    else if (auto sel = dyn_cast_or_null<arith::SelectOp>(op)) {
+      // An arm taken only where |x| >= 2^(mantissa bits) passes an integer (floor's expansion passes such x on).
+      auto beyond = [&](Value arm) {
+        auto c = sel.getCondition().getDefiningOp<arith::CmpFOp>();
+        APFloat k(0.0f);
+        auto ft = dyn_cast<FloatType>(arm.getType());
+        if (!c || !ft || c.getLhs() != arm || !matchPattern(c.getRhs(), m_ConstantFloat(&k)))
+          return false;
+        double bound = std::ldexp(1.0, int(APFloat::semanticsPrecision(ft.getFloatSemantics())) - 1);
+        double kd = k.convertToDouble();
+        using P = arith::CmpFPredicate;
+        P p = c.getPredicate();
+        return ((p == P::OGT || p == P::OGE) && kd >= bound) || ((p == P::OLT || p == P::OLE) && kd <= -bound);
+      };
+      r = (integral(sel.getTrueValue()) || beyond(sel.getTrueValue())) && integral(sel.getFalseValue());
+    }
+    return memo[v] = r;
+  };
+  return integral(v);
+}
 
 void mlir::furiosa::guardNaNs(ModuleOp module) {
   module.walk([&](Operation *op) {

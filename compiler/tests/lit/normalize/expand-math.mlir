@@ -1,9 +1,11 @@
-// RUN: furiosa-mlir-opt --furiosa-normalize-kernels %s | FileCheck %s --implicit-check-not=math.fma --implicit-check-not=math.log2 --implicit-check-not=math.floor --implicit-check-not=math.asin --implicit-check-not=math.acos --implicit-check-not=math.atan --implicit-check-not=math.copysign --implicit-check-not=arith.minui --implicit-check-not=arith.mului_extended
+// RUN: furiosa-mlir-opt --furiosa-normalize-kernels %s | FileCheck %s --implicit-check-not=math.fma --implicit-check-not=math.log2 --implicit-check-not=math.floor --implicit-check-not=math.trunc --implicit-check-not=math.asin --implicit-check-not=math.acos --implicit-check-not=math.atan --implicit-check-not=math.copysign --implicit-check-not=arith.minui --implicit-check-not=arith.mului_extended
 
 // Math ops the Vector Engine lacks become ones it has: fma(a, b, c) = a*b + c, log2(x) = ln(x) * log2(e), and
 // floor(x) = t - (t > x) from the nearest integer t, x itself beyond 2^23 (already an integer); asin, acos,
 // atan and atan2 by MLIR's polynomial approximations, copysign(a, b) = b < 0 ? -|a| : |a|; an unsigned min compares
 // signed with the sign bits flipped; tl.umulhi's high half comes from 16-bit limbs (four wrapping i32 products).
+// A float->int cast truncates toward zero while the engine's conversion rounds: a value not known to be integral
+// truncates first (x < 0 ? ceil : floor from the nearest integer); a clamped floor is integral and casts as it is.
 
 // CHECK-LABEL: func.func @fma_log2
 // CHECK: ^bb0(%[[A:.*]]: f32, %[[B:.*]]: f32, %[[C:.*]]: f32, %{{.*}}: f32):
@@ -34,6 +36,22 @@
 // CHECK-LABEL: func.func @mulhi
 // CHECK-COUNT-4: arith.muli
 // CHECK: arith.shrui
+// CHECK-LABEL: func.func @to_int
+// CHECK: ^bb0(%[[X:.*]]: f32, %{{.*}}: i32):
+// CHECK: %[[T:.*]] = math.round %[[X]] : f32
+// CHECK: %[[DOWN:.*]] = arith.subf %[[T]], %{{.*}} : f32
+// CHECK: %[[UP:.*]] = arith.addf %[[T]], %{{.*}} : f32
+// CHECK: %[[NEG:.*]] = arith.cmpf olt, %[[X]], %{{.*}} : f32
+// CHECK: %[[NEAR:.*]] = arith.select %[[NEG]], %[[UP]], %[[DOWN]] : f32
+// CHECK: arith.select %{{.*}}, %[[X]], %[[NEAR]] : f32
+// CHECK: %[[TR:.*]] = arith.select %{{.*}}, %[[X]], %{{.*}} : f32
+// CHECK: arith.fptosi %[[TR]] : f32 to i32
+// CHECK-LABEL: func.func @floor_to_int8
+// CHECK: math.round
+// CHECK-NOT: math.round
+// CHECK: %[[C:.*]] = arith.minimumf
+// CHECK-NOT: math.round
+// CHECK: arith.fptosi %[[C]] : f32 to i8
 #id = affine_map<(d0) -> (d0)>
 module {
   func.func @fma_log2(%a: tensor<64xf32>, %b: tensor<64xf32>, %c: tensor<64xf32>, %o: tensor<64xf32>) -> tensor<64xf32> attributes {furiosa.written = [3]} {
@@ -85,6 +103,30 @@ module {
     ^bb0(%x: i32, %y: i32, %out: i32):
       %l, %h = arith.mului_extended %x, %y : i32
       linalg.yield %h : i32
+    } -> tensor<64xi32>
+    return %r : tensor<64xi32>
+  }
+  func.func @to_int(%a: tensor<64xf32>, %o: tensor<64xi32>) -> tensor<64xi32> attributes {furiosa.written = [1]} {
+    %e = tensor.empty() : tensor<64xi32>
+    %r = linalg.generic {indexing_maps = [#id, #id], iterator_types = ["parallel"]} ins(%a : tensor<64xf32>) outs(%e : tensor<64xi32>) {
+    ^bb0(%x: f32, %out: i32):
+      %i = arith.fptosi %x : f32 to i32
+      linalg.yield %i : i32
+    } -> tensor<64xi32>
+    return %r : tensor<64xi32>
+  }
+  func.func @floor_to_int8(%a: tensor<64xf32>, %o: tensor<64xi32>) -> tensor<64xi32> attributes {furiosa.written = [1]} {
+    %lo = arith.constant -1.270000e+02 : f32
+    %hi = arith.constant 1.270000e+02 : f32
+    %e = tensor.empty() : tensor<64xi32>
+    %r = linalg.generic {indexing_maps = [#id, #id], iterator_types = ["parallel"]} ins(%a : tensor<64xf32>) outs(%e : tensor<64xi32>) {
+    ^bb0(%x: f32, %out: i32):
+      %f = math.floor %x : f32
+      %m = arith.maximumf %f, %lo : f32
+      %n = arith.minimumf %m, %hi : f32
+      %i = arith.fptosi %n : f32 to i8
+      %w = arith.extsi %i : i8 to i32
+      linalg.yield %w : i32
     } -> tensor<64xi32>
     return %r : tensor<64xi32>
   }
