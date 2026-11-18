@@ -6,6 +6,9 @@ npu stage) against GPU goldens.
 
 ## 1.4.0 (unreleased, main)
 
+- A data-dependent read inside a computation (x[r, t[r]] in a loss) becomes a gather step of its own that the computation
+  reads as an input; furiosa-opt's gather DMA takes power-of-two row counts, so other counts pad with row 0 (npu3
+  rejected 3, 5 or 12 rows): held-out cross-entropy maps (2bb23f5).
 - Raise: a reduction whose input is the combiner's identity past a masked prefix reduces over the prefix (no clamp left,
   the read promotes; the dot's live-K analysis shares it): held-out group norm passes L0 to L4 (d6133de).
 - Float scalar arguments stay fp32 values: the driver made every scalar a constexpr, so Triton folded float arguments in
