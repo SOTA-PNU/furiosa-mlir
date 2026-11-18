@@ -136,8 +136,9 @@ The compiler must handle Triton code it has never seen, so it may not recognise 
   corpus also exercises; a change that only a held-out case motivates does not count. The second batch
   (`heldout2_*`: ten standard ML ops written from their math after 1.3.0, without reading the compiler) passed L4
   at first try in 5 of 10 (layer norm and softmax backward, RoPE, a matmul epilogue at 96x80x200, a direct 3x3
-  conv); the rest found a `min` loop bound, a runtime integer division in an index, fp32 scalars folded in higher
-  precision, a per-row data gather, and an int8 quantizer no class maps.
+  conv); the rest found a `min` loop bound, tiles stepped by a masked prefix, fp32 scalars folded in higher precision,
+  a per-row data gather with per-program atomics, and float-to-int casts, all fixed by general mechanisms: at
+  1.4.0 all ten pass L4.
 
 ## Operator matrix (harness/ops)
 
@@ -172,7 +173,7 @@ copy through `HARNESS_TRITON=<snap>`.
 Each run writes `harness/out/ops/<stage>.{json,md}`: an operator x dtype table and the failures grouped
 by the compiler's diagnostic. At the raise stage (raised IR on the CPU JIT) 905 of the 907 cases pass at 1805f3e;
 the other two, int32 sort at 256 and 1024 lanes, exceeded the 900 s limit in codegen and take seconds since f6ad81a.
-The npu stage at 1.3.0 (238dde6): all 907 cases pass.
+The npu stage at 1.4.0 (cdc6a32): all 907 cases pass.
 
 ## Running
 

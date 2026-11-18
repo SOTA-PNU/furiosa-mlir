@@ -4,7 +4,11 @@ main carries the next version as `X.Y.Z.dev0`. A release is a `release/X.Y.Z` br
 with the commit "Release X.Y.Z" and the tag `vX.Y.Z`. "On npu3" means harness level L4 (or the operator matrix's
 npu stage) against GPU goldens.
 
-## 1.4.0 (unreleased, main)
+## 1.4.0 (2026-11-18, release/1.4.0)
+
+Milestone: kernels the compiler was not written for. The second held-out batch (ten standard ML ops written from their
+math without reading the compiler) passed L4 at first try in 5 of 10 with 1.3.0 and passes in all 10 now; all 35
+corpus and held-out cases pass L0 to L4 and all 907 operator matrix cases pass on npu3.
 
 - A reduction without a Vector Engine reduction (xor, and, or, a product) over a width that is not a power of two pads
   with the combiner's identity to one before its tree: xor_sum at 2x7x33, which d6133de's live-prefix reductions had
