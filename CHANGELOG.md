@@ -6,6 +6,9 @@ npu stage) against GPU goldens.
 
 ## 1.3.0 (unreleased, main)
 
+- The tiled path's comparison tags honor ordered and unordered predicates exactly (they took oge/ole/one as the
+  complements of olt/ogt/oeq, true on NaN; ord/uno did not map): all 14 cmpf predicates match torch on npu3 over NaN,
+  +-inf, +-0 and the bounds' neighbours (b56a07b).
 - maxnumf/minnumf of two computed operands are exact too: r = maximumf(clean x, clean y), then r > -inf ? r :
   (x == -inf ? x : y), so a NaN is skipped and only an all-NaN pair gives NaN. The tiled path's last arithmetic blend
   (a select whose branch tile exceeds the 8 KB VRF, a*s + b*(1-s), which made NaN rows of attention) is a bit-level
