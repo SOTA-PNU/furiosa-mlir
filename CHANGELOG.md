@@ -6,6 +6,11 @@ npu stage) against GPU goldens.
 
 ## 1.3.0 (unreleased, main)
 
+- maxnumf/minnumf of two computed operands are exact too: r = maximumf(clean x, clean y), then r > -inf ? r :
+  (x == -inf ? x : y), so a NaN is skipped and only an all-NaN pair gives NaN. The tiled path's last arithmetic blend
+  (a select whose branch tile exceeds the 8 KB VRF, a*s + b*(1-s), which made NaN rows of attention) is a bit-level
+  select b ^ ((a ^ b) & m). `extra.maximum_nan` exact on npu3; whole-graph run time unchanged (fused attention 0.55 s,
+  vgg16 3.02 vs 2.98 s), though Vector Engine passes grow (vgg16's maxpool 4 to 34) (2150081).
 - tl.sort and tl.topk compile to a verdict in seconds instead of timing out: the row-wise operand weight is memoized
   over the DAG (it recursed exponentially through sort's stages and hung the mapping oracle) (ae69985), and a split
   only the oracle asks for stands only when its pieces map (pieces split again down to one per element: sort at 1024
