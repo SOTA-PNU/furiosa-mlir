@@ -6,6 +6,11 @@ npu stage) against GPU goldens.
 
 ## 1.4.0 (unreleased, main)
 
+- Release binaries on GitHub: `scripts/package.sh` builds a wheel (`furiosa_mlir-<version>-cp312-cp312-linux_x86_64.whl`)
+  beside the tarball; neither bundles FuriosaAI's furiosa-opt tools (`install.sh` installs `cargo-furiosa-opt` 0.10.0
+  from crates.io with the crates' toolchain); both carry Triton's and LLVM's licenses and copy the targets of the
+  source tree's links (the earlier tarballs carried links that resolved only on the build host). The 1.3.0 release
+  has both attached, with checksums (c78db8f, b9ae73d).
 - A second held-out batch (`heldout2_*`, c08c3bc): ten standard ML ops (layer norm, rmsnorm and softmax backward, RoPE,
   cross-entropy, group norm, int8 quantization, AdamW, a matmul epilogue, a direct conv) written from their math
   without reading the compiler. First try at 1.3.0: 5 of 10 pass L4 on npu3. The harness groups `heldout*` cases
