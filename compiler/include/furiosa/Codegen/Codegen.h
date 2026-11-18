@@ -64,6 +64,14 @@ void normalizeKernels(ModuleOp module, function_ref<bool(linalg::GenericOp)> map
 /// row of NaN alone reduces to -inf). Runs on every kernel, before any is mapped whole (lib/Codegen/Normalize.cpp).
 void guardNaNs(ModuleOp module);
 
+/// A truncation to fp8 (e4m3fn, e5m2) rounds in f32 ops the Vector Engine has, as the GPU converts (nearest even,
+/// saturating to the largest finite value, NaN kept): m = min(|x|, largest), rounded at the unit of its last kept
+/// bit, (m + u) - u with u = max(2^exponent(m), least normal) * 2^(23 - mantissa bits), then x's sign. The value is
+/// then exact in fp8: an extension of it is the value itself, and the truncation that stays (a store to an fp8
+/// buffer) is exact, so mapping may drop it. Runs on every kernel, before any is mapped whole
+/// (lib/Codegen/Normalize.cpp).
+void roundToF8(ModuleOp module);
+
 /// Whether float `v` holds an integer by construction: rounded, converted from an integer, an integral constant,
 /// or sums, products, negations, min/max and selects of such (lib/Codegen/Normalize.cpp).
 bool isIntegral(Value v);

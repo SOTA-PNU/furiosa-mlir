@@ -2331,6 +2331,47 @@ void mlir::furiosa::relayoutFactorReads(ModuleOp module, function_ref<bool(linal
     relayoutReads(g, mapsAlone);
 }
 
+void mlir::furiosa::roundToF8(ModuleOp module) {
+  SmallVector<arith::TruncFOp> truncs;
+  module.walk([&](arith::TruncFOp op) {
+    if (isa<Float8E4M3FNType, Float8E5M2Type>(op.getType()) && op.getIn().getType().getIntOrFloatBitWidth() <= 32)
+      truncs.push_back(op);
+  });
+  for (arith::TruncFOp op : truncs) {
+    OpBuilder b(op);
+    Location loc = op.getLoc();
+    const llvm::fltSemantics &sem = cast<FloatType>(op.getType()).getFloatSemantics();
+    Type f32 = b.getF32Type(), i32 = b.getI32Type();
+    auto f = [&](double v) { return arith::ConstantOp::create(b, loc, b.getF32FloatAttr(v)).getResult(); };
+    auto i = [&](int32_t v) { return arith::ConstantOp::create(b, loc, b.getI32IntegerAttr(v)).getResult(); };
+    auto bits = [&](Value v) { return arith::BitcastOp::create(b, loc, i32, v).getResult(); };
+    auto flt = [&](Value v) { return arith::BitcastOp::create(b, loc, f32, v).getResult(); };
+    auto mask = [&](Value v, int32_t m) { return arith::AndIOp::create(b, loc, v, i(m)).getResult(); };
+    Value x = op.getIn();
+    if (x.getType() != f32)
+      x = arith::ExtFOp::create(b, loc, f32, x);
+    Value xb = bits(x);
+    Value m = arith::MinimumFOp::create(b, loc, flt(mask(xb, 0x7FFFFFFF)), f(APFloat::getLargest(sem).convertToDouble()));
+    Value e = arith::MaximumFOp::create(b, loc, flt(mask(bits(m), 0x7F800000)),
+                                        f(APFloat::getSmallestNormalized(sem).convertToDouble()));
+    Value unit = arith::MulFOp::create(b, loc, e, f(std::ldexp(1.0, 24 - int(APFloat::semanticsPrecision(sem)))));
+    Value r = arith::SubFOp::create(b, loc, arith::AddFOp::create(b, loc, m, unit), unit);
+    Value v = flt(arith::OrIOp::create(b, loc, bits(r), mask(xb, int32_t(0x80000000u))));
+    for (OpOperand &use : llvm::make_early_inc_range(op->getUses())) {
+      auto ext = dyn_cast<arith::ExtFOp>(use.getOwner());
+      if (!ext || ext.getType().getIntOrFloatBitWidth() > 32)
+        continue;
+      OpBuilder at(ext);
+      ext.replaceAllUsesWith(ext.getType() == f32 ? v : arith::TruncFOp::create(at, ext.getLoc(), ext.getType(), v));
+      ext.erase();
+    }
+    if (op->use_empty())
+      op.erase();
+    else
+      op.getInMutable().assign(v);
+  }
+}
+
 void mlir::furiosa::normalizeKernels(ModuleOp module, function_ref<bool(linalg::GenericOp)> mapsAlone) {
   expandMath(module);
   splitGuardedReductions(module, mapsAlone);

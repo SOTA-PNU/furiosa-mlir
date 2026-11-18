@@ -114,7 +114,8 @@ SmallVector<int64_t> writtenArgs(func::FuncOp func) {
 
 /// fp16 and fp8 buffers live as f32 on the device (furiosa-opt has no f16, every f16 and fp8 is exact in f32, and
 /// an fp8 is exact in the bf16 a contraction casts f32 to; both convert at the graph boundary): the kernel's f16 and
-/// fp8 tensors and scalars become f32, and the conversions between them vanish.
+/// fp8 tensors and scalars become f32, and the conversions between them vanish (a truncation to fp8 arrives exact:
+/// roundToF8 rounded its operand before any kernel was mapped).
 void widenF16(func::FuncOp func) {
   Type f32 = Float32Type::get(func.getContext());
   auto narrow = [](Type t) { return t.isF16() || isa<Float8E4M3FNType, Float8E5M2Type>(t); };

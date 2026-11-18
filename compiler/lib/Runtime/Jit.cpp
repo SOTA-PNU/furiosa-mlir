@@ -99,6 +99,40 @@ struct ExtFromF8E4M3FN : OpRewritePattern<arith::ExtFOp> {
   }
 };
 
+/// arith.truncf to f8E4M3FN, encoded into its bits as the GPU converts (nearest even, saturating to 448, NaN kept):
+/// m = min(|x|, 448) rounds at its exponent's unit 2^(max(e, -6) - 3) as (m + u) - u, u = 2^(max(e, -6) + 20) in
+/// f32; then the bits are E.MMM from 2^-6 up (E = e + 7, the f32's exponent - 120), M * 2^-9 below, S.1111.111 NaN.
+struct TruncToF8E4M3FN : OpRewritePattern<arith::TruncFOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(arith::TruncFOp op, PatternRewriter &rw) const override {
+    if (!isa<Float8E4M3FNType>(op.getType()) || op.getIn().getType().getIntOrFloatBitWidth() > 32)
+      return failure();
+    Location loc = op.getLoc();
+    Type i32 = rw.getI32Type(), f32 = rw.getF32Type();
+    auto c = [&](int64_t v) -> Value { return arith::ConstantIntOp::create(rw, loc, i32, v); };
+    auto f = [&](float v) -> Value { return arith::ConstantFloatOp::create(rw, loc, cast<FloatType>(f32), APFloat(v)); };
+    auto bits = [&](Value v) -> Value { return arith::BitcastOp::create(rw, loc, i32, v); };
+    auto flt = [&](Value v) -> Value { return arith::BitcastOp::create(rw, loc, f32, v); };
+    Value x = op.getIn();
+    if (x.getType() != f32)
+      x = arith::ExtFOp::create(rw, loc, f32, x);
+    Value m = arith::MinimumFOp::create(rw, loc, flt(arith::AndIOp::create(rw, loc, bits(x), c(0x7fffffff))), f(448.0f));
+    Value e = arith::MaximumFOp::create(rw, loc, flt(arith::AndIOp::create(rw, loc, bits(m), c(0x7f800000))), f(0x1p-6f));
+    Value u = arith::MulFOp::create(rw, loc, e, f(0x1p20f));
+    Value r = arith::SubFOp::create(rw, loc, arith::AddFOp::create(rw, loc, m, u), u);
+    Value rb = bits(r);
+    Value normal = arith::SubIOp::create(rw, loc, arith::ShRUIOp::create(rw, loc, rb, c(20)), c(120 << 3));
+    Value sub = arith::FPToUIOp::create(rw, loc, i32, arith::MulFOp::create(rw, loc, r, f(0x1p9f)));
+    using P = arith::CmpIPredicate;
+    Value code = arith::SelectOp::create(rw, loc, arith::CmpIOp::create(rw, loc, P::uge, rb, c(0x3c800000)), normal, sub);
+    code = arith::SelectOp::create(rw, loc, arith::CmpIOp::create(rw, loc, P::ugt, rb, c(0x7f800000)), c(127), code);
+    Value sign = arith::AndIOp::create(rw, loc, arith::ShRUIOp::create(rw, loc, bits(x), c(24)), c(0x80));
+    Value byte = arith::TruncIOp::create(rw, loc, rw.getI8Type(), arith::OrIOp::create(rw, loc, code, sign));
+    rw.replaceOpWithNewOp<arith::BitcastOp>(op, op.getType(), byte);
+    return success();
+  }
+};
+
 constexpr const char *kPipeline =
     "one-shot-bufferize{bufferize-function-boundaries function-boundary-type-conversion=identity-layout-map "
     "allow-return-allocs-from-loops},"
@@ -236,7 +270,7 @@ std::unique_ptr<JitModule> JitModule::compile(llvm::StringRef text, std::string 
   }
 
   RewritePatternSet f8(&ctx);
-  f8.add<ExtFromF8E4M3FN>(&ctx);
+  f8.add<ExtFromF8E4M3FN, TruncToF8E4M3FN>(&ctx);
   (void)applyPatternsGreedily(*module, std::move(f8));
   PassManager pm(&ctx);
   if (failed(parsePassPipeline(kPipeline, pm, diagnostics)) || failed(pm.run(*module))) {

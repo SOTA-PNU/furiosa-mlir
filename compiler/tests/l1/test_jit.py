@@ -112,6 +112,17 @@ module {
     } -> tensor<2x4xf16>
     return %r : tensor<2x4xf16>
   }
+  // A round trip through fp8 e4m3 (tl.float8e4nv): truncf encodes, extf decodes.
+  func.func public @fp8(%x: tensor<65544xf32>, %out: tensor<65544xf32>) -> tensor<65544xf32> {
+    %r = linalg.generic {indexing_maps = [#id1, #id1], iterator_types = ["parallel"]}
+        ins(%x : tensor<65544xf32>) outs(%out : tensor<65544xf32>) {
+    ^bb0(%a: f32, %o: f32):
+      %q = arith.truncf %a : f32 to f8E4M3FN
+      %w = arith.extf %q : f8E4M3FN to f32
+      linalg.yield %w : f32
+    } -> tensor<65544xf32>
+    return %r : tensor<65544xf32>
+  }
 }
 """
 
@@ -294,6 +305,15 @@ def main():
     tensors.call(engine.lookup("ints"), [ids, np.zeros_like(out), out])
     assert np.array_equal(out, ((ids * 3) % 7).reshape(2, 4).astype(np.float16)), "ints"
     print("i32 muli/remsi, expand_shape, sitofp to f16: exact")
+
+    # Every bf16, then infinities, overflow and NaN: nearest even, saturating to +-448 as the GPU converts.
+    xs = np.concatenate([np.arange(1 << 16, dtype=np.uint16).view(BF16).astype(np.float32),
+                         np.float32([np.inf, -np.inf, 463.9, 464.0, -1e30, 0.01171875, 0.009765625, np.nan])])
+    out = np.empty_like(xs)
+    tensors.call(engine.lookup("fp8"), [xs, np.zeros_like(out), out])
+    want = np.clip(np.nan_to_num(xs, nan=np.nan, posinf=448, neginf=-448), -448, 448).astype(ml_dtypes.float8_e4m3fn)
+    assert np.array_equal(out, want.astype(np.float32), equal_nan=True), "fp8"
+    print("f32 -> f8E4M3FN -> f32 (every bf16, saturating): exact")
 
     x, y = rng.standard_normal(16).astype(np.float32), np.empty(16, np.float32)
     path = "/tmp/claude-2006/-home-chacha-git-furiosa-mlir/d735c3dd-63aa-4a2f-bd7a-bbb5a499ef73/scratchpad/roundtrip.safetensors"
