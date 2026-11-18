@@ -147,7 +147,7 @@ wheels = [
 
 [[package]]
 name = "furiosa-mlir"
-version = "1.4.0.dev0"
+version = "1.4.0"
 source = { virtual = "." }
 dependencies = [
     { name = "triton" },
