@@ -1538,6 +1538,50 @@ void relayoutReads(linalg::GenericOp g, function_ref<bool(linalg::GenericOp)> ma
   g.setIndexingMapsAttr(b.getAffineMapArrayAttr(maps));
 }
 
+/// Runs of consecutive loops of one iterator type that every operand reads together and in order become one loop
+/// each (upstream collapseOpIterationDims), in a generic no class maps as it is: tl.sort's stages iterate twelve loops
+/// of extent 2, ten of which only move as one, and the op classes take few, long dims (the row-wise class splits its
+/// outermost row dim over the 256 slices).
+linalg::GenericOp collapseLoopRuns(linalg::GenericOp g, function_ref<bool(linalg::GenericOp)> mapsAlone) {
+  SmallVector<AffineMap> maps = g.getIndexingMapsArray();
+  auto iters = g.getIteratorTypesArray();
+  if (!mapsAlone || !llvm::all_of(maps, [](AffineMap m) { return m.isProjectedPermutation(); }))
+    return g;
+  SmallVector<ReassociationIndices> runs;
+  for (int64_t d = 0; d < g.getNumLoops();) {
+    ReassociationIndices run{d};
+    for (int64_t e = d + 1; e < g.getNumLoops() && iters[e] == iters[d]; ++e) {
+      run.push_back(e);
+      if (!linalg::areDimSequencesPreserved(maps, run)) {
+        run.pop_back();
+        break;
+      }
+    }
+    d += run.size();
+    if (run.size() > 1)
+      runs.push_back(run);
+  }
+  if (runs.empty() || mapsAlone(g))
+    return g;
+  // Kept only when the collapsed generic maps (copies and gathers are their own classes' as they are); the collapse
+  // takes the body of a copy.
+  Operation *before = g->getPrevNode();
+  auto copy = cast<linalg::GenericOp>(OpBuilder(g).clone(*g));
+  IRRewriter rewriter(copy);
+  FailureOr<linalg::CollapseResult> collapsed = linalg::collapseOpIterationDims(copy, runs, rewriter);
+  auto fresh = succeeded(collapsed) ? dyn_cast<linalg::GenericOp>(collapsed->collapsedOp.getOperation())
+                                    : linalg::GenericOp();
+  if (fresh && mapsAlone(fresh)) {
+    g->replaceAllUsesWith(collapsed->results);
+    g->erase();
+    copy->erase();
+    return fresh;
+  }
+  while (g->getPrevNode() != before)
+    g->getPrevNode()->erase();
+  return g;
+}
+
 /// A select keyed by an index-only condition between computed values, in a generic no class maps as it is, becomes
 /// the bitwise blend b ^ ((a ^ b) & m) under the index-only mask m = c ? ~0 : 0 (a table once hoisted, exact for any
 /// bits): the row-wise class selects by a streamed key and computes nothing along the columns alone, as tl.sort's
@@ -2025,6 +2069,7 @@ void mlir::furiosa::normalizeKernels(ModuleOp module, function_ref<bool(linalg::
   for (linalg::GenericOp g : generics) {
     relayoutReads(g, mapsAlone);
     blendIndexSelects(g, mapsAlone);
+    g = collapseLoopRuns(g, mapsAlone);
     broadcastStreams(g, mapsAlone);
   }
   // The slices and carriers the reads no longer use.
