@@ -1552,7 +1552,18 @@ FailureOr<StoreSpace> Raiser::storeSpace(Write store, ArrayRef<int64_t> extraStr
     SmallVector<bool> used(nd, false);
     sp.step.assign(rank, 1);
     sp.global.assign(rank, AffineExpr());
+    // A term stepped along a view dim by no more than the extent of a term that moves along that dim alone (a
+    // loop over column tiles: cols = c0 + arange) shares the dim with it: the two axes are the dim's digits
+    // under the step, tile then lane.
+    SmallVector<int> lanes(comps.size(), -1);
+    for (auto [k, c] : llvm::enumerate(comps))
+      for (auto [l, d] : llvm::enumerate(comps))
+        if (stepped[k] && !stepped[l] && !d.digit && dimOf[l] == dimOf[k] && span[l] == 1 &&
+            d.stride == st[dimOf[k]] && shape[d.axis] <= c.stride / st[dimOf[k]])
+          lanes[k] = l;
     for (auto [k, c] : llvm::enumerate(comps)) {
+      if (llvm::is_contained(lanes, (int)k))
+        continue; // global set with its tile's
       if (stepped[k])
         sp.step[c.axis] = c.stride / st[dimOf[k]];
       AffineExpr term = getAffineConstantExpr(0, ctx);
@@ -1564,6 +1575,11 @@ FailureOr<StoreSpace> Raiser::storeSpace(Write store, ArrayRef<int64_t> extraStr
         }
         used[j] = true;
         term = term + getAffineDimExpr(j, ctx) * (c.a * (st[j] / st[dimOf[k]]));
+      }
+      if (lanes[k] >= 0) {
+        sp.global[comps[lanes[k]].axis] = term % sp.step[c.axis];
+        term = term.floorDiv(sp.step[c.axis]);
+        sp.step[c.axis] = 1;
       }
       sp.global[c.axis] = sp.global[c.axis] ? sp.global[c.axis] + term : term;
     }
@@ -1710,70 +1726,87 @@ FailureOr<StoreSpace> Raiser::storeSpace(Write store, ArrayRef<int64_t> extraStr
     return sp;
   };
 
-  for (int attempt = 0; attempt < 4; ++attempt) {
-    std::set<int64_t, std::greater<int64_t>> strides{1};
-    for (auto [k, c] : llvm::enumerate(comps))
-      if (!stepped[k])
-        strides.insert(c.stride);
-    if (attempt == 0 || attempt == 2) {
-      strides.insert(bufStrides.begin(), bufStrides.end());
-      strides.insert(extraStrides.begin(), extraStrides.end());
+  // Failing every view, a term whose stride is no buffer dim's (a loop over column tiles of a row the tile does not
+  // divide) steps along the dim of the largest stride dividing it instead, as one whose stride does not divide the
+  // buffer.
+  std::string first;
+  for (int round = 0; round < 2; ++round) {
+    if (round) {
+      first = why;
+      bool more = false;
+      for (auto [k, c] : llvm::enumerate(comps))
+        if (!c.digit && !stepped[k] && !llvm::is_contained(bufStrides, c.stride))
+          stepped[k] = more = true;
+      if (!more)
+        break;
+      probeStrides.clear();
+      probeOrigins.clear();
     }
-    if (attempt >= 2) {
-      size_t before = strides.size();
-      for (unsigned j = 0; j < probeStrides.size() && !probeOrigins.empty(); ++j) {
-        int64_t step = 0;
-        for (auto &o : probeOrigins)
-          step = std::gcd(step, std::abs(o[j] - probeOrigins[0][j]));
-        if (step > 1)
-          strides.insert(probeStrides[j] * step);
+    for (int attempt = 0; attempt < 4; ++attempt) {
+      std::set<int64_t, std::greater<int64_t>> strides{1};
+      for (auto [k, c] : llvm::enumerate(comps))
+        if (!stepped[k])
+          strides.insert(c.stride);
+      if (attempt == 0 || attempt == 2) {
+        strides.insert(bufStrides.begin(), bufStrides.end());
+        strides.insert(extraStrides.begin(), extraStrides.end());
       }
-      if (strides.size() == before)
-        break;
-    }
-    SmallVector<int64_t> st(strides.begin(), strides.end());
-    bool nests = numel % st[0] == 0;
-    for (unsigned j = 1; j < st.size(); ++j)
-      nests &= st[j - 1] % st[j] == 0;
-    if (!nests)
-      continue;
-    SmallVector<int> dimOf;
-    for (auto [k, c] : llvm::enumerate(comps)) {
-      if (stepped[k])
-        dimOf.push_back(llvm::find_if(st, [&](int64_t v) { return v < c.stride && c.stride % v == 0; }) - st.begin());
-      else
-        dimOf.push_back(llvm::find(st, c.stride) - st.begin());
-    }
-    // Widen the linear term of an axis whose tiles cross a view dim boundary over the dim above it,
-    // while no other term moves along that dim.
-    SmallVector<unsigned> span(comps.size(), 1);
-    for (;;) {
-      int crossed = -1;
+      if (attempt >= 2) {
+        size_t before = strides.size();
+        for (unsigned j = 0; j < probeStrides.size() && !probeOrigins.empty(); ++j) {
+          int64_t step = 0;
+          for (auto &o : probeOrigins)
+            step = std::gcd(step, std::abs(o[j] - probeOrigins[0][j]));
+          if (step > 1)
+            strides.insert(probeStrides[j] * step);
+        }
+        if (strides.size() == before)
+          break;
+      }
+      SmallVector<int64_t> st(strides.begin(), strides.end());
+      bool nests = numel % st[0] == 0;
+      for (unsigned j = 1; j < st.size(); ++j)
+        nests &= st[j - 1] % st[j] == 0;
+      if (!nests)
+        continue;
+      SmallVector<int> dimOf;
+      for (auto [k, c] : llvm::enumerate(comps)) {
+        if (stepped[k])
+          dimOf.push_back(llvm::find_if(st, [&](int64_t v) { return v < c.stride && c.stride % v == 0; }) - st.begin());
+        else
+          dimOf.push_back(llvm::find(st, c.stride) - st.begin());
+      }
+      // Widen the linear term of an axis whose tiles cross a view dim boundary over the dim above it,
+      // while no other term moves along that dim.
+      SmallVector<unsigned> span(comps.size(), 1);
+      for (;;) {
+        int crossed = -1;
+        if (attempt == 1)
+          probeOrigins.clear();
+        auto sp = tryView(st, dimOf, span, crossed, attempt == 1 ? &probeOrigins : nullptr);
+        if (sp)
+          return *sp;
+        if (why == "two stores of the grid write the same element" || why == "the store never writes")
+          return store.emitError("furiosa: ") << why, failure();
+        int widen = -1;
+        for (auto [k, c] : llvm::enumerate(comps))
+          if (crossed >= 0 && c.axis == crossed && !c.digit && !stepped[k])
+            widen = k;
+        if (widen < 0 || dimOf[widen] < (int)span[widen])
+          break;
+        int above = dimOf[widen] - span[widen];
+        bool taken = false;
+        for (auto [k, c] : llvm::enumerate(comps))
+          taken |= above <= dimOf[k] && above > dimOf[k] - (int)span[k];
+        if (taken)
+          break;
+        ++span[widen];
+      }
       if (attempt == 1)
-        probeOrigins.clear();
-      auto sp = tryView(st, dimOf, span, crossed, attempt == 1 ? &probeOrigins : nullptr);
-      if (sp)
-        return *sp;
-      if (why == "two stores of the grid write the same element" || why == "the store never writes")
-        return store.emitError("furiosa: ") << why, failure();
-      int widen = -1;
-      for (auto [k, c] : llvm::enumerate(comps))
-        if (crossed >= 0 && c.axis == crossed && !c.digit && !stepped[k])
-          widen = k;
-      if (widen < 0 || dimOf[widen] < (int)span[widen])
-        break;
-      int above = dimOf[widen] - span[widen];
-      bool taken = false;
-      for (auto [k, c] : llvm::enumerate(comps))
-        taken |= above <= dimOf[k] && above > dimOf[k] - (int)span[k];
-      if (taken)
-        break;
-      ++span[widen];
+        probeStrides = st;
     }
-    if (attempt == 1)
-      probeStrides = st;
   }
-  return store.emitError("furiosa: ") << why, failure();
+  return store.emitError("furiosa: ") << (first.empty() ? why : first), failure();
 }
 
 /// The basis element k (a stored axis origin, or a free dim coordinate) as an expression of the
@@ -2637,8 +2670,10 @@ FailureOr<Value> Raiser::emit(Gen &g, Value v, ArrayRef<Axis> env) {
       idx.push_back(linalg::IndexOp::create(*g.ob, loc, d));
     }
     out = tensor::ExtractOp::create(*g.ob, loc, it->second.first, idx).getResult();
-  } else if (!def) {
+  } else if (!def && !isa<scf::ForOp>(cast<BlockArgument>(v).getOwner()->getParentOp())) {
     return kernel.emitError("furiosa: a loop-carried value is used outside its loop"), failure();
+  } else if (!def) {
+    out = materialize(g, v, env);
   } else if (auto c = dyn_cast<arith::ConstantOp>(def)) {
     OpBuilder::InsertionGuard guard(b);
     b.setInsertionPoint(g.ob->getInsertionBlock(), g.ob->getInsertionPoint());
@@ -3120,7 +3155,57 @@ FailureOr<Value> Raiser::materialize(Gen &g, Value v, ArrayRef<Axis> env) {
   // Remaps an env over the parent's dims into a generic built with `remap`.
   FailureOr<std::pair<Value, SmallVector<unsigned>>> built = failure();
 
-  if (auto red = dyn_cast<tt::ReduceOp>(def)) {
+  if (auto arg = dyn_cast<BlockArgument>(v)) {
+    // An iter arg read inside its loop (a running carry stored per tile) at the current iteration: the
+    // accumulation of the iterations before it, when the loop updates it as arg (op) term by an
+    // associative op and term reads no data state of the loop.
+    auto loop = cast<scf::ForOp>(arg.getOwner()->getParentOp());
+    unsigned i = arg.getArgNumber() - loop.getNumInductionVars(), id = loopIds.lookup(loop);
+    Operation *upd = cast<scf::YieldOp>(loop.getBody()->getTerminator()).getOperand(i).getDefiningOp();
+    if (!upd || upd->getParentOp() != loop.getOperation() || upd->getNumOperands() != 2 ||
+        !llvm::is_contained(upd->getOperands(), v) ||
+        !isa<arith::AddFOp, arith::MulFOp, arith::MaxNumFOp, arith::MinNumFOp, arith::MaximumFOp, arith::MinimumFOp,
+             arith::AddIOp, arith::MulIOp, arith::MaxSIOp, arith::MinSIOp, arith::MaxUIOp, arith::MinUIOp,
+             arith::XOrIOp, arith::OrIOp, arith::AndIOp>(upd))
+      return loop.emitError("furiosa: a loop-carried value read inside its loop is not an accumulation"), failure();
+    Value term = upd->getOperand(0) == v ? upd->getOperand(1) : upd->getOperand(0);
+    SmallVector<Value> work{term};
+    DenseSet<Operation *> seen;
+    while (!work.empty()) {
+      Value x = work.pop_back_val();
+      if (auto a = dyn_cast<BlockArgument>(x); a && a.getOwner() == loop.getBody() && a.getArgNumber() &&
+                                                 !act[0]->get(a))
+        return loop.emitError("furiosa: a loop-carried accumulation reads the loop's state"), failure();
+      Operation *d = x.getDefiningOp();
+      if (d && loop->isProperAncestor(d) && seen.insert(d).second)
+        d->walk([&](Operation *in) { work.append(in->operand_begin(), in->operand_end()); });
+    }
+    built = buildGeneric(
+        g, parentDims, {loopTrip[id]}, {{id, 0}}, elem,
+        [&](Gen &gi, ArrayRef<int> remap) { return emit(gi, loop.getInitArgs()[i], remapEnv(env, remap)); },
+        [&](Gen &gg, Value acc, ArrayRef<int> remap) -> FailureOr<Value> {
+          // The current iteration: the loop counter as the parent has it.
+          Gen outer = gg;
+          outer.memo.clear();
+          outer.loopPos.erase(id);
+          if (auto it = g.loopPos.find(id); it != g.loopPos.end()) {
+            if (remap[it->second] < 0)
+              return failure();
+            outer.loopPos[id] = remap[it->second];
+          }
+          auto cur = emit(outer, loop.getInductionVar(), {});
+          auto own = emit(gg, loop.getInductionVar(), {});
+          auto x = emit(gg, term, remapEnv(env, remap));
+          if (failed(cur) || failed(own) || failed(x))
+            return failure();
+          OperationState state(loc, upd->getName());
+          state.addOperands({acc, *x});
+          state.addTypes(elem);
+          state.addAttributes(upd->getAttrs());
+          Value before = arith::CmpIOp::create(*gg.ob, loc, arith::CmpIPredicate::slt, *own, *cur);
+          return arith::SelectOp::create(*gg.ob, loc, before, gg.ob->create(state)->getResult(0), acc).getResult();
+        });
+  } else if (auto red = dyn_cast<tt::ReduceOp>(def)) {
     unsigned result = cast<OpResult>(v).getResultNumber();
     // Through a data-moving reshape (Expr axes) reductions nest in every context that reads them, and
     // gather form would rebuild them per context, exponentially in the nesting (tl.sort, tl.flip): build
