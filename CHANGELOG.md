@@ -6,6 +6,10 @@ npu stage) against GPU goldens.
 
 ## 1.4.0 (unreleased, main)
 
+- A second held-out batch (`heldout2_*`, c08c3bc): ten standard ML ops (layer norm, rmsnorm and softmax backward, RoPE,
+  cross-entropy, group norm, int8 quantization, AdamW, a matmul epilogue, a direct conv) written from their math
+  without reading the compiler. First try at 1.3.0: 5 of 10 pass L4 on npu3. The harness groups `heldout*` cases
+  as held-out.
 ## 1.3.0 (2026-11-18, release/1.3.0)
 
 Milestone: the whole operator matrix on npu3. All 907 operator matrix cases pass (879 in 1.2.0), and all 25 corpus

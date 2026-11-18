@@ -374,7 +374,7 @@ def main():
         if CASES[name].path.startswith("models/"):
             return "models"
         prefix = name.split("_")[0]
-        return prefix if prefix in ("tutorial", "heldout") else "micro"
+        return "heldout" if prefix.startswith("heldout") else prefix if prefix == "tutorial" else "micro"
     print()
     for group in ("micro", "tutorial", "heldout", "models"):
         members = [n for n in names if layer(n) == group]

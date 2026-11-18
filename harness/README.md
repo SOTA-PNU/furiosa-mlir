@@ -133,7 +133,11 @@ The compiler must handle Triton code it has never seen, so it may not recognise 
 - Held-out cases (`harness/cases/heldout_*.py`) are kernels written apart from the corpus, in other
   styles (NCHW layout, 3-D grids, `acc += tl.dot`, transposed stores, online reductions), to measure
   whether the compiler generalizes. A held-out failure is fixed only by a general mechanism that the
-  corpus also exercises; a change that only a held-out case motivates does not count.
+  corpus also exercises; a change that only a held-out case motivates does not count. The second batch
+  (`heldout2_*`: ten standard ML ops written from their math after 1.3.0, without reading the compiler) passed L4
+  at first try in 5 of 10 (layer norm and softmax backward, RoPE, a matmul epilogue at 96x80x200, a direct 3x3
+  conv); the rest found a `min` loop bound, a runtime integer division in an index, fp32 scalars folded in higher
+  precision, a per-row data gather, and an int8 quantizer no class maps.
 
 ## Operator matrix (harness/ops)
 
