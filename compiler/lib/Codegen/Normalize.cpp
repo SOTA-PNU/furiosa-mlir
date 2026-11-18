@@ -1576,15 +1576,31 @@ void relayoutReads(linalg::GenericOp g, function_ref<bool(linalg::GenericOp)> ma
     // Result j of the relayout is operand dim perm[j], the operand dims in loop order.
     SmallVector<int64_t> perm = llvm::to_vector(llvm::seq<int64_t>(0, m.getNumResults()));
     llvm::stable_sort(perm, [&](int64_t x, int64_t y) { return position(m.getResult(x)) < position(m.getResult(y)); });
-    auto t = cast<RankedTensorType>(in->get().getType());
-    SmallVector<int64_t> shape;
+    // A padded operand relays out its source, padded after: the copy class moves buffers, and the classes read pads.
+    Value src = in->get();
+    auto pad = src.getDefiningOp<tensor::PadOp>();
+    Value padValue = pad ? pad.getConstantPaddingValue() : Value();
+    if (padValue && pad.getLow().empty() && pad.getHigh().empty())
+      src = pad.getSource();
+    auto t = cast<RankedTensorType>(src.getType());
+    SmallVector<int64_t> shape, padded;
+    SmallVector<OpFoldResult> low, high;
     SmallVector<AffineExpr> exprs;
     for (int64_t d : perm) {
       shape.push_back(t.getDimSize(d));
+      padded.push_back(cast<RankedTensorType>(in->get().getType()).getDimSize(d));
+      if (src != in->get()) {
+        low.push_back(b.getIndexAttr(pad.getStaticLow()[d]));
+        high.push_back(b.getIndexAttr(pad.getStaticHigh()[d]));
+      }
       exprs.push_back(m.getResult(d));
     }
     Value empty = tensor::EmptyOp::create(b, g.getLoc(), shape, t.getElementType());
-    in->set(linalg::TransposeOp::create(b, g.getLoc(), in->get(), empty, perm).getResult()[0]);
+    Value relaid = linalg::TransposeOp::create(b, g.getLoc(), src, empty, perm).getResult()[0];
+    if (src != in->get())
+      relaid = tensor::PadOp::create(b, g.getLoc(), RankedTensorType::get(padded, t.getElementType()), relaid, low, high,
+                                     padValue);
+    in->set(relaid);
     maps[in->getOperandNumber()] = AffineMap::get(m.getNumDims(), 0, exprs, g.getContext());
   }
   g.setIndexingMapsAttr(b.getAffineMapArrayAttr(maps));
@@ -2306,6 +2322,13 @@ void mlir::furiosa::guardNaNs(ModuleOp module) {
     op->getResult(0).replaceAllUsesWith(r);
     op->erase();
   });
+}
+
+void mlir::furiosa::relayoutFactorReads(ModuleOp module, function_ref<bool(linalg::GenericOp)> mapsAlone) {
+  SmallVector<linalg::GenericOp> generics;
+  module.walk([&](linalg::GenericOp g) { generics.push_back(g); });
+  for (linalg::GenericOp g : generics)
+    relayoutReads(g, mapsAlone);
 }
 
 void mlir::furiosa::normalizeKernels(ModuleOp module, function_ref<bool(linalg::GenericOp)> mapsAlone) {

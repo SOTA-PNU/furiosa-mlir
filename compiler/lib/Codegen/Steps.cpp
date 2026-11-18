@@ -868,6 +868,7 @@ LogicalResult mlir::furiosa::splitSteps(ModuleOp module) {
     return failure();
   normalizeKernels(module, mapsAlone);
   normalizeContractions(module, mapsAlone);
+  relayoutFactorReads(module, mapsAlone);
   // Reads the normalization rewrote alike (each operand gets its own reshape and box) become one again.
   PassManager pm(module.getContext());
   pm.addPass(createCSEPass());

@@ -68,6 +68,11 @@ void guardNaNs(ModuleOp module);
 /// or sums, products, negations, min/max and selects of such (lib/Codegen/Normalize.cpp).
 bool isIntegral(Value v);
 
+/// A factor normalizeContractions made into a generic of its own reads its operand in that operand's layout (a w laid
+/// out [k, n] computed over [n, k]): an elementwise generic no class maps as it is reads it relaid out into loop
+/// order, as normalizeKernels does (lib/Codegen/Normalize.cpp).
+void relayoutFactorReads(ModuleOp module, function_ref<bool(linalg::GenericOp)> mapsAlone);
+
 /// Takes contractions apart into the 2-D form op classes map: computed factors become producers, a non-zero
 /// start is added after, batch dims split into slices, dims collapse (lib/Codegen/Contract.cpp).
 /// `mapsAlone` says whether a batched contraction maps as a step of its own, so it need not be unbatched.
