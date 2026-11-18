@@ -1570,7 +1570,7 @@ FailureOr<StoreSpace> Raiser::storeSpace(Write store, ArrayRef<int64_t> extraStr
     sp.boxLo.assign(nd, std::numeric_limits<int64_t>::max());
     sp.boxHi.assign(nd, std::numeric_limits<int64_t>::min());
     int64_t count = 0;
-    SmallVector<int64_t> idx(rank), coord(nd);
+    SmallVector<int64_t> idx(rank), coord(nd), live(rank, 0); // live: per axis, past the last index written
     why.clear();
     for (auto [n, ev] : llvm::enumerate(act)) {
       if (maskNever[n])
@@ -1612,6 +1612,8 @@ FailureOr<StoreSpace> Raiser::storeSpace(Write store, ArrayRef<int64_t> extraStr
           break;
         }
         ++count;
+        for (unsigned i = 0; i < rank; ++i)
+          live[i] = std::max(live[i], idx[i] + 1);
         for (unsigned j = 0; j < nd; ++j) {
           sp.boxLo[j] = std::min(sp.boxLo[j], coord[j]);
           sp.boxHi[j] = std::max(sp.boxHi[j], coord[j]);
@@ -1644,10 +1646,18 @@ FailureOr<StoreSpace> Raiser::storeSpace(Write store, ArrayRef<int64_t> extraStr
     for (unsigned i = 0; i < rank; ++i) {
       if (!sp.global[i] || sp.step[i] > 1)
         continue;
-      int64_t e = shape[i], ph = ((sp.origin[0][i] % e) + e) % e;
-      bool aligned = llvm::all_of(sp.origin, [&](auto &o) { return ((o[i] % e) + e) % e == ph; });
-      sp.extent[i] = e;
-      sp.phase[i] = aligned ? ph : -1;
+      auto phaseFor = [&](int64_t e) -> int64_t {
+        int64_t ph = ((sp.origin[0][i] % e) + e) % e;
+        bool aligned = llvm::all_of(sp.origin, [&](auto &o) { return ((o[i] % e) + e) % e == ph; });
+        return aligned ? ph : -1;
+      };
+      // Tiles masked to a prefix (a group's channels in a wider block) may step by the prefix instead.
+      sp.extent[i] = shape[i];
+      sp.phase[i] = phaseFor(shape[i]);
+      if (sp.phase[i] < 0 && live[i] < shape[i] && phaseFor(live[i]) >= 0) {
+        sp.extent[i] = live[i];
+        sp.phase[i] = phaseFor(live[i]);
+      }
     }
     return sp;
   };
