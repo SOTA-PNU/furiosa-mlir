@@ -1333,6 +1333,164 @@ linalg::GenericOp splitLoopDigits(linalg::GenericOp g) {
   return fresh;
 }
 
+/// Values two generics compute alike: the same buffer (or the same reshape or slice of it), or ops alike on values
+/// alike.
+bool sameTensor(Value a, Value b) {
+  if (a == b)
+    return true;
+  Operation *x = a.getDefiningOp(), *y = b.getDefiningOp();
+  return x && y && !isa<linalg::GenericOp>(x) && x->getNumRegions() == 0 &&
+         OperationEquivalence::isEquivalentTo(
+             x, y, [](Value u, Value v) { return success(sameTensor(u, v)); }, nullptr,
+             OperationEquivalence::IgnoreLocations) &&
+         cast<OpResult>(a).getResultNumber() == cast<OpResult>(b).getResultNumber();
+}
+
+/// A generic no class maps as it is, whose body recomputes what an earlier elementwise generic yields, reads that
+/// generic's result instead (tl.sort's stages, each fused with every stage before it, then read the previous stage:
+/// one stage a generic, and few enough operands for a launch). The bodies match op for op, their reads of one buffer through maps that agree
+/// under one correspondence of the loops, which then maps the read of the earlier result.
+void reuseResults(ModuleOp module, function_ref<bool(linalg::GenericOp)> mapsAlone) {
+  SmallVector<linalg::GenericOp> generics;
+  module.walk([&](linalg::GenericOp g) { generics.push_back(g); });
+  // Reads of distinct loops, or 0 into a unit dim.
+  auto projection = [](AffineMap m) {
+    llvm::SmallBitVector seen(m.getNumDims());
+    return llvm::all_of(m.getResults(), [&](AffineExpr e) {
+      auto d = dyn_cast<AffineDimExpr>(e);
+      auto c = dyn_cast<AffineConstantExpr>(e);
+      if (d && !seen.test(d.getPosition()))
+        return seen.set(d.getPosition()), true;
+      return c && c.getValue() == 0;
+    });
+  };
+  auto producer = [&](linalg::GenericOp a) {
+    return a.getNumDpsInits() == 1 && !a.getNumReductionLoops() &&
+           !a.payloadUsesValueFromOperand(a.getDpsInitOperand(0)) &&
+           a.getMatchingIndexingMap(a.getDpsInitOperand(0)).isPermutation() &&
+           llvm::all_of(a.getIndexingMapsArray(), projection);
+  };
+  for (linalg::GenericOp b : llvm::reverse(generics)) {
+    if (!llvm::all_of(b.getIndexingMapsArray(), projection))
+      continue;
+    Block &bb = b.getRegion().front();
+    for (linalg::GenericOp a : llvm::reverse(generics)) {
+      if (a == b || a->getBlock() != b->getBlock() || !a->isBeforeInBlock(b) || !producer(a) ||
+          !llvm::all_of(a.getDpsInputs(), [&](Value t) {
+            return llvm::any_of(b.getDpsInputs(), [&](Value u) { return sameTensor(t, u); });
+          }))
+        continue;
+      Block &ab = a.getRegion().front();
+      Value yield = ab.getTerminator()->getOperand(0);
+      SmallVector<int64_t> ra = a.getStaticLoopRanges(), rb = b.getStaticLoopRanges();
+      // phi: b's loop -> a's loop.
+      llvm::DenseMap<unsigned, unsigned> phi, inv;
+      llvm::DenseMap<std::pair<Value, Value>, bool> memo;
+      auto bind = [&](unsigned db, unsigned da) {
+        auto [i, fresh] = phi.try_emplace(db, da);
+        auto [j, fresh2] = inv.try_emplace(da, db);
+        return i->second == da && j->second == db && ra[da] == rb[db];
+      };
+      std::function<bool(Value, Value)> match = [&](Value va, Value vb) -> bool {
+        if (va.getType() != vb.getType())
+          return false;
+        if (auto it = memo.find({va, vb}); it != memo.end())
+          return it->second;
+        bool ok = false;
+        auto argA = dyn_cast<BlockArgument>(va), argB = dyn_cast<BlockArgument>(vb);
+        Operation *x = va.getDefiningOp(), *y = vb.getDefiningOp();
+        if (argA && argB && argA.getOwner() == &ab && argB.getOwner() == &bb) {
+          unsigned i = argA.getArgNumber(), j = argB.getArgNumber();
+          if (i < a.getNumDpsInputs() && j < b.getNumDpsInputs() &&
+              sameTensor(a.getDpsInputs()[i], b.getDpsInputs()[j])) {
+            AffineMap ma = a.getIndexingMapsArray()[i], mb = b.getIndexingMapsArray()[j];
+            ok = ma.getNumResults() == mb.getNumResults();
+            for (unsigned r = 0; ok && r < ma.getNumResults(); ++r) {
+              auto da = dyn_cast<AffineDimExpr>(ma.getResult(r)), db = dyn_cast<AffineDimExpr>(mb.getResult(r));
+              ok = da && db ? bind(db.getPosition(), da.getPosition()) : ma.getResult(r) == mb.getResult(r);
+            }
+          }
+        } else if (argA || argB || !x || !y) {
+          ok = false;
+        } else if (x->getBlock() != &ab || y->getBlock() != &bb) {
+          ok = va == vb; // a constant both capture
+        } else if (auto ia = dyn_cast<linalg::IndexOp>(x)) {
+          auto ib = dyn_cast<linalg::IndexOp>(y);
+          ok = ib && bind(ib.getDim(), ia.getDim());
+        } else {
+          ok = cast<OpResult>(va).getResultNumber() == cast<OpResult>(vb).getResultNumber() &&
+               OperationEquivalence::isEquivalentTo(
+                   x, y, [&](Value u, Value v) { return success(match(u, v)); }, nullptr,
+                   OperationEquivalence::IgnoreLocations);
+        }
+        return memo[{va, vb}] = ok;
+      };
+      // The yield, or the value it views as other bits (the stage value of a sort, yielded as an integer).
+      Value found, viewed;
+      auto view = yield.getDefiningOp<arith::BitcastOp>();
+      for (Value target : {view ? view.getIn() : Value(), yield})
+        for (Operation &op : llvm::reverse(bb.without_terminator())) {
+          if (!target || found)
+            break;
+          phi.clear(), inv.clear(), memo.clear();
+          if (op.getNumResults() == 1 && match(target, op.getResult(0)))
+            found = op.getResult(0), viewed = target == yield ? Value() : target;
+        }
+      // The read of a's result: each of its loops in the output's order, as the b loop it corresponds to.
+      SmallVector<AffineExpr> exprs;
+      for (AffineExpr e : a.getMatchingIndexingMap(a.getDpsInitOperand(0)).getResults())
+        if (auto it = inv.find(cast<AffineDimExpr>(e).getPosition()); found && it != inv.end())
+          exprs.push_back(getAffineDimExpr(it->second, b.getContext()));
+      if (!found || exprs.size() != a.getNumLoops() || mapsAlone(b))
+        continue;
+      OpBuilder builder(b);
+      SmallVector<Value> ins(b.getDpsInputs());
+      ins.push_back(a.getResult(0));
+      SmallVector<AffineMap> maps = b.getIndexingMapsArray();
+      maps.insert(maps.begin() + b.getNumDpsInputs(), AffineMap::get(b.getNumLoops(), 0, exprs, b.getContext()));
+      auto fresh = linalg::GenericOp::create(builder, b.getLoc(), b.getResultTypes(), ins, b.getDpsInits(), maps,
+                                             b.getIteratorTypesArray());
+      fresh->setDiscardableAttrs(b->getDiscardableAttrDictionary());
+      fresh.getRegion().takeBody(b.getRegion());
+      Block &body = fresh.getRegion().front();
+      Value read = body.insertArgument(fresh.getNumDpsInputs() - 1, yield.getType(), b.getLoc());
+      if (viewed) {
+        OpBuilder vb = OpBuilder::atBlockBegin(&body);
+        read = arith::BitcastOp::create(vb, b.getLoc(), found.getType(), read);
+      }
+      found.replaceAllUsesWith(read);
+      SmallVector<Operation *> ops;
+      for (Operation &op : body.without_terminator())
+        ops.push_back(&op);
+      for (Operation *op : llvm::reverse(ops))
+        if (isOpTriviallyDead(op))
+          op->erase();
+      // The reads the reused prefix took are carriers now: dropped where the other operands span the loops.
+      for (int i = fresh.getNumDpsInputs() - 1; i >= 0; --i) {
+        if (!body.getArgument(i).use_empty())
+          continue;
+        SmallVector<AffineMap> maps = fresh.getIndexingMapsArray();
+        llvm::SmallBitVector spanned(fresh.getNumLoops());
+        for (auto [k, m] : llvm::enumerate(maps))
+          if (int(k) != i)
+            for (AffineExpr e : m.getResults())
+              if (auto d = dyn_cast<AffineDimExpr>(e))
+                spanned.set(d.getPosition());
+        if (!spanned.all())
+          continue;
+        fresh.getInputsMutable().erase(i);
+        body.eraseArgument(i);
+        maps.erase(maps.begin() + i);
+        fresh.setIndexingMapsAttr(builder.getAffineMapArrayAttr(maps));
+      }
+      b.replaceAllUsesWith(fresh.getResults());
+      std::replace(generics.begin(), generics.end(), b, fresh);
+      b.erase();
+      break;
+    }
+  }
+}
+
 /// A read through the loops out of their order (a transposed operand), in an elementwise generic no class maps as
 /// it is, becomes a relayout of the operand into loop order (linalg.transpose: one DMA, the copy class's) read in
 /// order, as the computing classes stream rows and columns. A 0 into a unit dim rides along first. Reductions keep
@@ -1803,13 +1961,19 @@ void mlir::furiosa::normalizeKernels(ModuleOp module, function_ref<bool(linalg::
   padsToInserts(module);
   SmallVector<linalg::GenericOp> generics;
   module.walk([&](linalg::GenericOp g) { generics.push_back(g); });
-  for (linalg::GenericOp g : generics) {
+  for (linalg::GenericOp &g : generics) {
     g = splitLoopDigits(initsToInputs(dropUnitReductions(promoteExtracts(g))));
     for (unsigned i = 0; i < g.getNumDpsInputs(); ++i) {
       delinearizeRead(g, i);
       maskToPad(g, i);
     }
     dropCarriers(g);
+  }
+  if (mapsAlone)
+    reuseResults(module, mapsAlone);
+  generics.clear();
+  module.walk([&](linalg::GenericOp g) { generics.push_back(g); });
+  for (linalg::GenericOp g : generics) {
     relayoutReads(g, mapsAlone);
     broadcastStreams(g, mapsAlone);
   }
