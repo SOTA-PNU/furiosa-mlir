@@ -20,11 +20,14 @@ assert 'furiosa' in backends, backends
 print('triton', triton.__version__, 'with the furiosa backend')"
 # The furiosa-opt tools the generated crates build with (crates.io; the version furiosa-opt-std is pinned to in
 # furiosa_compiler/crate.py), where the compiler looks for them: .tools/bin.
-if command -v cargo >/dev/null; then
+# The toolchain is the one the crates pin (crate.py's rust-toolchain.toml): rustup may have no default.
+toolchain=nightly-2026-05-01
+if command -v rustup >/dev/null; then
+    rustup toolchain install --profile minimal "$toolchain" >/dev/null
     if command -v cargo-binstall >/dev/null; then
-        cargo binstall -y --root "$here/.tools" cargo-furiosa-opt@0.10.0
+        cargo "+$toolchain" binstall -y --root "$here/.tools" cargo-furiosa-opt@0.10.0
     else
-        cargo install --locked --root "$here/.tools" cargo-furiosa-opt@0.10.0
+        cargo "+$toolchain" install --locked --root "$here/.tools" cargo-furiosa-opt@0.10.0
     fi
 else
     echo "note: no cargo on PATH; install rustup (https://rustup.rs), then rerun install.sh to run on the NPU"

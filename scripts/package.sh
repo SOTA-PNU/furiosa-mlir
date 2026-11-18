@@ -13,9 +13,11 @@ dist="${DIST:-$root/dist}"
 stage="$dist/stage/$name"
 rm -rf "$stage" && mkdir -p "$stage/python" "$stage/bin" "$stage/examples" "$stage/docs"
 
-# Triton with the furiosa backend as files (the source tree links it), and no other backend.
-cp -a third_party/triton/python/triton "$stage/python/triton"
-rm -rf "$stage/python/triton/backends/"{furiosa,nvidia,amd}
+# Triton with the furiosa backend as files, and no other backend. The source tree links language/extra and
+# tools/extra (cuda's libdevice, which the furiosa backend maps libdevice calls through) into third_party/:
+# copy what the links point to, not the links.
+rsync -a --copy-links --exclude=__pycache__ --exclude='/backends/furiosa' --exclude='/backends/nvidia' \
+    --exclude='/backends/amd' third_party/triton/python/triton/ "$stage/python/triton/"
 cp -aL compiler/backend "$stage/python/triton/backends/furiosa"
 strip --strip-debug "$stage/python/triton/_C/libtriton.so"
 # The JIT links the MLIR runner utilities; libtriton looks for them beside itself (compiler/lib/Runtime/Jit.cpp).

@@ -20,7 +20,7 @@ tar xzf furiosa-mlir-1.3.0-linux-x86_64.tar.gz && furiosa-mlir-1.3.0-linux-x86_6
 
 python3.12 -m venv venv && venv/bin/pip install --extra-index-url https://download.pytorch.org/whl/cpu \
     furiosa_mlir-1.3.0-cp312-cp312-linux_x86_64.whl          # the wheel provides `triton`: use a fresh venv
-cargo binstall cargo-furiosa-opt@0.10.0                     # or cargo install; on PATH for NPU builds
+cargo +nightly-2026-05-01 binstall cargo-furiosa-opt@0.10.0  # or cargo install; on PATH for NPU builds
 ```
 
 Both hold the furiosa-enabled Triton (libtriton with the compiler passes, stripped), `furiosa_compiler`,
