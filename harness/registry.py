@@ -51,6 +51,24 @@ CASES = {
     "heldout_gelu": Case("harness/cases/heldout_gelu.py", npu=Tol(rtol=8e-3, atol=0)),
     "heldout_logsumexp": Case("harness/cases/heldout_logsumexp.py", npu=Tol(rtol=1e-5, atol=0)),
     "heldout_depthwise": Case("harness/cases/heldout_depthwise.py", npu=Tol(rtol=6.5e-3, atol=0)),
+    # Second held-out batch, by the same rules: a bf16 output allows one bf16 ulp (fp16: one fp16 ulp) at
+    # max|golden|; fp32 elementwise math and reductions keep the exact tolerance; the direct conv is a
+    # contraction (twice the measured drift of rounding x and w to bf16: 0.20% of max|y|); q is exact. AdamW drops
+    # the 1e-5 absolute floor at L1 too: its parameters are ~1e-3, so that floor would accept 1% errors.
+    "heldout2_layernorm_bwd": Case("harness/cases/heldout2_layernorm_bwd.py", npu=Tol(rtol=8e-3, atol=0),
+                                   float_ranges={"rstd": (0.5, 2.0)}),
+    "heldout2_rmsnorm_bwd": Case("harness/cases/heldout2_rmsnorm_bwd.py", npu=Tol(rtol=1e-3, atol=0)),
+    "heldout2_rope": Case("harness/cases/heldout2_rope.py", npu=Tol(rtol=8e-3, atol=0),
+                          float_ranges={"cos": (-1.0, 1.0), "sin": (-1.0, 1.0)}),
+    "heldout2_cross_entropy": Case("harness/cases/heldout2_cross_entropy.py", npu=Tol(rtol=1e-5, atol=0),
+                                   int_ranges={"target": (0, 1000)}),
+    "heldout2_softmax_bwd": Case("harness/cases/heldout2_softmax_bwd.py", npu=Tol(rtol=1e-3, atol=0),
+                                 float_ranges={"y": (0.0, 1.0)}),
+    "heldout2_group_norm": Case("harness/cases/heldout2_group_norm.py", npu=Tol(rtol=1e-5, atol=0)),
+    "heldout2_quant_int8": Case("harness/cases/heldout2_quant_int8.py", npu=Tol(rtol=1e-5, atol=0)),
+    "heldout2_adamw": Case("harness/cases/heldout2_adamw.py", exact=Tol(rtol=1e-5, atol=0), npu=Tol(rtol=1e-5, atol=0)),
+    "heldout2_linear_bias_residual": Case("harness/cases/heldout2_linear_bias_residual.py", npu=Tol(rtol=8e-3, atol=0)),
+    "heldout2_conv2d": Case("harness/cases/heldout2_conv2d.py", npu=Tol(rtol=4e-3, atol=0)),
     # fp32 models: the NPU contracts in bf16, so L3/L4 allow twice the logit drift of the same Triton
     # graph run in bf16 on the GPU (measured: lenet5 0.16%, alexnet 0.37%, vgg16 0.66%, resnet101 2.4%,
     # mobilenetv3 6.5% of max|logit|), and the top-1 class must not change.
