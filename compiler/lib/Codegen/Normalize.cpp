@@ -656,9 +656,10 @@ void selectionReductions(ModuleOp module) {
 }
 
 /// A reduction whose combiner the Vector Engine cannot reduce (products, bitwise xor/and/or) becomes a tree of
-/// elementwise ops: its terms over the whole iteration space, then the two halves along the reduced dim combined
-/// until one element is left, combined with the init last. The combiner is associative and commutative, so the
-/// order does not matter (beyond rounding, for products).
+/// elementwise ops: its terms over the whole iteration space (padded with the combiner's identity to a power of two
+/// along the reduced dim), then the two halves along the reduced dim combined until one element is left, combined
+/// with the init last. The combiner is associative and commutative, so the order does not matter (beyond rounding,
+/// for products).
 void treeReductions(ModuleOp module) {
   SmallVector<linalg::GenericOp> generics;
   module.walk([&](linalg::GenericOp g) { generics.push_back(g); });
@@ -677,8 +678,8 @@ void treeReductions(ModuleOp module) {
       if (it == utils::IteratorType::reduction)
         r = d;
     SmallVector<int64_t> extents = g.getStaticLoopRanges();
-    // shortcut: halves need a power-of-two extent; pad with the combiner's identity to take other extents.
-    if (llvm::any_of(extents, ShapedType::isDynamic) || !llvm::isPowerOf2_64(extents[r]))
+    std::optional<TypedAttr> neutral = arith::getNeutralElement(comb);
+    if (llvm::any_of(extents, ShapedType::isDynamic) || (!llvm::isPowerOf2_64(extents[r]) && !neutral))
       continue;
     AffineMap outMap = g.getIndexingMapsArray().back();
     OpBuilder b(g);
@@ -709,6 +710,14 @@ void treeReductions(ModuleOp module) {
           linalg::YieldOp::create(nb, l, m.lookupOrDefault(term));
         });
     cur = terms.getResult(0);
+    // Halves need a power-of-two extent: the terms past the reduced extent are the combiner's identity.
+    if (int64_t whole = llvm::PowerOf2Ceil(extents[r]); whole != extents[r]) {
+      SmallVector<OpFoldResult> low(rank, b.getIndexAttr(0)), high(low);
+      high[r] = b.getIndexAttr(whole - extents[r]);
+      extents[r] = whole;
+      cur = tensor::PadOp::create(b, loc, RankedTensorType::get(extents, et), cur, low, high,
+                                  arith::ConstantOp::create(b, loc, *neutral).getResult());
+    }
     // Halves combined until one element is left along the reduced dim.
     AffineMap id = AffineMap::getMultiDimIdentityMap(rank, ctx);
     for (int64_t len = extents[r]; len > 1; len /= 2) {
@@ -742,7 +751,6 @@ void treeReductions(ModuleOp module) {
     AffineMap outId = AffineMap::getMultiDimIdentityMap(outRank, ctx);
     // An init that fills the combiner's neutral element (x ^ 0) leaves the total as it is.
     auto fill = init.getDefiningOp<linalg::FillOp>();
-    std::optional<TypedAttr> neutral = arith::getNeutralElement(comb);
     Attribute filled;
     bool keep = !fill || !neutral || !matchPattern(fill.getInputs()[0], m_Constant(&filled)) || filled != *neutral;
     SmallVector<Value> ins{cur};
