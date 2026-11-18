@@ -64,4 +64,3 @@ module attributes {furiosa.launch = "{\22grid\22: [2, 1, 1], \22buffers\22: [{\2
     tt.return
   }
 }
-
