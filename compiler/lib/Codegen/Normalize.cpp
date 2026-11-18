@@ -1307,8 +1307,9 @@ void broadcastStreams(linalg::GenericOp g, function_ref<bool(linalg::GenericOp)>
 /// one condition, as the Vector Engine selects by one tag comparison at a time: select(!c, a, b) =
 /// select(c, b, a) (!c written c ^ true), select(c1 & c2, a, b) = select(c1, select(c2, a, b), b), likewise |, and
 /// c1 ^ c2 (also c1 != c2 on i1; c1 == c2 its negation) selects by c2 between the two orders of c1's select. An
-/// index-only condition stays whole: hoistIndexOnly makes it one table. A reduction's combiner (an argmax's
-/// order | (eq & tie)) stays for selectionReductions.
+/// index-only condition stays whole: hoistIndexOnly makes it one table. In a reduction, a select of its terms
+/// nests likewise (tl.sort's compare-and-swap, fused with the xor reduction that finds the partner); one reading the
+/// accumulator is the combiner (an argmax's order | (eq & tie)) and stays for selectionReductions.
 void nestSelectKeys(ModuleOp module) {
   llvm::DenseMap<Value, bool> memo;
   std::function<bool(Value)> readsData = [&](Value v) {
@@ -1319,10 +1320,22 @@ void nestSelectKeys(ModuleOp module) {
     Operation *op = v.getDefiningOp();
     return memo[v] = op && llvm::any_of(op->getOperands(), readsData);
   };
+  // In a reduction, what reads the accumulator (its init's block argument) is the combiner, selectionReductions'.
+  llvm::DenseMap<Value, bool> accMemo;
+  std::function<bool(Value)> readsAcc = [&](Value v) {
+    if (auto arg = dyn_cast<BlockArgument>(v)) {
+      auto g = dyn_cast<linalg::GenericOp>(arg.getOwner()->getParentOp());
+      return g && arg.getArgNumber() >= g.getNumDpsInputs();
+    }
+    if (auto it = accMemo.find(v); it != accMemo.end())
+      return it->second;
+    Operation *op = v.getDefiningOp();
+    return accMemo[v] = op && llvm::any_of(op->getOperands(), readsAcc);
+  };
   SmallVector<arith::SelectOp> work;
   module.walk([&](arith::SelectOp s) {
     auto g = s->getParentOfType<linalg::GenericOp>();
-    if (s.getCondition().getType().isInteger(1) && g && !g.getNumReductionLoops())
+    if (s.getCondition().getType().isInteger(1) && g && (!g.getNumReductionLoops() || !readsAcc(s.getResult())))
       work.push_back(s);
   });
   while (!work.empty()) {
