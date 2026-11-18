@@ -35,6 +35,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
@@ -1180,6 +1181,8 @@ private:
   FailureOr<Value> emitElementwise(Gen &g, Operation *op, ArrayRef<Axis> env);
   FailureOr<Value> materialize(Gen &g, Value v, ArrayRef<Axis> env);
   int64_t liveExtent(tt::DotOp dot);
+  int64_t maskLive(Value mask, unsigned axis, int64_t full);
+  int64_t liveAlong(Value v, unsigned axis, TypedAttr identity);
   FailureOr<Value> materializeState(Gen &g, scf::ForOp loop, unsigned result, ArrayRef<Axis> env);
   FailureOr<SmallVector<SmallVector<Axis>>> stateEnvs(scf::ForOp loop, unsigned result, ArrayRef<Axis> env,
                                                      SmallVector<bool> *skipped = nullptr);
@@ -2949,6 +2952,67 @@ Raiser::buildGenerics(Gen &parent, ArrayRef<unsigned> parentDims, ArrayRef<int64
 /// exclude k (by conditions on k and loop counters alone) in every instance and iteration, and whose
 /// `other` is zero, so the products there add nothing: a padded reduction tile (BLOCK_K > K, masked)
 /// reduces over its true extent.
+/// How far along `axis` a value masked by `mask` can be live in any instance (and iteration): past it the mask's
+/// conditions on that axis alone fail. `full` when no condition reads the axis alone.
+int64_t Raiser::maskLive(Value mask, unsigned axis, int64_t full) {
+  unsigned rank = shapeOf(mask.getType()).size(), nl = loopTrip.size();
+  int64_t live = 0;
+  std::set<std::string> seen;
+  for (Evaluator *ev : act) {
+    const Sym *m = ev->get(mask);
+    if (!m || m->kind != Sym::Mask)
+      return full;
+    if (m->never)
+      continue;
+    SmallVector<AffineExpr> conds;
+    for (AffineExpr c : m->conds) {
+      bool others = false;
+      for (unsigned d = 0; d < rank; ++d)
+        others |= d != axis && c.isFunctionOfDim(d);
+      if (!others && c.isFunctionOfDim(axis))
+        conds.push_back(c);
+    }
+    if (conds.empty())
+      return full;
+    SmallVector<unsigned> used;
+    for (unsigned l = 0; l < nl; ++l)
+      if (llvm::any_of(conds, [&](AffineExpr c) { return c.isFunctionOfSymbol(l); }))
+        used.push_back(l);
+    std::string key;
+    for (AffineExpr c : conds)
+      key += show(c) + ";";
+    int64_t total = 1;
+    for (unsigned l : used) {
+      key += std::to_string(ev->trips.lookup(l)) + ",";
+      total *= ev->trips.lookup(l);
+    }
+    if (!seen.insert(key).second)
+      continue;
+    if (total > (1 << 16))
+      return full;
+    SmallVector<AffineExpr> symVals(nl, getAffineConstantExpr(0, ctx));
+    for (int64_t f = 0; f < total && live < full; ++f) {
+      int64_t r = f;
+      for (unsigned l : used) {
+        symVals[l] = getAffineConstantExpr(r % ev->trips.lookup(l), ctx);
+        r /= ev->trips.lookup(l);
+      }
+      SmallVector<AffineExpr> at;
+      for (AffineExpr c : conds)
+        at.push_back(c.replaceSymbols(symVals));
+      SmallVector<int64_t> point(rank, 0);
+      for (int64_t kk = full - 1; kk >= live; --kk) {
+        point[axis] = kk;
+        if (llvm::all_of(at, [&](AffineExpr c) { return evalAt(c, point) >= 0; })) {
+          live = kk + 1;
+          break;
+        }
+      }
+    }
+  }
+  return live;
+}
+
 int64_t Raiser::liveExtent(tt::DotOp dot) {
   int64_t k = shapeOf(dot.getA().getType())[1];
   auto isZero = [](Attribute a) {
@@ -2974,64 +3038,54 @@ int64_t Raiser::liveExtent(tt::DotOp dot) {
       if (!c || !isZero(c.getValue()))
         return k;
     }
-    unsigned rank = shapeOf(v.getType()).size(), nl = loopTrip.size();
-    int64_t live = 0;
-    std::set<std::string> seen;
-    for (Evaluator *ev : act) {
-      const Sym *m = ev->get(load.getMask());
-      if (!m || m->kind != Sym::Mask)
-        return k;
-      if (m->never)
-        continue;
-      SmallVector<AffineExpr> conds;
-      for (AffineExpr c : m->conds) {
-        bool others = false;
-        for (unsigned d = 0; d < rank; ++d)
-          others |= d != axis && c.isFunctionOfDim(d);
-        if (!others && c.isFunctionOfDim(axis))
-          conds.push_back(c);
-      }
-      if (conds.empty())
-        return k;
-      SmallVector<unsigned> used;
-      for (unsigned l = 0; l < nl; ++l)
-        if (llvm::any_of(conds, [&](AffineExpr c) { return c.isFunctionOfSymbol(l); }))
-          used.push_back(l);
-      std::string key;
-      for (AffineExpr c : conds)
-        key += show(c) + ";";
-      int64_t total = 1;
-      for (unsigned l : used) {
-        key += std::to_string(ev->trips.lookup(l)) + ",";
-        total *= ev->trips.lookup(l);
-      }
-      if (!seen.insert(key).second)
-        continue;
-      if (total > (1 << 16))
-        return k;
-      SmallVector<AffineExpr> symVals(nl, getAffineConstantExpr(0, ctx));
-      for (int64_t f = 0; f < total && live < k; ++f) {
-        int64_t r = f;
-        for (unsigned l : used) {
-          symVals[l] = getAffineConstantExpr(r % ev->trips.lookup(l), ctx);
-          r /= ev->trips.lookup(l);
-        }
-        SmallVector<AffineExpr> at;
-        for (AffineExpr c : conds)
-          at.push_back(c.replaceSymbols(symVals));
-        SmallVector<int64_t> point(rank, 0);
-        for (int64_t kk = k - 1; kk >= live; --kk) {
-          point[axis] = kk;
-          if (llvm::all_of(at, [&](AffineExpr c) { return evalAt(c, point) >= 0; })) {
-            live = kk + 1;
-            break;
-          }
-        }
-      }
-    }
-    return live;
+    return maskLive(load.getMask(), axis, k);
   };
   return std::max<int64_t>(1, std::max(liveOf(dot.getA(), 1), liveOf(dot.getB(), 0)));
+}
+
+/// How far along `axis` `v` can differ from `identity` in any instance: past it every element is the identity. It is
+/// so past the prefix a load's mask keeps (with the identity as `other`) or a select's condition keeps (with it as
+/// the false value), through conversions, broadcasts and reductions over another axis with the same identity, and for
+/// zero through products (any zero factor) and sums (every term zero).
+int64_t Raiser::liveAlong(Value v, unsigned axis, TypedAttr identity) {
+  int64_t full = shapeOf(v.getType())[axis];
+  auto isIdentity = [&](Value c) {
+    Attribute a;
+    if (!c || !matchPattern(c, m_Constant(&a)))
+      return false;
+    if (auto d = dyn_cast<SplatElementsAttr>(a))
+      a = d.getSplatValue<Attribute>();
+    if (auto f = dyn_cast<FloatAttr>(a); f && isa<FloatAttr>(identity))
+      return f.getValueAsDouble() == cast<FloatAttr>(identity).getValueAsDouble();
+    if (auto i = dyn_cast<IntegerAttr>(a); i && isa<IntegerAttr>(identity))
+      return i.getValue().getSExtValue() == cast<IntegerAttr>(identity).getValue().getSExtValue();
+    return false;
+  };
+  bool zero = isa<FloatAttr>(identity) ? cast<FloatAttr>(identity).getValueAsDouble() == 0.0
+                                       : cast<IntegerAttr>(identity).getValue().isZero();
+  Operation *def = v.getDefiningOp();
+  if (!def)
+    return full;
+  if (isa<arith::ExtFOp, arith::TruncFOp, tt::FpToFpOp>(def))
+    return liveAlong(def->getOperand(0), axis, identity);
+  if (auto load = dyn_cast<tt::LoadOp>(def))
+    return load.getMask() && (!load.getOther() || isIdentity(load.getOther())) ? maskLive(load.getMask(), axis, full)
+                                                                                : full;
+  if (auto sel = dyn_cast<arith::SelectOp>(def); sel && isIdentity(sel.getFalseValue()) &&
+                                                   isa<RankedTensorType>(sel.getCondition().getType()))
+    return std::min(maskLive(sel.getCondition(), axis, full), liveAlong(sel.getTrueValue(), axis, identity));
+  if (zero && isa<arith::MulFOp, arith::MulIOp>(def))
+    return std::min(liveAlong(def->getOperand(0), axis, identity), liveAlong(def->getOperand(1), axis, identity));
+  if (zero && isa<arith::AddFOp, arith::SubFOp, arith::AddIOp, arith::SubIOp>(def))
+    return std::max(liveAlong(def->getOperand(0), axis, identity), liveAlong(def->getOperand(1), axis, identity));
+  if (auto ed = dyn_cast<tt::ExpandDimsOp>(def))
+    return axis == ed.getAxis() ? full : liveAlong(ed.getSrc(), axis - (axis > ed.getAxis()), identity);
+  if (auto bc = dyn_cast<tt::BroadcastOp>(def))
+    return shapeOf(bc.getSrc().getType())[axis] == full ? liveAlong(bc.getSrc(), axis, identity) : full;
+  if (auto red = dyn_cast<tt::ReduceOp>(def); red && red.getNumOperands() == 1 &&
+                                              identityOf(red.getCombineOp().front()) == identity)
+    return liveAlong(red.getOperand(0), axis + (axis >= red.getAxis()), identity);
+  return full;
 }
 
 FailureOr<Value> Raiser::materialize(Gen &g, Value v, ArrayRef<Axis> env) {
@@ -3188,6 +3242,9 @@ FailureOr<std::pair<Value, SmallVector<unsigned>>> Raiser::reduceTensor(Gen &g, 
   TypedAttr identity = identityOf(combiner);
   unsigned axis = red.getAxis();
   int64_t extent = shapeOf(red.getOperand(0).getType())[axis];
+  // A padded tile (BLOCK > N, masked to the identity) reduces over its live prefix.
+  if (identity && n == 1)
+    extent = std::max<int64_t>(1, liveAlong(red.getOperand(0), axis, identity));
   // Every operand at reduction index `r`.
   auto operandsAt = [&](Gen &gg, ArrayRef<int> remap, Axis r) -> FailureOr<SmallVector<Value>> {
     SmallVector<Axis> in = remapEnv(env, remap);
