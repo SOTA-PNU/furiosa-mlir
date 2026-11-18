@@ -20,6 +20,9 @@ npu stage) against GPU goldens.
 - Raise: a store whose rows are remapped by `//` and `%` by a constant its tile crosses keeps the digits in every
   program instance (6f360ee; ViT's patch rows `n * 197 + 1 + p`). ViT's 88 launches pass L1; its patch embedding then
   stops in codegen (an assertion in the K-loop digit split).
+- Raise: a loop over column tiles of a row the tile does not divide stores at `c0 + arange` (the tile counter takes
+  the column's digits above the tile), and a loop-carried value read inside the loop is the accumulation of the
+  iterations before (7f88f38). `heldout3_cumsum` (exclusive scan) passes L1; both its kernels stop in codegen.
 ## 1.4.0 (2026-11-18, release/1.4.0)
 
 Milestone: kernels the compiler was not written for. The second held-out batch (ten standard ML ops written from their
