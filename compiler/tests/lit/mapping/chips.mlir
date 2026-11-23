@@ -7,7 +7,8 @@
 // w. Mapping gives the kernel the whole buffers, the same on every chip (chip mapping m![2]): it copies its block of x
 // out of them, maps the block as on one chip, and gathers its block of the result into every chip's copy (the
 // all-gather, a DMA across chips). A kernel that reads a buffer it writes (in place) is not split: it runs whole on
-// every chip.
+// every chip. A slice that keeps the split dim whole is a block of its source's block: a pool's window reads split by
+// channel.
 
 // SHARD-LABEL: func.func @mm
 // SHARD-SAME: (%arg0: tensor<32x64xf32> {furiosa.shard = 0 : i64}, %arg1: tensor<64x64xf32>,
@@ -17,6 +18,10 @@
 // SHARD-SAME: ins({{.*}} : tensor<32x64xf32>, tensor<64x64xf32>) outs({{.*}} : tensor<32x64xf32>)
 // SHARD-LABEL: func.func @accumulate
 // SHARD-SAME: (%arg0: tensor<64x64xf32>, %arg1: tensor<64x64xf32>) -> tensor<64x64xf32>
+// SHARD-LABEL: func.func @pool
+// SHARD-SAME: (%arg0: tensor<8x32xf32> {furiosa.shard = 1 : i64}, %arg1: tensor<7x32xf32> {furiosa.shard = 1 : i64})
+// SHARD: tensor.extract_slice %arg0[0, 0] [7, 32] [1, 1] : tensor<8x32xf32> to tensor<7x32xf32>
+// SHARD: tensor.extract_slice %arg0[1, 0] [7, 32] [1, 1] : tensor<8x32xf32> to tensor<7x32xf32>
 
 // CHECK-LABEL: func.func @mm
 // CHECK-SAME: (%arg0: !fopt.hbm<f32, <"2">, <"CHIP{2}, [[R:[A-Z0-9_]+]]{32}, [[C:[A-Z0-9_]+]]{64}">>
@@ -37,6 +42,11 @@
 // CHECK-SAME: ["CHIP", 2]
 // CHECK-SAME: fopt.chip = 2
 // CHECK-NOT: {{(hbm|hbmv|dm|tu)<[a-z0-9]+, <"(1|2)">}}
+// CHECK: return
+// CHECK-LABEL: func.func @pool
+// CHECK-SAME: (%arg0: !fopt.hbm<f32, <"2">, <"[[PR:[A-Z0-9_]+]]{8}, CHIP{2}, [[PC:[A-Z0-9_]+]]{32}">>
+// CHECK-SAME: -> (!fopt.hbm<f32, <"2">, <"{{[A-Z0-9_]+}}{7}, CHIP{2}, {{[A-Z0-9_]+}}{32}">>
+// CHECK: fopt.hbm_to_hbm_view {{.*}} : !fopt.hbmv<f32, <"2">, <"[[PR]]{8}, CHIP{2}, [[PC]]{32}">, false>, !fopt.hbmv<f32, <"CHIP{2}">, <"[[PR]]{8}, [[PC]]{32}">, true>
 // CHECK: return
 
 #x = affine_map<(d0, d1, d2) -> (d0, d2)>
@@ -76,5 +86,19 @@ module attributes {furiosa.chips = 2 : i64} {
       linalg.yield %s : f32
     } -> tensor<64x64xf32>
     return %sum : tensor<64x64xf32>
+  }
+
+  func.func @pool(%x: tensor<8x64xf32>, %y: tensor<7x64xf32>) -> tensor<7x64xf32>
+      attributes {furiosa.written = [1]} {
+    %a = tensor.extract_slice %x[0, 0] [7, 64] [1, 1] : tensor<8x64xf32> to tensor<7x64xf32>
+    %b = tensor.extract_slice %x[1, 0] [7, 64] [1, 1] : tensor<8x64xf32> to tensor<7x64xf32>
+    %e = tensor.empty() : tensor<7x64xf32>
+    %m = linalg.generic {indexing_maps = [#id, #id, #id], iterator_types = ["parallel", "parallel"]}
+        ins(%a, %b : tensor<7x64xf32>, tensor<7x64xf32>) outs(%e : tensor<7x64xf32>) {
+    ^bb0(%p: f32, %q: f32, %c: f32):
+      %r = arith.maximumf %p, %q : f32
+      linalg.yield %r : f32
+    } -> tensor<7x64xf32>
+    return %m : tensor<7x64xf32>
   }
 }

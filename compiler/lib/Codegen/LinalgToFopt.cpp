@@ -505,11 +505,37 @@ struct Split {
   DenseMap<Operation *, unsigned> loops;
 };
 
+/// The dim of `slice`'s result that source dim `d` is, when the slice keeps that dim whole.
+static std::optional<int64_t> sliceResultDim(tensor::ExtractSliceOp slice, int64_t d) {
+  if (slice.getStaticOffsets()[d] != 0 || slice.getStaticStrides()[d] != 1 ||
+      slice.getStaticSizes()[d] != slice.getSourceType().getDimSize(d))
+    return std::nullopt;
+  llvm::SmallBitVector dropped = slice.getDroppedDims();
+  if (dropped.test(d))
+    return std::nullopt;
+  int64_t r = d;
+  for (int64_t i = 0; i < d; ++i)
+    r -= dropped.test(i);
+  return r;
+}
+
+/// The source dim of `slice` that result dim `d` is, when the slice keeps it whole.
+static std::optional<int64_t> sliceSourceDim(tensor::ExtractSliceOp slice, int64_t d) {
+  for (int64_t i = 0, e = slice.getSourceType().getRank(); i < e; ++i)
+    if (std::optional<int64_t> r = sliceResultDim(slice, i); r && *r == d)
+      return i;
+  return std::nullopt;
+}
+
+/// Whether `pad` pads nothing along dim `d`.
+static bool unpadded(tensor::PadOp pad, int64_t d) { return !pad.getStaticLow()[d] && !pad.getStaticHigh()[d]; }
+
 /// Splits dim `dim` of `seed` over `n` chips through `func`: each linalg op computing or reading a split value runs
 /// that loop split, so every value the split reaches is computed block by block, one block per chip, from blocks of
-/// its operands along the same loop (or their whole value where the loop does not index them). Fails where a block
-/// would not be a box of one dim of every operand (a window, the loop's index used as data, an op outside linalg),
-/// or would not divide.
+/// its operands along the same loop (or their whole value where the loop does not index them). A slice that keeps
+/// the dim whole (maxpool's window reads) or a pad that pads other dims is a block of its source's block. Fails
+/// where a block would not be a box of one dim of every operand (a window, the loop's index used as data, another
+/// op outside linalg), or would not divide.
 LogicalResult propagate(func::FuncOp func, Value seed, int64_t dim, int64_t n, Split &s) {
   SmallVector<std::pair<Value, int64_t>> work;
   SmallVector<Value> whole; // read whole by a split op
@@ -582,6 +608,13 @@ LogicalResult propagate(func::FuncOp func, Value seed, int64_t dim, int64_t n, S
       std::optional<unsigned> l = loopOf(op.getIndexingMapMatchingResult(cast<OpResult>(v)), d);
       if (!l || failed(splitOp(op, *l)))
         return failure();
+    } else if (auto slice = v.getDefiningOp<tensor::ExtractSliceOp>()) {
+      std::optional<int64_t> sd = sliceSourceDim(slice, d);
+      if (!sd || failed(mark(slice.getSource(), *sd)))
+        return failure();
+    } else if (auto pad = v.getDefiningOp<tensor::PadOp>()) {
+      if (!unpadded(pad, d) || failed(mark(pad.getSource(), d)))
+        return failure();
     } else if (!v.getDefiningOp<tensor::EmptyOp>()) {
       return failure();
     }
@@ -589,6 +622,17 @@ LogicalResult propagate(func::FuncOp func, Value seed, int64_t dim, int64_t n, S
     for (OpOperand &use : v.getUses()) {
       if (isa<func::ReturnOp>(use.getOwner()))
         continue;
+      if (auto slice = dyn_cast<tensor::ExtractSliceOp>(use.getOwner())) {
+        std::optional<int64_t> rd = sliceResultDim(slice, d);
+        if (!rd || failed(mark(slice.getResult(), *rd)))
+          return failure();
+        continue;
+      }
+      if (auto pad = dyn_cast<tensor::PadOp>(use.getOwner())) {
+        if (use.getOperandNumber() != 0 || !unpadded(pad, d) || failed(mark(pad.getResult(), d)))
+          return failure();
+        continue;
+      }
       auto op = dyn_cast<linalg::LinalgOp>(use.getOwner());
       std::optional<unsigned> l = op ? loopOf(op.getMatchingIndexingMap(&use), d) : std::nullopt;
       if (!l || failed(splitOp(op, *l)))
@@ -602,11 +646,21 @@ LogicalResult propagate(func::FuncOp func, Value seed, int64_t dim, int64_t n, S
 /// and marks the split arguments and results with their dim.
 void applySplit(func::FuncOp func, const Split &s, int64_t n) {
   Builder b(func.getContext());
+  // A split slice's sizes are its result's (the source dim found before the types change).
+  SmallVector<std::pair<tensor::ExtractSliceOp, int64_t>> slices;
+  for (auto [v, d] : s.dims)
+    if (auto slice = v.getDefiningOp<tensor::ExtractSliceOp>())
+      slices.push_back({slice, *sliceSourceDim(slice, d)});
   for (auto [v, d] : s.dims) {
     auto t = cast<RankedTensorType>(v.getType());
     SmallVector<int64_t> shape(t.getShape());
     shape[d] /= n;
     v.setType(t.clone(shape));
+  }
+  for (auto [slice, sd] : slices) {
+    SmallVector<int64_t> sizes(slice.getStaticSizes());
+    sizes[sd] /= n;
+    slice.setStaticSizes(sizes);
   }
   Operation *ret = func.getBody().front().getTerminator();
   for (BlockArgument arg : func.getArguments())
