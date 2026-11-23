@@ -1849,7 +1849,10 @@ void splitGathers(ModuleOp module, function_ref<bool(linalg::GenericOp)> mapsAlo
       if (op && op->getBlock() == &body && ops.insert(op))
         llvm::append_range(work, op->getOperands());
     }
-    if (!data)
+    // An address of the indices alone that no indexing map took (a floor, a flat index over non-adjacent dims of a
+    // buffer) gathers too, from the table hoistIndexOnly makes of it; a constant's reads are the hoisting's own.
+    bool indices = llvm::any_of(ops, [](Operation *op) { return isa<linalg::IndexOp>(op); });
+    if (!data && (!indices || matchPattern(e.getTensor(), m_Constant())))
       return failure();
     SmallVector<Operation *> sorted(ops.begin(), ops.end());
     llvm::sort(sorted, [](Operation *a, Operation *b) { return a->isBeforeInBlock(b); });
@@ -1990,13 +1993,16 @@ void splitElementGathers(ModuleOp module, function_ref<bool(linalg::GenericOp)> 
   for (linalg::GenericOp g : found) {
     Block &body = g.getRegion().front();
     auto extract = body.getTerminator()->getOperand(0).getDefiningOp<tensor::ExtractOp>();
-    // A data-dependent address: some index reads a block argument (affine ones promoted to indexing maps).
+    // A data-dependent address: some index reads a block argument, or the loop indices (an address no indexing map
+    // took: affine ones were promoted, and splitGathers moved the rest here) of a buffer, not a constant table.
     std::function<bool(Value)> data = [&](Value v) {
       if (auto arg = dyn_cast<BlockArgument>(v))
         return arg.getOwner() == &body;
       Operation *op = v.getDefiningOp();
-      return op && op->getBlock() == &body && llvm::any_of(op->getOperands(), data);
+      return op && op->getBlock() == &body && (isa<linalg::IndexOp>(op) || llvm::any_of(op->getOperands(), data));
     };
+    if (matchPattern(extract.getTensor(), m_Constant()))
+      continue;
     auto table = cast<RankedTensorType>(extract.getTensor().getType());
     Type et = table.getElementType();
     int64_t bytes = et.isBF16() ? 2 : et.isIntOrFloat() && et.getIntOrFloatBitWidth() <= 32 ? 4 : 0; // f16, i8: 32-bit
@@ -2046,9 +2052,18 @@ void splitElementGathers(ModuleOp module, function_ref<bool(linalg::GenericOp)> 
       lineId = b.getMultiDimIdentityMap(1);
       Value flat = furiosa::reshapeTo(b, loc, addresses, RankedTensorType::get({count}, i32));
       Value zero = arith::ConstantIntOp::create(b, loc, i32, 0);
-      addresses = tensor::PadOp::create(b, loc, RankedTensorType::get({lines}, i32), flat,
-                                        ArrayRef<OpFoldResult>{b.getIndexAttr(0)},
-                                        ArrayRef<OpFoldResult>{b.getIndexAttr(lines - count)}, zero);
+      // Past 256 rows the row-wise class reads row tiles, which it does not pad: there the addresses are inserted
+      // into zeros, a copy step.
+      if (lines > 256)
+        addresses = tensor::InsertSliceOp::create(b, loc, flat,
+                                                  linalg::FillOp::create(b, loc, zero, empty({lines}, i32)).getResult(0),
+                                                  ArrayRef<OpFoldResult>{b.getIndexAttr(0)},
+                                                  ArrayRef<OpFoldResult>{b.getIndexAttr(count)},
+                                                  ArrayRef<OpFoldResult>{b.getIndexAttr(1)});
+      else
+        addresses = tensor::PadOp::create(b, loc, RankedTensorType::get({lines}, i32), flat,
+                                          ArrayRef<OpFoldResult>{b.getIndexAttr(0)},
+                                          ArrayRef<OpFoldResult>{b.getIndexAttr(lines - count)}, zero);
     }
     unsigned lineRank = lineShape.size();
     auto row = linalg::GenericOp::create(

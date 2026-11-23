@@ -52,7 +52,8 @@ FailureOr<Copy> find(RaisedKernel &kernel) {
     // shortcut: the zero fill relies on the crate allocating a temporary as zeros when a step first writes
     // it in place; a non-zero fill needs a memset.
     auto fill = insert.getDest().getDefiningOp<linalg::FillOp>();
-    if (!c.to && fill && matchPattern(fill.getInputs()[0], m_AnyZeroFloat()) &&
+    if (!c.to && fill &&
+        (matchPattern(fill.getInputs()[0], m_AnyZeroFloat()) || matchPattern(fill.getInputs()[0], m_Zero())) &&
         fill.getOutputs()[0].getDefiningOp<tensor::EmptyOp>())
       c.to = func.getArgument(kernel.written[0]);
     // An insert into an empty tensor writes the box alone: the rest is undefined (other inserts fill it).
