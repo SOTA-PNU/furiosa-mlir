@@ -117,6 +117,10 @@ Attribute foldWith(Value v, BlockArgument arg, Attribute c) {
     Operation *op = x.getDefiningOp();
     if (!op || op->getNumResults() != 1 || op->getBlock() != arg.getOwner())
       return {};
+    // A select whose sides fold alike is that value, whatever its condition (a mask on the other operands).
+    if (auto sel = dyn_cast<arith::SelectOp>(op))
+      if (Attribute t = eval(sel.getTrueValue()); t && t == eval(sel.getFalseValue()))
+        return known[x] = t;
     SmallVector<Attribute> ins;
     for (Value o : op->getOperands()) {
       if (!(a = eval(o)))
@@ -726,8 +730,8 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
       n.op = op;
       n.integer = StringRef(op).ends_with("I");
       n.args = {*t};
-      // A computed term of one input (clean(x) = x > -inf ? x : -inf) whose identity padding it folds to the
-      // identity: padded rows pad that input.
+      // A computed term of one input (clean(x) = x > -inf ? x : -inf), or of several (x masked by a table), whose
+      // identity padding of one input alone folds it to the identity: padded rows pad that input.
       SmallVector<BlockArgument> leaves;
       std::function<void(Value)> collect = [&](Value v) {
         if (auto b = dyn_cast<BlockArgument>(v); b && b.getOwner() == &body) {
@@ -742,9 +746,11 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
       Attribute start;
       if (fill)
         matchPattern(fill.getInputs()[0], m_Constant(&start));
-      if (dag.nodes[*t].kind != Node::Input && leaves.size() == 1 && leaves[0] != acc && start &&
-          scalar.count(leaves[0]) && dag.nodes[scalar[leaves[0]]].kind == Node::Input) {
-        Type at = leaves[0].getType();
+      for (BlockArgument leaf : leaves) {
+        if (dag.nodes[*t].kind == Node::Input || llvm::is_contained(leaves, acc) || !start || !scalar.count(leaf) ||
+            dag.nodes[scalar[leaf]].kind != Node::Input || n.arg >= 0)
+          continue;
+        Type at = leaf.getType();
         Attribute pad;
         if (auto fa = dyn_cast<FloatAttr>(start); fa && isa<FloatType>(at)) {
           llvm::APFloat v = fa.getValue();
@@ -754,8 +760,8 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
         } else if (isa<IntegerAttr>(start) && at == cast<IntegerAttr>(start).getType()) {
           pad = start;
         }
-        if (pad && foldWith(term, leaves[0], pad) == start)
-          n.arg = scalar[leaves[0]];
+        if (pad && foldWith(term, leaf, pad) == start)
+          n.arg = scalar[leaf];
       }
       n.shape = Shape::Row;
       result = dag.add(n);
