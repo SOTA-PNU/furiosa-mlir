@@ -985,7 +985,40 @@ struct StoreSpace {
   std::vector<SmallVector<int64_t>> origin;
   SmallVector<Value> dataMask; // mask terms that depend on data: the write keeps the old value where one fails
   unsigned programDims = 0;    // trailing view dims that are program ids (free dims), reduced over
+  // An atomic whose address adds data: the stored axes the data varies along (folded over at each element) and the
+  // leading view dims the data selects (spanned whole, no axis moves along them).
+  SmallVector<unsigned> dataAxes, dataDims;
 };
+
+/// A constant every value of the integer `v` is a multiple of, read off its constant factors (a row index times the
+/// row length) through shape ops and sign extensions; 0 for zero, 1 when none is known.
+static int64_t factorOf(Value v) {
+  Operation *d = v.getDefiningOp();
+  if (!d)
+    return 1;
+  if (isa<tt::SplatOp, tt::BroadcastOp, tt::ExpandDimsOp, tt::ReshapeOp, tt::TransOp, arith::ExtSIOp>(d))
+    return factorOf(d->getOperand(0));
+  if (isa<arith::ConstantOp>(d)) {
+    auto c = getConstantIntValue(d->getResult(0));
+    return c ? std::abs(*c) : 1;
+  }
+  if (isa<arith::MulIOp>(d))
+    return factorOf(d->getOperand(0)) * factorOf(d->getOperand(1));
+  if (isa<arith::AddIOp, arith::SubIOp>(d))
+    return std::gcd(factorOf(d->getOperand(0)), factorOf(d->getOperand(1)));
+  return 1;
+}
+
+/// The axes of an index of `s` that its data terms vary along.
+static SmallVector<unsigned> dataAxesOf(const Sym &s) {
+  SmallVector<unsigned> axes;
+  for (unsigned i = 0; i < s.shape.size(); ++i)
+    if (llvm::any_of(s.data, [&](const DataTerm &t) {
+          return t.axisOf[i] >= 0 && shapeOf(t.value.getType())[t.axisOf[i]] > 1;
+        }))
+      axes.push_back(i);
+  return axes;
+}
 
 /// A write mask taken apart over its `and`s: the index predicates (conds, never) decide where it can
 /// write; the terms that depend on data are left in `data` for the write to select on.
@@ -1445,8 +1478,19 @@ FailureOr<StoreSpace> Raiser::storeSpace(Write store, ArrayRef<int64_t> extraStr
   shape.append(vshape.begin(), vshape.end());
   unsigned rank = shape.size();
   const Sym *p0 = act[0]->get(store.getPtr());
-  if (!p0 || p0->kind != Sym::Ptr || !p0->data.empty())
+  // An atomic whose address adds data (run): its space is the one its index part writes with the data axes held at
+  // 0, and the leading view dims the data selects (scatterDims below).
+  bool scatter = p0 && isa<tt::AtomicRMWOp>(store.getOperation()) && !p0->data.empty();
+  if (!p0 || p0->kind != Sym::Ptr || (!p0->data.empty() && !scatter))
     return store.emitError("furiosa: store address is not an affine function of program ids and axes"), failure();
+  SmallVector<unsigned> dataAxes = scatter ? dataAxesOf(*p0) : SmallVector<unsigned>();
+  SmallVector<int64_t> withScale(extraStrides);
+  int64_t scale = 0; // the data's common factor
+  for (const DataTerm &t : p0->data)
+    scale = std::gcd(scale, factorOf(t.value));
+  if (scatter && scale > 1)
+    withScale.push_back(scale);
+  extraStrides = withScale;
   int arg = p0->base;
   const BufferInfo &buf = buffers[arg];
   int64_t numel = buf.numel();
@@ -1466,11 +1510,13 @@ FailureOr<StoreSpace> Raiser::storeSpace(Write store, ArrayRef<int64_t> extraStr
   std::vector<SmallVector<int64_t>> extentsOf(act.size());
   for (auto [n, ev] : llvm::enumerate(act)) {
     const Sym *p = ev->get(store.getPtr());
-    if (!p || p->kind != Sym::Ptr || p->base != arg || !p->data.empty())
+    if (!p || p->kind != Sym::Ptr || p->base != arg || p->data != p0->data)
       return store.emitError("furiosa: store base differs between program instances"), failure();
     for (unsigned id : encl)
       extentsOf[n].push_back(ev->trips.lookup(id));
     extentsOf[n].append(vshape.begin(), vshape.end());
+    for (unsigned a : dataAxes)
+      extentsOf[n][nl + a] = 1;
     // Over this instance's ranges of the loop counters and axes, digits resolve ((pid + 4 t) mod 32
     // floordiv 4 = t when the address stays below 32).
     SmallVector<Interval> ranges;
@@ -1484,7 +1530,8 @@ FailureOr<StoreSpace> Raiser::storeSpace(Write store, ArrayRef<int64_t> extraStr
       SmallVector<Value> data;
       splitMask(store.getMask(), [&](Value v) { return ev->get(v); }, conds, never, data);
       for (AffineExpr c : conds)
-        maskConds[n].push_back(simplify(c.replaceDimsAndSymbols(toDims, toSyms), rank, 0));
+        if (llvm::none_of(dataAxes, [&](unsigned a) { return c.isFunctionOfDim(a); })) // the fold checks those
+          maskConds[n].push_back(simplify(c.replaceDimsAndSymbols(toDims, toSyms), rank, 0));
       maskNever[n] = never;
       if (n == 0)
         dataMask = data;
@@ -1844,8 +1891,34 @@ FailureOr<StoreSpace> Raiser::storeSpace(Write store, ArrayRef<int64_t> extraStr
         if (attempt == 1)
           probeOrigins.clear();
         auto sp = tryView(st, dimOf, span, crossed, attempt == 1 ? &probeOrigins : nullptr);
-        if (sp)
+        if (sp && !scatter)
           return *sp;
+        if (sp) {
+          // The data selects the leading view dims the index part leaves at 0 in every instance, when it moves in
+          // whole steps of the last: they span their extent, and each element folds the lanes whose data lands there.
+          unsigned j = 0;
+          while (j < sp->freeDims.size() && sp->freeDims[j] == j &&
+                 llvm::all_of(sp->origin, [&](auto &o) { return o[sp->global.size() + j] == 0; }))
+            ++j;
+          if (!j || scale % sp->viewStrides[j - 1])
+            return store.emitError("furiosa: an atomic address adds data that does not select rows of its buffer"),
+                   failure();
+          sp->dataAxes = dataAxes;
+          bool full = true;
+          for (unsigned d = 0; d < sp->viewShape.size(); ++d) {
+            if (d < j) {
+              sp->dataDims.push_back(d);
+              sp->boxLo[d] = 0;
+              sp->boxHi[d] = sp->viewShape[d] - 1;
+            }
+            full &= sp->boxHi[d] - sp->boxLo[d] + 1 == sp->viewShape[d];
+          }
+          sp->full = full;
+          sp->freeDims.erase(sp->freeDims.begin(), sp->freeDims.begin() + j);
+          for (auto &o : sp->origin)
+            o.erase(o.begin() + sp->global.size(), o.begin() + sp->global.size() + j);
+          return *sp;
+        }
         if (why == "two stores of the grid write the same element" || why == "the store never writes")
           return store.emitError("furiosa: ") << why, failure();
         int widen = -1;
@@ -4078,6 +4151,57 @@ LogicalResult Raiser::raiseStoreIn(Write store, const StoreSpace &spRef) {
       SmallVector<utils::IteratorType>(nd, utils::IteratorType::parallel), [&](OpBuilder &ob, Location, ValueRange args) {
         g.ob = &ob;
         g.index.assign(nd, Value());
+        if (!sp->dataDims.empty()) {
+          // An atomic whose address adds data: each element folds, from its old value, the lanes along the data axes
+          // whose address lands on it (the data selecting its row of the data dims, the index part its place in it).
+          SmallVector<unsigned> all;
+          for (unsigned d = 0; d < nd; ++d)
+            all.push_back(d);
+          SmallVector<int64_t> vshape = shapeOf(store.getValue().getType()), lanes;
+          for (unsigned a : sp->dataAxes)
+            lanes.push_back(vshape[a]);
+          Value flatOld = flatOf(current[arg], arg);
+          auto linear = [&](Gen &gg, ArrayRef<int> remap, ArrayRef<unsigned> dims) {
+            Value at = arith::ConstantIndexOp::create(*gg.ob, loc, 0);
+            for (unsigned d : dims)
+              at = arith::AddIOp::create(*gg.ob, loc, at,
+                                         arith::MulIOp::create(*gg.ob, loc, index(gg, remap[d]),
+                                                               arith::ConstantIndexOp::create(*gg.ob, loc, sp->viewStrides[d])));
+            return at;
+          };
+          SmallVector<unsigned> viewDims(all.begin(), all.begin() + nv);
+          auto built = buildGeneric(
+              g, all, lanes, {}, elem,
+              [&](Gen &gi, ArrayRef<int> remap) -> FailureOr<Value> {
+                return tensor::ExtractOp::create(*gi.ob, loc, flatOld, linear(gi, remap, viewDims)).getResult();
+              },
+              [&](Gen &gg, Value acc, ArrayRef<int> remap) -> FailureOr<Value> {
+                SmallVector<Axis> e = remapEnv(env, remap);
+                for (auto [k, a] : llvm::enumerate(sp->dataAxes)) {
+                  e[a].kind = Axis::Iter;
+                  e[a].dim = gg.extent.size() - lanes.size() + k;
+                }
+                auto x = emit(gg, store.getValue(), e);
+                auto delta = emitDataTerms(gg, *act[0]->get(store.getPtr()), e);
+                auto on = store.getMask() ? emit(gg, store.getMask(), e) : FailureOr<Value>(Value());
+                if (failed(x) || failed(delta) || failed(on))
+                  return failure();
+                Value hit = arith::CmpIOp::create(*gg.ob, loc, arith::CmpIPredicate::eq, *delta, linear(gg, remap, sp->dataDims));
+                if (*on)
+                  hit = arith::AndIOp::create(*gg.ob, loc, hit, *on);
+                return arith::SelectOp::create(*gg.ob, loc, hit, combine(*gg.ob, acc, *x), acc).getResult();
+              });
+          if (failed(built)) {
+            status = failure();
+            linalg::YieldOp::create(ob, loc, ValueRange{args[0]});
+            return;
+          }
+          SmallVector<Value> idx;
+          for (unsigned d : built->second)
+            idx.push_back(linalg::IndexOp::create(ob, loc, d));
+          linalg::YieldOp::create(ob, loc, ValueRange{tensor::ExtractOp::create(ob, loc, built->first, idx).getResult()});
+          return;
+        }
         auto v = emit(g, store.getValue(), env);
         if (failed(v)) {
           status = failure();
@@ -4322,15 +4446,29 @@ LogicalResult Raiser::run() {
       // mask on data (Triton's float max/min through an i32 pointer and a sign mask stays in rounds).
       const Sym *p0 = instances[0]->get(st.getPtr());
       bool sameElements = getElementTypeOrSelf(st.getValue().getType()) == buffers[p0->base].elem;
+      // An address that adds data (an embedding gradient's row ids[t] * D) writes, in each instance, the elements its
+      // index part selects in the rows the data selects: a fold over the lanes the data varies along at each element
+      // of those rows (storeSpace, raiseStoreIn). Rounds go by the index part: two instances whose index parts write
+      // disjoint elements write disjoint elements whatever the data.
+      SmallVector<unsigned> dataAxes = dataAxesOf(*p0);
+      if (!p0->data.empty()) {
+        auto rmw = dyn_cast<tt::AtomicRMWOp>(st.getOperation());
+        if (!rmw || rmw.getAtomicRmwOp() == tt::RMWOp::XCHG || !st->use_empty() || !sameElements ||
+            llvm::any_of(dataAxes, [&](unsigned a) { return p0->expr.isFunctionOfDim(a); }))
+          return st.emitError("furiosa: an atomic address depends on data (raised as a read-modify-write of the "
+                              "buffer's type whose old value is unused, its data on axes the rest does not use)");
+        sameElements = false;
+      }
       for (Evaluator *ev : instances) {
         const Sym *p = ev->get(st.getPtr());
-        if (!p->data.empty())
-          return st.emitError("furiosa: an atomic address depends on data");
+        if (p->data != p0->data)
+          return st.emitError("furiosa: an atomic address adds different data in different program instances");
         SmallVector<AffineExpr> conds; // where it may write: the data terms of its mask only narrow that
         bool never = false;
         SmallVector<Value> data;
         if (st.getMask())
           splitMask(st.getMask(), [&](Value v) { return ev->get(v); }, conds, never, data);
+        llvm::erase_if(conds, [&](AffineExpr c) { return llvm::any_of(dataAxes, [&](unsigned a) { return c.isFunctionOfDim(a); }); });
         sameElements &= data.empty();
         std::set<int64_t> addrs;
         SmallVector<int64_t> at(shape.size(), 0);
