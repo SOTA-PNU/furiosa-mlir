@@ -13,7 +13,10 @@ TORCHVISION = {
     "efficientnet_b0": ("EfficientNet_B0_Weights", "IMAGENET1K_V1"),
     "convnext_tiny": ("ConvNeXt_Tiny_Weights", "IMAGENET1K_V1"),
 }
-HUGGINGFACE = {"qwen3_0_6b": ("Qwen/Qwen3-0.6B", "c1899de289a04d12100db370d81485cdf75e47ca")}
+HUGGINGFACE = {
+    "qwen3_0_6b": ("Qwen/Qwen3-0.6B", "c1899de289a04d12100db370d81485cdf75e47ca"),
+    "bert_base": ("google-bert/bert-base-uncased", "86b5e0934494bd15c9632b12f734a8a67f723594"),
+}
 
 
 def version(loader: str, case: str) -> str:

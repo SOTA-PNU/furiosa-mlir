@@ -110,4 +110,9 @@ CASES = {
     # next_token is an integer output, so it must match exactly.
     "qwen3_0_6b": Case("models/qwen3_0_6b.py", weights="huggingface", int_ranges={"input_ids": (0, 151936)},
                        graph=Tol(rtol=3e-2, atol=0), npu=Tol(rtol=5.4e-2, atol=0)),
+    # Held-out Hugging Face models (fp32 checkpoints), by the fp32 models' rule: twice the drift of the same
+    # Triton graph run in bf16 on the GPU, at the worst output (measured: bert_base pooler_output 3.2%,
+    # last_hidden_state 1.0% of max|out|); integer outputs are exact.
+    "bert_base": Case("models/bert_base.py", weights="huggingface", npu=Tol(rtol=6.4e-2, atol=0),
+                      int_ranges={"input_ids": (0, 30522), "token_type_ids": (0, 2), "lengths": (1, 129)}),
 }
