@@ -132,6 +132,9 @@ npu stage) against GPU goldens.
 - Row-wise: a stored K loop (a contraction over K > 1024) is not a row tile nest, and the class declines it
   (9d69cb4). fold() had dereferenced the empty nest: undefined behavior that crashed or mapped from run to run, in
   every SwiGLU from Qwen3-1.7B up. Those SwiGLUs now map.
+- Normalize: a long reduction whose input is read at 0 in a unit dim is reshaped before the split (18ae9a9). The
+  upstream split asserted (`cast<AffineDimExpr>`) on RMSNorm with residual run as one program at hidden >= 2048, in
+  every Qwen3 size from 1.7B and Qwen2.5-7B; those kernels now map.
 - Golden data keeps checkpoint weights by reference (55b474a): a golden of a case with `weights=` stores only its
   inputs and states; every consumer (the harness's levels, `furiosa_compiler.l1`/`l1_launch`, the crate's run_graph)
   reads full inputs restored from the pinned checkpoint into a cache, bit-identical to the old files. Old goldens
