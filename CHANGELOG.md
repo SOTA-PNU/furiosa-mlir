@@ -102,6 +102,13 @@ npu stage) against GPU goldens.
     inf, so a float form keeps its diagnostic.
   `heldout3_cumsum` passes L1 to L4 (exact). The matrix is unchanged (its scans and reductions pass 171 of 171 on
   npu3); upsample and sliding-window attention merge some steps and pass L4.
+- Held-out models, wave 2 (written from the math by authors who did not read the compiler, checked on the GPU
+  against torchvision's own model: top-1 identical on the golden input and a real photo):
+  - EfficientNet-B0 (7fed84b): MBConv with strided 3x3/5x5 depthwise convs, squeeze-and-excitation, SiLU, explicit
+    batch norm; 83 launches; max|logit diff| 2.7e-6, NPU tolerance rtol 7.4e-2.
+  - ConvNeXt-Tiny (1473bd7): 7x7 depthwise conv into channels-last rows, LayerNorm over channels, erf GELU, layer
+    scale with a transposed store, patch-GEMM stem and downsampling; 83 launches; max|logit diff| 2.9e-6, rtol
+    1.5e-2.
 ## 1.4.0 (2026-11-18, release/1.4.0)
 
 Milestone: kernels the compiler was not written for. The second held-out batch (ten standard ML ops written from their
