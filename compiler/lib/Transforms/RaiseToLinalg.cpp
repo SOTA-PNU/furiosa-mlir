@@ -401,6 +401,12 @@ struct DataTerm {
   bool operator==(const DataTerm &o) const { return value == o.value && axisOf == o.axisOf && sign == o.sign; }
 };
 
+/// A loop counted from a base common to every instance: counter t is base + step * t in each, and an instance runs
+/// the iterations from its own lower bound on (Raiser::evaluate).
+struct Rebase {
+  int64_t base, step;
+};
+
 /// The symbolic value of an integer, pointer or i1 SSA value in one program instance. Dims are the
 /// value's tensor axes; symbols are the iteration counts of scf.for loops (numbered per kernel).
 struct Sym {
@@ -445,6 +451,9 @@ public:
   }
 
   DenseMap<unsigned, int64_t> trips;    // per loop id: its trip count in this instance
+  DenseMap<unsigned, int64_t> lowers;   // per loop id: its lower bound in this instance
+  DenseMap<unsigned, int64_t> firsts;   // per rebased loop id: the first iteration this instance runs
+  const std::map<unsigned, Rebase> *rebase = nullptr; // per loop id (Raiser::evaluate)
   DenseMap<Operation *, bool> taken;     // per scf.if: whether this instance took its then-branch
   DenseSet<Operation *> executed;        // the stores (and atomics) this instance runs
 
@@ -790,6 +799,19 @@ private:
       return getConstantIntValue(v);
     };
     auto lb = bound(f.getLowerBound()), ub = bound(f.getUpperBound()), step = bound(f.getStep());
+    if (unsigned id = loopIds.lookup(f); rebase && rebase->count(id)) {
+      Rebase r = rebase->at(id);
+      int64_t base = r.base, st = r.step;
+      setInt(f.getInductionVar(), cst(base) + getAffineSymbolExpr(id, ctx) * st);
+      if (symbolic) // the first iteration depends on the program: carried indices have no closed form
+        return evalBody(f, id, std::nullopt, std::nullopt);
+      if (!lb || !ub || step != st)
+        return fail(f.getOperation(), "furiosa: loop bounds vary inside a program instance");
+      trips[id] = std::max<int64_t>(0, (*ub - base + st - 1) / st);
+      lowers[id] = *lb;
+      firsts[id] = (*lb - base) / st;
+      return evalBody(f, id, trips[id], firsts[id]);
+    }
     if (symbolic && step && *step > 0 && (!lb || !ub)) {
       // Program-dependent bounds: keep the counter's expression, the trip count is not needed here.
       const Sym *l = get(f.getLowerBound());
@@ -804,6 +826,7 @@ private:
     unsigned id = loopIds.lookup(f);
     int64_t trip = std::max<int64_t>(0, (*ub - *lb + *step - 1) / *step);
     trips[id] = trip;
+    lowers[id] = *lb;
     setInt(f.getInductionVar(), cst(*lb) + getAffineSymbolExpr(id, ctx) * *step);
     return evalBody(f, id, trip);
   }
@@ -829,13 +852,14 @@ private:
   }
 
   /// The body of loop `f` (counter symbol `id`): carried indices in closed form, then every op.
-  LogicalResult evalBody(scf::ForOp f, unsigned id, std::optional<int64_t> trip) {
+  LogicalResult evalBody(scf::ForOp f, unsigned id, std::optional<int64_t> trip,
+                         std::optional<int64_t> first = 0) {
     AffineExpr t = getAffineSymbolExpr(id, ctx);
-    // Index-typed iter args (pointer increments): closed form init + t * delta, with delta read off a
+    // Index-typed iter args (pointer increments): closed form init + (t - first) * delta, with delta read off a
     // first evaluation of the body at the initial value.
     SmallVector<unsigned> carried;
     for (auto [i, init] : llvm::enumerate(f.getInitArgs()))
-      if (const Sym *s = get(init)) {
+      if (const Sym *s = get(init); s && first) {
         syms[f.getRegionIterArgs()[i]] = *s;
         carried.push_back(i);
       }
@@ -855,7 +879,7 @@ private:
           continue;
         }
         Sym s = *init;
-        s.expr = init->expr + t * (next->expr - init->expr);
+        s.expr = init->expr + (t - *first) * (next->expr - init->expr);
         syms[f.getRegionIterArgs()[i]] = s;
         affine.push_back(i);
       }
@@ -1143,6 +1167,7 @@ private:
   DenseMap<Operation *, unsigned> loopIds;
   SmallVector<int64_t> loopTrip;
   SmallVector<bool> varTrip;
+  std::map<unsigned, Rebase> rebase; // Evaluator::rebase
   std::vector<std::unique_ptr<Evaluator>> evals;
   // The instances that run the store being raised, with one control path and one store base.
   SmallVector<Evaluator *> act;
@@ -1171,6 +1196,7 @@ private:
   FailureOr<AffineExpr> fitOrigins(Operation *at, const Gen &g, ArrayRef<int64_t> consts);
   FailureOr<SmallVector<AffineExpr>> tripBounds(Gen &g, unsigned id);
   FailureOr<Value> tripGuard(Gen &g, unsigned id, Value t);
+  FailureOr<Value> firstGuard(Gen &g, unsigned id, Value t);
   FailureOr<AffineExpr> rewriteSymbolic(Operation *at, const Gen &g, ArrayRef<Axis> env,
                                         std::function<AffineExpr(const Sym &)> select, Value v);
   Value index(Gen &g, unsigned dim);
@@ -1282,16 +1308,49 @@ LogicalResult Raiser::evaluate() {
     loopIds[f] = loopTrip.size();
     loopTrip.push_back(0);
   });
-  for (int64_t z = 0; z < grid[2]; ++z)
-    for (int64_t y = 0; y < grid[1]; ++y)
-      for (int64_t x = 0; x < grid[0]; ++x) {
-        evals.push_back(std::make_unique<Evaluator>(ctx, ArrayRef<int64_t>{x, y, z}, grid, argIndex, loopIds));
-        if (failed(evals.back()->run(kernel)))
-          return failure();
+  auto run = [&]() -> LogicalResult {
+    evals.clear();
+    for (int64_t z = 0; z < grid[2]; ++z)
+      for (int64_t y = 0; y < grid[1]; ++y)
+        for (int64_t x = 0; x < grid[0]; ++x) {
+          evals.push_back(std::make_unique<Evaluator>(ctx, ArrayRef<int64_t>{x, y, z}, grid, argIndex, loopIds));
+          evals.back()->rebase = &rebase;
+          if (failed(evals.back()->run(kernel)))
+            return failure();
+        }
+    symEval = std::make_unique<Evaluator>(ctx, (unsigned)loopTrip.size(), grid, argIndex, loopIds);
+    symEval->rebase = &rebase;
+    if (failed(symEval->run(kernel)))
+      symEval.reset();
+    return success();
+  };
+  if (failed(run()))
+    return failure();
+  // A loop whose lower bound differs between instances as no expression of the program ids (a window's first key
+  // block, max(start - WINDOW + 1, 0) // BLOCK * BLOCK) counts from the least of them in every instance, each running
+  // the iterations from its own on (tripGuard), when they all lie on one step. Not around a write: its tiles would
+  // start per instance.
+  for (auto [op, id] : loopIds) {
+    auto loop = cast<scf::ForOp>(op);
+    auto step = getConstantIntValue(loop.getStep());
+    std::optional<int64_t> base;
+    bool varies = false;
+    for (auto &ev : evals)
+      if (auto it = ev->lowers.find(id); it != ev->lowers.end()) {
+        varies |= base && *base != it->second;
+        base = std::min(base.value_or(it->second), it->second);
       }
-  symEval = std::make_unique<Evaluator>(ctx, (unsigned)loopTrip.size(), grid, argIndex, loopIds);
-  if (failed(symEval->run(kernel)))
-    symEval.reset();
+    const Sym *lb = symEval ? symEval->get(loop.getLowerBound()) : nullptr;
+    if (!varies || !step || *step <= 0 || (lb && lb->kind == Sym::Int && lb->data.empty()) ||
+        loop->walk([](Operation *w) {
+              return isa<tt::StoreOp, tt::AtomicRMWOp, tt::AtomicCASOp>(w) ? WalkResult::interrupt() : WalkResult::advance();
+            }).wasInterrupted())
+      continue;
+    if (llvm::all_of(evals, [&](auto &ev) { return !ev->lowers.count(id) || (ev->lowers.lookup(id) - *base) % *step == 0; }))
+      rebase[id] = {*base, *step};
+  }
+  if (!rebase.empty() && failed(run()))
+    return failure();
   // A loop's reduction extent is its longest trip; instances with shorter trips mask the rest.
   varTrip.assign(loopTrip.size(), false);
   for (unsigned id = 0; id < loopTrip.size(); ++id) {
@@ -1302,7 +1361,7 @@ LogicalResult Raiser::evaluate() {
       hi = std::max(hi, t);
     }
     loopTrip[id] = hi;
-    varTrip[id] = lo != hi;
+    varTrip[id] = lo != hi || rebase.count(id);
   }
   return success();
 }
@@ -2152,7 +2211,8 @@ FailureOr<SmallVector<AffineExpr>> Raiser::tripBounds(Gen &g, unsigned id) {
   for (Value term : whole ? ArrayRef<Value>() : ArrayRef<Value>(terms)) {
     SmallVector<int64_t> distance;
     for (Evaluator *ev : act) {
-      auto lb = value(ev, loop.getLowerBound()), ub = value(ev, term), step = value(ev, loop.getStep());
+      auto lb = rebase.count(id) ? rebase[id].base : value(ev, loop.getLowerBound());
+      auto ub = value(ev, term), step = value(ev, loop.getStep());
       if (!lb || !ub || !step)
         return loop.emitError("furiosa: a loop bound term is not an index in every instance"), failure();
       distance.push_back(floorDiv(*ub - *lb + *step - 1, *step));
@@ -2174,14 +2234,49 @@ FailureOr<SmallVector<AffineExpr>> Raiser::tripBounds(Gen &g, unsigned id) {
 /// Whether the instance at the current point of `g` runs iteration `t` of loop `id`.
 FailureOr<Value> Raiser::tripGuard(Gen &g, unsigned id, Value t) {
   auto bounds = tripBounds(g, id);
-  if (failed(bounds))
+  auto first = firstGuard(g, id, t);
+  if (failed(bounds) || failed(first))
     return failure();
-  Value active;
+  Value active = *first;
   for (AffineExpr e : *bounds) {
     Value lt = arith::CmpIOp::create(*g.ob, loc, arith::CmpIPredicate::slt, t, exprValue(g, e));
     active = active ? arith::AndIOp::create(*g.ob, loc, active, lt).getResult() : lt;
   }
   return active;
+}
+
+/// For a loop counted from a common base (Raiser::evaluate), whether iteration `t` is at or past the first the instance
+/// at the current point of `g` runs: a fit of the first iterations on the tile origins, else the counter against the
+/// loop's lower bound computed there. Null for another loop.
+FailureOr<Value> Raiser::firstGuard(Gen &g, unsigned id, Value t) {
+  auto it = rebase.find(id);
+  if (it == rebase.end())
+    return Value();
+  scf::ForOp loop;
+  for (auto [op, i] : loopIds)
+    if (i == id)
+      loop = cast<scf::ForOp>(op);
+  OpBuilder &ob = *g.ob;
+  Rebase r = it->second;
+  auto counter = [&]() -> Value { // the loop's counter at iteration t
+    return arith::AddIOp::create(ob, loc, arith::MulIOp::create(ob, loc, t, arith::ConstantIndexOp::create(ob, loc, r.step)),
+                                 arith::ConstantIndexOp::create(ob, loc, r.base));
+  };
+  SmallVector<int64_t> first;
+  for (Evaluator *ev : act)
+    first.push_back(ev->firsts.lookup(id));
+  FailureOr<AffineExpr> fit = failure();
+  {
+    ScopedDiagnosticHandler quiet(ctx, [](Diagnostic &) { return success(); });
+    fit = fitOrigins(loop, g, first);
+  }
+  if (succeeded(fit))
+    return arith::CmpIOp::create(ob, loc, arith::CmpIPredicate::sge, t, exprValue(g, *fit)).getResult();
+  auto lb = emit(g, loop.getLowerBound(), {});
+  if (failed(lb))
+    return failure();
+  Value lo = arith::IndexCastOp::create(ob, loc, ob.getIndexType(), *lb);
+  return arith::CmpIOp::create(ob, loc, arith::CmpIPredicate::sge, counter(), lo).getResult();
 }
 
 Value Raiser::index(Gen &g, unsigned dim) {
@@ -3189,7 +3284,7 @@ FailureOr<Value> Raiser::materialize(Gen &g, Value v, ArrayRef<Axis> env) {
     auto loop = cast<scf::ForOp>(arg.getOwner()->getParentOp());
     unsigned i = arg.getArgNumber() - loop.getNumInductionVars(), id = loopIds.lookup(loop);
     Operation *upd = cast<scf::YieldOp>(loop.getBody()->getTerminator()).getOperand(i).getDefiningOp();
-    if (!upd || upd->getParentOp() != loop.getOperation() || upd->getNumOperands() != 2 ||
+    if (!upd || upd->getParentOp() != loop.getOperation() || upd->getNumOperands() != 2 || rebase.count(id) ||
         !llvm::is_contained(upd->getOperands(), v) ||
         !isa<arith::AddFOp, arith::MulFOp, arith::MaxNumFOp, arith::MinNumFOp, arith::MaximumFOp, arith::MinimumFOp,
              arith::AddIOp, arith::MulIOp, arith::MaxSIOp, arith::MinSIOp, arith::MaxUIOp, arith::MinUIOp,
