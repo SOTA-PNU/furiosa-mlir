@@ -1360,7 +1360,8 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
         need = Fp, form = FpBinary, alu = "FpFma", veOp = op == "add" ? "AddF" : "SubF";
       else
         need = Clip, form = ClipBin, needWay4 = false, alu = "ClipAdd", veOp = "Add";
-    } else if (op == "div" && !st.reversed) {
+    } else if (op == "div") {
+      // c / x (reversed): the same ALUs with the operands swapped (BinaryArgMode::Mode10).
       if (stage <= FpDiv && !alus.count("ReduceFpDiv"))
         need = FpDiv, form = Div, alu = "ReduceFpDiv";
       else
@@ -1419,10 +1420,20 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
     case FpBinary:
       if (op == "neg")
         imm = b.getF32FloatAttr(negImm);
-      s = VectorFpBinaryOp::create(b, loc, stream(f32(), time(), packet()), s, b.getStringAttr(veOp), imm, vrf, stash);
+      if (st.reversed)
+        s = VectorAluOp::create(b, loc, stream(f32(), time(), packet()), s, b.getStringAttr("vector_fp_binary"),
+                                b.getStringAttr("FpBinaryOp::" + veOp), b.getStringAttr("Mode10"), imm, vrf, stash,
+                                ArrayAttr());
+      else
+        s = VectorFpBinaryOp::create(b, loc, stream(f32(), time(), packet()), s, b.getStringAttr(veOp), imm, vrf,
+                                     stash);
       break;
     case Div:
-      s = VectorFpDivOp::create(b, loc, stream(f32(), time(), packet()), s, imm, vrf, stash);
+      if (st.reversed)
+        s = VectorAluOp::create(b, loc, stream(f32(), time(), packet()), s, b.getStringAttr("vector_fp_div"),
+                                b.getStringAttr(""), b.getStringAttr("Mode10"), imm, vrf, stash, ArrayAttr());
+      else
+        s = VectorFpDivOp::create(b, loc, stream(f32(), time(), packet()), s, imm, vrf, stash);
       break;
     case ClipBin:
       s = VectorClipOp::create(b, loc, stream(f32(), time(), packet()), s, b.getStringAttr(veOp), imm, vrf, stash);
