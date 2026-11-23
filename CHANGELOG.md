@@ -23,6 +23,9 @@ npu stage) against GPU goldens.
 - Raise: a loop over column tiles of a row the tile does not divide stores at `c0 + arange` (the tile counter takes
   the column's digits above the tile), and a loop-carried value read inside the loop is the accumulation of the
   iterations before (7f88f38). `heldout3_cumsum` (exclusive scan) passes L1; both its kernels stop in codegen.
+- Normalize: a loop split into the digits a `//` and `%` read takes apart, which only the reduction's carrier spans,
+  reshapes the carrier like an output; a split that would leave a digit unspanned is not made (66d40f0; it asserted
+  in `getStaticLoopRanges`). ViT's patch embedding maps as one contraction; all of vit_b16 passes L2a.
 ## 1.4.0 (2026-11-18, release/1.4.0)
 
 Milestone: kernels the compiler was not written for. The second held-out batch (ten standard ML ops written from their
