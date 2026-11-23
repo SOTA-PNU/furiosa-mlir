@@ -113,6 +113,12 @@ CASES = {
     # next_token is an integer output, so it must match exactly.
     "qwen3_0_6b": Case("models/qwen3_0_6b.py", weights="huggingface", int_ranges={"input_ids": (0, 151936)},
                        graph=Tol(rtol=3e-2, atol=0), npu=Tol(rtol=5.4e-2, atol=0)),
+    # Larger Qwen3 sizes (models/qwen3_0_6b.py at their configs), by the same rule; the two implementations are
+    # the GPU graph and transformers' Qwen3 on the same weights and prompt, at the worst output (that measure
+    # gives 3.05% for 0.6B): graph = the drift, npu = twice it. A seed other than 0 is the first whose golden
+    # greedy tokens both lead the runner-up by more than the two implementations' logits differ.
+    "qwen3_1_7b": Case("models/qwen3_1_7b.py", weights="huggingface", int_ranges={"input_ids": (0, 151936)},
+                       graph=Tol(rtol=2.5e-2, atol=0), npu=Tol(rtol=5e-2, atol=0), seed=2),  # 2.47% kv_cache.14.v
     # Held-out Hugging Face models (fp32 checkpoints), by the fp32 models' rule: twice the drift of the same
     # Triton graph run in bf16 on the GPU, at the worst output (measured: bert_base pooler_output 3.2%,
     # last_hidden_state 1.0% of max|out|); integer outputs are exact.
