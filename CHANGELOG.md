@@ -33,6 +33,24 @@ npu stage) against GPU goldens.
   rejected the kernel at the NPU build after the mapping was accepted), and a 0/1 mask table is no contraction
   operand (2a32c04): a masked f32 sum went through the bf16 contraction path and was off by 1e-3. Steps marks the
   tables it externalizes. `heldout3_batch_norm` passes L1 to L4 (rel 4.4e-7).
+- Raise, four general mechanisms for batch 3 (each with a lit test; corpus and all 907 matrix cases' stages
+  unchanged):
+  - An index no single expression of the coordinates gives (a min/max whose operands' ranges overlap, an index the
+    program instances disagree on) is computed from its operands where it is read (615c338). A check that instances
+    add the same data terms now compares the terms, not only their count.
+  - A loop whose lower bound differs between instances and is no expression of the program ids counts from the
+    least bound, each iteration guarded (5f85e8f).
+  - An atomic whose address adds data (`dw[ids[t] * D + d] += g`) folds, per element, the lanes whose data selects
+    that row, starting from the old value (0ab25cb).
+  - A loop whose bounds are loaded runs over every counter value its loads can reach, guarded by the bounds and the
+    step; accepted only for loops that write nothing and only accumulate (15078aa).
+  `heldout3_avgpool` passes L1 to L4 (rel 0); scatter-add, segment sum and sliding-window attention pass L1 and stop
+  in codegen.
+- N chips, first step (9a12d59): `FURIOSA_CHIPS=N` compiles every kernel for N chips (`#[device(chip = N)]`, the chip
+  mapping in every type) and uploads every buffer to each chip; for now every chip computes the same values.
+  `FURIOSA_VISIBLE_CHIPS` names the NPUs (default the last N). Every run locks each NPU it opens and checks right
+  before that each is idle, waiting otherwise; L4 passes only if the run opened exactly its NPUs. N = 1 is
+  byte-identical. At N = 2 (npu2 and npu3) eight cases pass L4, from vector_add to LeNet-5.
 ## 1.4.0 (2026-11-18, release/1.4.0)
 
 Milestone: kernels the compiler was not written for. The second held-out batch (ten standard ML ops written from their
