@@ -1,9 +1,10 @@
 """Harness level L1: runs a compiled model's raised linalg kernels on the CPU, graph by graph, and
 compares every output and state buffer with golden.
 
-    python -m furiosa_compiler.l1 harness/out/<case>/compiler harness/golden/<case> --rtol R --atol A
+    python -m furiosa_compiler.l1 harness/out/<case>/compiler harness/golden/<case> [--inputs DIR] --rtol R --atol A
 
-Graph i starts from golden inputs i (state included); each launch calls its kernel with every
+Graph i starts from golden inputs i (state included), read from DIR/<i>/inputs.safetensors: a golden that stores
+its checkpoint weights by reference needs DIR from `python -m harness.golden --inputs <case>`. Each launch calls its kernel with every
 pointer-argument buffer and writes the kernel's results back into the buffers it names. Prints one
 JSON line: {"status": "PASS" | "FAIL", "detail": "..."}.
 """
@@ -51,6 +52,16 @@ class Kernels:
                 raise RuntimeError(f"{symbol}: JIT failed: {str(e).strip().splitlines()[0][:300]}") from None
             self.compiled[symbol] = (engine, engine.lookup(name), entry.get("written", []))
         return self.compiled[symbol]
+
+
+def load_inputs(inputs_dir: Path, i: int, graph: dict) -> dict:
+    """Graph i's input, weight and state buffers; every weight must be there (never zeros)."""
+    buffers = tensors.load(inputs_dir / str(i) / "inputs.safetensors")
+    missing = [n for n, b in graph["buffers"].items() if b["kind"] == "weight" and n not in buffers]
+    if missing:
+        raise RuntimeError(f"weights {missing[:3]} not in {inputs_dir}: pass --inputs "
+                           "(python -m harness.golden --inputs <case>)")
+    return buffers
 
 
 def run_graph(graph: dict, buffers: dict, kernels: Kernels) -> None:
@@ -108,18 +119,18 @@ def compare(got: dict, want: dict, rtol: float, atol: float) -> tuple[bool, str]
 STAGES = ("linalg", "structured", "steps", "tiled")
 
 
-def judge(out_dir: Path, golden_dir: Path, rtol: float, atol: float) -> tuple[bool, str]:
+def judge(out_dir: Path, golden_dir: Path, rtol: float, atol: float, inputs_dir: Path | None = None) -> tuple[bool, str]:
     """Both stages must reproduce the golden outputs; the detail reports the raised stage."""
     details = []
     for stage in STAGES:
-        ok, detail = judge_stage(out_dir, golden_dir, rtol, atol, stage)
+        ok, detail = judge_stage(out_dir, golden_dir, rtol, atol, stage, inputs_dir or golden_dir)
         if not ok:
             return False, f"{stage}: {detail}"
         details.append(detail)
     return True, details[0]
 
 
-def judge_stage(out_dir: Path, golden_dir: Path, rtol: float, atol: float, stage: str) -> tuple[bool, str]:
+def judge_stage(out_dir: Path, golden_dir: Path, rtol: float, atol: float, stage: str, inputs_dir: Path) -> tuple[bool, str]:
     graph_file = out_dir / "graph.json"
     if not graph_file.exists():
         return False, f"no {graph_file}"
@@ -130,8 +141,8 @@ def judge_stage(out_dir: Path, golden_dir: Path, rtol: float, atol: float, stage
     kernels = Kernels(out_dir, compiled["kernels"], stage)
     details = []
     for i, graph in enumerate(compiled["graphs"]):
-        buffers = tensors.load(golden_dir / str(i) / "inputs.safetensors")
         try:
+            buffers = load_inputs(inputs_dir, i, graph)
             run_graph(graph, buffers, kernels)
         except RuntimeError as e:
             return False, f"graph {i}: {e}"
@@ -147,11 +158,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("out_dir", type=Path)
     parser.add_argument("golden_dir", type=Path)
+    parser.add_argument("--inputs", type=Path, help="dir of <i>/inputs.safetensors (default: golden_dir)")
     parser.add_argument("--rtol", type=float, default=1e-5)
     parser.add_argument("--atol", type=float, default=1e-5)
     args = parser.parse_args()
     try:
-        ok, detail = judge(args.out_dir, args.golden_dir, args.rtol, args.atol)
+        ok, detail = judge(args.out_dir, args.golden_dir, args.rtol, args.atol, args.inputs)
     except Exception as e:  # noqa: BLE001 - L1 always ends with a verdict line
         ok, detail = False, f"{type(e).__name__}: {e}"
     print(json.dumps({"status": "PASS" if ok else "FAIL", "detail": detail}))

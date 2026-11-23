@@ -20,7 +20,7 @@ from pathlib import Path
 import torch
 from safetensors.torch import load_file
 
-from harness.golden import GOLDEN
+from harness.golden import GOLDEN, inputs_dir
 from harness.registry import CASES
 from tests.harness import ROOT
 
@@ -158,6 +158,10 @@ def build_run_graph(crate: Path, npu: bool) -> tuple[str | None, str]:
 def run_graphs(name: str, crate: Path, npu: bool, tol) -> Result:
     """Runs run_graph for every golden graph index and compares its outputs."""
     meta = json.loads((GOLDEN / name / "meta.json").read_text())
+    try:
+        inputs = inputs_dir(name)
+    except Exception as e:  # noqa: BLE001 - reported as the case's failure
+        return Result("FAIL", f"golden inputs: {e}")
     exe, log = build_run_graph(crate, npu)
     if not exe:
         return Result("FAIL", f"build: {tail(log)}")
@@ -173,7 +177,7 @@ def run_graphs(name: str, crate: Path, npu: bool, tol) -> Result:
             out = OUT / name / ("npu" if npu else "cpu") / str(i) / "outputs.safetensors"
             out.parent.mkdir(parents=True, exist_ok=True)
             out.unlink(missing_ok=True)
-            cmd = [exe, str(i), str(GOLDEN / name / str(i) / "inputs.safetensors"), str(out)]
+            cmd = [exe, str(i), str(inputs / str(i) / "inputs.safetensors"), str(out)]
             trace = out.parent / "openat.trace"
             if npu:  # record every device the run opens: the proof it ran on its NPUs alone
                 cmd = ["strace", "-f", "-qq", "-e", "trace=openat", "-o", str(trace)] + cmd
@@ -216,10 +220,14 @@ def judge(name: str, level: str, impl: str) -> Result:
             return compiled
         if not (GOLDEN / name / "meta.json").exists():
             return Result("SKIP", f"no golden (run: python -m harness.golden {name})")
+        try:
+            inputs = inputs_dir(name)
+        except Exception as e:  # noqa: BLE001 - reported as the case's failure
+            return Result("FAIL", f"golden inputs: {e}")
         # Two checks: every launch on golden inputs (one ulp), then the whole graph chained.
         verdicts = []
         for module, tol in (("furiosa_compiler.l1_launch", case.exact), ("furiosa_compiler.l1", case.graph or case.exact)):
-            cmd = compiler_cmd("-m", module, str(OUT / name / "compiler"), str(GOLDEN / name),
+            cmd = compiler_cmd("-m", module, str(OUT / name / "compiler"), str(GOLDEN / name), "--inputs", str(inputs),
                                "--rtol", str(tol.rtol), "--atol", str(tol.atol))
             code, log = sh(cmd, ROOT, compiler_env())
             try:

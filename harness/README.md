@@ -17,14 +17,33 @@ A case is a pure-Triton file with the same shape as a model file in `models/`: t
 Triton JIT is the reference) and writes, per graph index `i`:
 
 ```
-harness/golden/<case>/<i>/inputs.safetensors    every input, weight and state buffer before graph i
+harness/golden/<case>/<i>/inputs.safetensors    every input, weight (but a checkpoint's) and state buffer before graph i
 harness/golden/<case>/<i>/outputs.safetensors   every output and state buffer after graph i
-harness/golden/<case>/meta.json                 graph names, buffers, Triton version, seed
+harness/golden/<case>/<i>/launches/<j>.safetensors  the buffers launch j binds, after it ran (L1)
+harness/golden/<case>/meta.json                 graph names, buffers, Triton version, seed, weights_version
 ```
 
 Tensors are stored under their graph buffer names, in the dtype and row-major shape the graph
 declares. Graphs run in order on one set of buffers, so state (e.g. a KV cache) carries from graph
 `i` into graph `i + 1`. Inputs are seeded random; `registry.py` can bound integer inputs (token ids).
+
+A case with real weights (`weights=` in `registry.py`) stores them by reference, not in its inputs files: they
+are the pinned checkpoint of `harness/weights.py` (an 8B model's would be 16 GB per graph), and `meta.json`
+records its `weights_version`. Every consumer reads the inputs through `harness.golden.inputs_dir(<case>)`, a dir
+whose `<i>/inputs.safetensors` holds every buffer, weights too: the golden itself when its files hold the weights
+(goldens of seeded random weights, and older goldens), otherwise a copy with the checkpoint's weights restored in
+`/mnt/nvme1n1p2/chacha/golden-cache/<case>/<weights_version>/` (derived data: built from the checkpoint on first
+use, rebuilt when the golden file changes, safe to delete). The harness does this for L1-L4; by hand:
+
+```
+python -m harness.golden --inputs qwen3_0_6b       # prints the dir, building the copy if needed
+python -m furiosa_compiler.l1 harness/out/qwen3_0_6b/compiler harness/golden/qwen3_0_6b --inputs <dir> ...
+run_graph 0 <dir>/0/inputs.safetensors out.safetensors
+```
+
+Recording a large model's golden needs no space for its weights: `python -m harness.golden <case>` writes the
+inputs without them (the checkpoint comes from the Hugging Face cache, `HF_HUB_CACHE`), and the first L1-L4 run
+builds the copy on the cache disk.
 
 ## The crate contract
 
