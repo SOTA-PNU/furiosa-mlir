@@ -321,6 +321,20 @@ bool onlyData(Value v) {
   });
 }
 
+void eraseDead(Block &body) {
+  for (bool erased = true; erased;) {
+    erased = false;
+    SmallVector<Operation *> ops;
+    for (Operation &op : body.without_terminator())
+      ops.push_back(&op);
+    for (Operation *op : llvm::reverse(ops))
+      if (op->use_empty() && isPure(op)) {
+        op->erase();
+        erased = true;
+      }
+  }
+}
+
 /// Hoists the index-only values of one generic; returns the generic that replaces it (or the same one).
 linalg::GenericOp hoist(linalg::GenericOp generic) {
   Block &body = generic.getRegion().front();
@@ -353,6 +367,7 @@ linalg::GenericOp hoist(linalg::GenericOp generic) {
   SmallVector<Value> constants;
   SmallVector<AffineMap> maps;
   SmallVector<Value> replaced;
+  bool folds = false;
   for (Value v : frontier) {
     SmallVector<unsigned> dims = dimsOf(v, body);
     SmallVector<int64_t> shape;
@@ -390,11 +405,24 @@ linalg::GenericOp hoist(linalg::GenericOp generic) {
     }
     if (!ok)
       continue;
-    if (dims.empty()) {
-      // No dim: an ordinary constant, folded in place.
+    if (llvm::all_equal(elements)) {
+      // No dim, or the same value at every point (a mask true over the whole range): an ordinary constant, and
+      // what it makes trivial (x * 1, a select on it) folds.
       OpBuilder inner = OpBuilder::atBlockBegin(&body);
       Attribute c = widened ? b.getIntegerAttr(t, cast<IntegerAttr>(elements.front()).getInt()) : elements.front();
-      v.replaceAllUsesWith(arith::ConstantOp::create(inner, v.getLoc(), cast<TypedAttr>(c)));
+      Value k = arith::ConstantOp::create(inner, v.getLoc(), cast<TypedAttr>(c));
+      v.replaceAllUsesWith(k);
+      if (dims.empty())
+        continue;
+      for (Operation *user : llvm::to_vector(k.getUsers())) {
+        SmallVector<OpFoldResult> folded;
+        if (user->getNumResults() == 1 && !isIndexOnly(user->getResult(0), body, memo) &&
+            succeeded(user->fold(folded)) && folded.size() == 1 && isa<Value>(folded[0])) {
+          user->getResult(0).replaceAllUsesWith(cast<Value>(folded[0]));
+          user->erase();
+          folds = true;
+        }
+      }
       continue;
     }
     auto type = RankedTensorType::get(shape, tt);
@@ -405,8 +433,11 @@ linalg::GenericOp hoist(linalg::GenericOp generic) {
     maps.push_back(AffineMap::get(ranges.size(), 0, results, b.getContext()));
     replaced.push_back(v);
   }
-  if (constants.empty())
+  if (constants.empty()) {
+    if (folds)
+      eraseDead(body);
     return generic;
+  }
 
   // The generic again, reading the tables as extra inputs.
   SmallVector<Value> inputs(generic.getDpsInputs());
@@ -437,18 +468,7 @@ linalg::GenericOp hoist(linalg::GenericOp generic) {
   }
   generic.replaceAllUsesWith(replacement.getResults());
   generic.erase();
-  // The computations that only fed the tables are dead now.
-  for (bool erased = true; erased;) {
-    erased = false;
-    SmallVector<Operation *> ops;
-    for (Operation &op : moved.without_terminator())
-      ops.push_back(&op);
-    for (Operation *op : llvm::reverse(ops))
-      if (op->use_empty() && isPure(op)) {
-        op->erase();
-        erased = true;
-      }
-  }
+  eraseDead(moved); // the computations that only fed the tables
   return replacement;
 }
 
