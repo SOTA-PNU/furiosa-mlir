@@ -312,12 +312,15 @@ void selectsToArithmetic(Block &body) {
 }
 
 /// Whether an index-typed value only computes data (it reaches no tensor address): an index value feeding
-/// arithmetic that is cast back to an integer, like tl.arange(..) + x on i32s.
+/// arithmetic that is cast back to an integer, like tl.arange(..) + x on i32s, or compared (with loaded bounds).
 bool onlyData(Value v) {
   return llvm::all_of(v.getUsers(), [](Operation *user) {
+    if (isa<arith::CmpIOp>(user))
+      return true;
     if (isa<arith::IndexCastOp>(user))
       return !user->getResult(0).getType().isIndex() || onlyData(user->getResult(0));
-    return isa<arith::AddIOp, arith::SubIOp, arith::MulIOp, arith::MaxSIOp, arith::MinSIOp>(user) && onlyData(user->getResult(0));
+    return isa<arith::AddIOp, arith::SubIOp, arith::MulIOp, arith::MaxSIOp, arith::MinSIOp, arith::AndIOp>(user) &&
+           onlyData(user->getResult(0));
   });
 }
 
