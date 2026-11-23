@@ -135,6 +135,8 @@ npu stage) against GPU goldens.
 - Normalize: a long reduction whose input is read at 0 in a unit dim is reshaped before the split (18ae9a9). The
   upstream split asserted (`cast<AffineDimExpr>`) on RMSNorm with residual run as one program at hidden >= 2048, in
   every Qwen3 size from 1.7B and Qwen2.5-7B; those kernels now map.
+- A raise failure's diagnostics travel in its exception (d705248): the harness line shows the first error instead of
+  "PassManager::run failed".
 - Golden data keeps checkpoint weights by reference (55b474a): a golden of a case with `weights=` stores only its
   inputs and states; every consumer (the harness's levels, `furiosa_compiler.l1`/`l1_launch`, the crate's run_graph)
   reads full inputs restored from the pinned checkpoint into a cache, bit-identical to the old files. Old goldens
