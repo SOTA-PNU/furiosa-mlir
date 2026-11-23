@@ -90,6 +90,18 @@ npu stage) against GPU goldens.
     50 GB of memory. The corpus's largest is 40M.
   Six corpus cases change fopt (group norm, layer-norm and rmsnorm backward, add + layer norm, the layer-norm
   tutorial, Qwen3-0.6B) and pass L0 to L4; the matrix is unchanged.
+- Cumulative sums over rows that do not divide the slices:
+  - Row-wise: a pass reads at most 5 VRF operands (d72932a). The NPU build refuses a sixth ("cannot load more than
+    5"), but the CPU emulation accepts it, so L3 passed where L2 failed.
+  - Row-wise: rows whose dims do not divide the 256 slices map padded or in windows of an inner dim, tried after the
+    tiled class so nothing it maps moves, and never for a contraction of two buffers (fe5055f; cumsum's [19, 300]
+    rows as windows of 300 with 19 padded to 32, one device loop of 50).
+  - Normalize: a guarded integer reduction step `select(p, acc + t, acc)` adds `select(p, t, 0)` (d00ed6e); an
+    integer padding read through a reshape is a copy step (4f9ed25); a loop splits into digits whose place does not
+    divide it, padded to whole digits and sliced back (072e14e). Integers only: for floats, the skipped term may be
+    inf, so a float form keeps its diagnostic.
+  `heldout3_cumsum` passes L1 to L4 (exact). The matrix is unchanged (its scans and reductions pass 171 of 171 on
+  npu3); upsample and sliding-window attention merge some steps and pass L4.
 ## 1.4.0 (2026-11-18, release/1.4.0)
 
 Milestone: kernels the compiler was not written for. The second held-out batch (ten standard ML ops written from their
