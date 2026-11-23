@@ -54,6 +54,14 @@ npu stage) against GPU goldens.
 - Tiled class: a K window over a dim the K blocks do not divide (32 keys of 100) reads a copy padded to whole blocks
   (984cc71; furiosa-dma had failed with "an inner contraction digit wider than its padded extent"). Only kernels
   that failed so take the copy. `heldout3_sliding_window_attention` passes L1 to L4 (rel 0.0024, tolerance 6.4e-3).
+- N chips, splitting (2a5fbb4): with `FURIOSA_CHIPS=N > 1`, `furiosa-shard` splits one parallel dim of every
+  kernel over the chips. It traces each result's dims, outermost first, through the kernel's linalg ops; a window,
+  a loop index used as data, a reduction loop, an op outside linalg, a block N does not divide, or a block that does
+  not map to fopt refuses a dim (`FURIOSA_DEBUG=1` says why). Chip c gets block c of each split argument by one
+  HBM-to-HBM DMA, and each split result is all-gathered into every chip's copy by one DMA across chips; a kernel
+  with no dim to split, or one that reads a buffer it writes, runs whole on every chip. N = 1 is unchanged. At
+  N = 2 on npu2 and npu3 the micro kernels, all tutorials, 19 held-out kernels, LeNet-5, AlexNet, VGG16,
+  ResNet-101 and MobileNetV3 pass L4 against the same goldens.
 ## 1.4.0 (2026-11-18, release/1.4.0)
 
 Milestone: kernels the compiler was not written for. The second held-out batch (ten standard ML ops written from their
