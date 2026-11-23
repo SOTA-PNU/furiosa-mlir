@@ -62,6 +62,15 @@ npu stage) against GPU goldens.
   with no dim to split, or one that reads a buffer it writes, runs whole on every chip. N = 1 is unchanged. At
   N = 2 on npu2 and npu3 the micro kernels, all tutorials, 19 held-out kernels, LeNet-5, AlexNet, VGG16,
   ResNet-101 and MobileNetV3 pass L4 against the same goldens.
+- Selections and row-wise terms for MoE gating and segment offsets:
+  - A seeded selection reduction (`tl.argmax`'s form) may compare a value computed from the element, other inputs
+    and the index (softmax probabilities, a second pick masked to -1), when the seed computes it op for op at
+    element 0 (8b59f24).
+  - A masked term over padded rows pads the one input whose identity padding folds the term (f84756a; segment
+    offsets over 13 columns padded to 16).
+  - A column input streams where it meets a row value (`cols == pick[:, None]`); `tl.histogram`'s values stream so
+    too, with no relayout step (e3286a2).
+  `heldout3_moe_topk_gating` passes L1 to L4 (rel 9.8e-8); segment sum's offsets kernel maps and is exact on npu3.
 ## 1.4.0 (2026-11-18, release/1.4.0)
 
 Milestone: kernels the compiler was not written for. The second held-out batch (ten standard ML ops written from their
