@@ -398,6 +398,7 @@ struct DataTerm {
   Value value;
   SmallVector<int> axisOf;
   int sign = 1;
+  bool operator==(const DataTerm &o) const { return value == o.value && axisOf == o.axisOf && sign == o.sign; }
 };
 
 /// The symbolic value of an integer, pointer or i1 SSA value in one program instance. Dims are the
@@ -669,8 +670,8 @@ private:
           res = isMin ? ra : rb;
         else if (ib.hi <= ia.lo)
           res = isMin ? rb : ra;
-        else
-          return fail(op, "furiosa: min/max of indices whose ranges overlap");
+        else // ranges that overlap (a pooling window's in-image taps): data, computed where it is read
+          return success();
       }
       setInt(op->getResult(0), res);
       return success();
@@ -2304,12 +2305,16 @@ FailureOr<Value> Raiser::emitSym(Gen &g, Value v, const Sym &s0, ArrayRef<Axis> 
   OpBuilder &ob = *g.ob;
   Operation *at = v.getDefiningOp() ? v.getDefiningOp() : kernel.getOperation();
   if (s0.kind == Sym::Mask) {
-    Value on = arith::ConstantIntOp::create(ob, loc, ob.getI1Type(), s0.never ? 0 : 1);
+    SmallVector<AffineExpr> conds; // every one rewritten before an op is built: a failure leaves none behind
     for (unsigned c = 0; c < s0.conds.size(); ++c) {
       auto e = rewrite(at, g, env, [c](const Sym &s) { return s.conds[c]; }, v);
       if (failed(e))
         return failure();
-      Value ok = arith::CmpIOp::create(ob, loc, arith::CmpIPredicate::sge, exprValue(g, *e),
+      conds.push_back(*e);
+    }
+    Value on = arith::ConstantIntOp::create(ob, loc, ob.getI1Type(), s0.never ? 0 : 1);
+    for (AffineExpr e : conds) {
+      Value ok = arith::CmpIOp::create(ob, loc, arith::CmpIPredicate::sge, exprValue(g, e),
                                           arith::ConstantIndexOp::create(ob, loc, 0));
       on = arith::AndIOp::create(ob, loc, on, ok);
     }
@@ -2317,6 +2322,8 @@ FailureOr<Value> Raiser::emitSym(Gen &g, Value v, const Sym &s0, ArrayRef<Axis> 
   }
   if (s0.kind != Sym::Int)
     return at->emitError("furiosa: a pointer is used as data"), failure();
+  if (llvm::any_of(act, [&](Evaluator *ev) { return ev->get(v) && ev->get(v)->data != s0.data; }))
+    return at->emitError("furiosa: an index adds different data in different program instances"), failure();
   auto e = rewrite(at, g, env, [](const Sym &s) { return s.expr; }, v);
   if (failed(e))
     return failure();
@@ -2337,7 +2344,7 @@ FailureOr<Value> Raiser::emitLoad(Gen &g, Read load, ArrayRef<Axis> env) {
   int arg = p0->base;
   for (Evaluator *ev : act) {
     const Sym *p = ev->get(load.getPtr());
-    if (!p || p->base != arg || p->data.size() != p0->data.size())
+    if (!p || p->base != arg || p->data != p0->data)
       return load.emitError("furiosa: load base differs between program instances"), failure();
   }
   auto addr = rewrite(load, g, env, [](const Sym &s) { return s.expr; }, load.getPtr());
@@ -2660,8 +2667,28 @@ FailureOr<Value> Raiser::emit(Gen &g, Value v, ArrayRef<Axis> env) {
     return it->second;
   FailureOr<Value> out = failure();
   Operation *def = v.getDefiningOp();
-  if (const Sym *s = act[0]->get(v)) {
-    out = emitSym(g, v, *s, env);
+  const Sym *s0 = act[0]->get(v);
+  // An index value that is no one expression of the coordinates in every instance (a min whose operand ranges
+  // overlap in some instances only, a program's first key block max(start - WINDOW + 1, 0) // BLOCK * BLOCK) is
+  // computed from its operands, as data is.
+  if (s0 && s0->kind != Sym::Ptr && def &&
+      (isElementwise(def) || isa<tt::SplatOp, tt::BroadcastOp, tt::ExpandDimsOp, tt::TransOp, tt::ReshapeOp>(def))) {
+    if (llvm::all_of(act, [&](Evaluator *ev) { return ev->get(v) && ev->get(v)->data == s0->data; })) {
+      auto origins = originUses;
+      auto digits = digitUses;
+      {
+        ScopedDiagnosticHandler quiet(ctx, [](Diagnostic &) { return success(); });
+        out = emitSym(g, v, *s0, env);
+      }
+      if (succeeded(out))
+        return g.memo[memoKey] = *out;
+      originUses = origins;
+      digitUses = digits;
+    }
+    s0 = nullptr;
+  }
+  if (s0) {
+    out = emitSym(g, v, *s0, env);
   } else if (auto it = g.state.find(v.getAsOpaquePointer()); it != g.state.end()) {
     SmallVector<Value> idx;
     for (int d : it->second.second) {
