@@ -401,10 +401,12 @@ struct DataTerm {
   bool operator==(const DataTerm &o) const { return value == o.value && axisOf == o.axisOf && sign == o.sign; }
 };
 
-/// A loop counted from a base common to every instance: counter t is base + step * t in each, and an instance runs
-/// the iterations from its own lower bound on (Raiser::evaluate).
+/// A loop counted from a base common to every instance: counter t is base + step * t in each (Raiser::evaluate). A loop
+/// whose bounds vary inside an instance (data) runs `trip` iterations by 1 over the values its counter can address,
+/// each guarded by lb <= counter < ub and a whole number of its own steps (`dataStep`) past lb; otherwise an instance
+/// runs the iterations from its own lower bound on.
 struct Rebase {
-  int64_t base, step;
+  int64_t base, step, trip = 0, dataStep = 0;
 };
 
 /// The symbolic value of an integer, pointer or i1 SSA value in one program instance. Dims are the
@@ -454,6 +456,10 @@ public:
   DenseMap<unsigned, int64_t> lowers;   // per loop id: its lower bound in this instance
   DenseMap<unsigned, int64_t> firsts;   // per rebased loop id: the first iteration this instance runs
   const std::map<unsigned, Rebase> *rebase = nullptr; // per loop id (Raiser::evaluate)
+  // Loops whose bounds vary inside this instance (data), per load of one buffer that their counter u moves: the buffer,
+  // the counter's coefficient, and the range of the rest of the load's address over its axes.
+  std::vector<std::tuple<unsigned, Operation *, int, int64_t, int64_t, int64_t>> reach;
+  DenseSet<unsigned> dataBounds;
   DenseMap<Operation *, bool> taken;     // per scf.if: whether this instance took its then-branch
   DenseSet<Operation *> executed;        // the stores (and atomics) this instance runs
 
@@ -805,6 +811,10 @@ private:
       setInt(f.getInductionVar(), cst(base) + getAffineSymbolExpr(id, ctx) * st);
       if (symbolic) // the first iteration depends on the program: carried indices have no closed form
         return evalBody(f, id, std::nullopt, std::nullopt);
+      if (r.dataStep) {
+        trips[id] = r.trip;
+        return evalBody(f, id, r.trip, std::nullopt);
+      }
       if (!lb || !ub || step != st)
         return fail(f.getOperation(), "furiosa: loop bounds vary inside a program instance");
       trips[id] = std::max<int64_t>(0, (*ub - base + st - 1) / st);
@@ -820,6 +830,28 @@ private:
       unsigned id = loopIds.lookup(f);
       setInt(f.getInductionVar(), l->expr + getAffineSymbolExpr(id, ctx) * *step);
       return evalBody(f, id, std::nullopt);
+    }
+    if (!symbolic && step && *step > 0 && (!lb || !ub)) {
+      // Bounds on data: the counter u itself, and how far each load it moves reaches (Raiser::evaluate).
+      unsigned id = loopIds.lookup(f);
+      AffineExpr u = getAffineSymbolExpr(id, ctx);
+      setInt(f.getInductionVar(), u);
+      dataBounds.insert(id);
+      if (failed(evalBody(f, id, std::nullopt, std::nullopt)))
+        return failure();
+      f.getBody()->walk([&](tt::LoadOp load) {
+        const Sym *p = get(load.getPtr());
+        if (!p || p->kind != Sym::Ptr || !p->data.empty() || !p->expr.isFunctionOfSymbol(id))
+          return;
+        AffineExpr at0 = simplify(p->expr.replace(u, cst(0)), p->shape.size(), loopIds.size());
+        auto a = dyn_cast<AffineConstantExpr>(simplify(p->expr.replace(u, cst(1)) - at0, p->shape.size(), loopIds.size()));
+        if (!a || !a.getValue() || simplify(p->expr - u * a.getValue() - at0, p->shape.size(), loopIds.size()) != cst(0))
+          return;
+        auto [rest, in] = ranged(at0, p->shape);
+        if (!rest.isFunctionOfSymbol(id) && in.lo > -(int64_t(1) << 40) && in.hi < (int64_t(1) << 40))
+          reach.push_back({id, load, p->base, a.getValue(), in.lo, in.hi});
+      });
+      return success();
     }
     if (!lb || !ub || !step || *step <= 0)
       return fail(f.getOperation(), "furiosa: loop bounds vary inside a program instance");
@@ -1148,6 +1180,8 @@ SmallVector<Axis> reshapeEnv(ArrayRef<Axis> env, ArrayRef<int64_t> dst, ArrayRef
   return out;
 }
 
+TypedAttr identityOfOp(Operation *comb, Type et);
+
 /// The identity of a single-operand combiner that is one known op on its two arguments, else null.
 TypedAttr identityOf(Block &combiner) {
   if (combiner.getNumArguments() != 2 || !llvm::hasSingleElement(combiner.without_terminator()))
@@ -1157,8 +1191,12 @@ TypedAttr identityOf(Block &combiner) {
   if (comb->getNumOperands() != 2 || combiner.getTerminator()->getOperands() != comb->getResults() ||
       !((comb->getOperand(0) == a && comb->getOperand(1) == x) || (comb->getOperand(0) == x && comb->getOperand(1) == a)))
     return {};
+  return identityOfOp(comb, a.getType());
+}
+
+/// The identity of the associative op `comb` on values of type `et`, else null.
+TypedAttr identityOfOp(Operation *comb, Type et) {
   Builder b(comb->getContext());
-  Type et = a.getType();
   if (isa<arith::AddFOp>(comb))
     return b.getFloatAttr(et, 0.0);
   if (isa<arith::MulFOp>(comb))
@@ -1178,6 +1216,74 @@ TypedAttr identityOf(Block &combiner) {
   if (isa<arith::MinSIOp>(comb))
     return b.getIntegerAttr(et, APInt::getSignedMaxValue(et.getIntOrFloatBitWidth()));
   return {};
+}
+
+/// Whether `loop` only accumulates: no writes, and each iter arg is updated as arg (op) term by an associative op whose
+/// identity the term is wherever the `bounded` loads yield their `other` (masked off past their buffers), what the term
+/// is there read off its ops (conversions, broadcasts, selects of equal values, reductions of their identity, sums and
+/// products of known values).
+static bool accumulatesOnly(scf::ForOp loop, const DenseSet<Operation *> &bounded) {
+  if (loop.getBody()->walk([](Operation *w) {
+        return isa<tt::StoreOp, tt::AtomicRMWOp, tt::AtomicCASOp>(w) ? WalkResult::interrupt() : WalkResult::advance();
+      }).wasInterrupted())
+    return false;
+  std::function<TypedAttr(Value)> masked = [&](Value v) -> TypedAttr {
+    Operation *d = v.getDefiningOp();
+    if (!d)
+      return {};
+    if (auto c = dyn_cast<arith::ConstantOp>(d)) {
+      if (auto e = dyn_cast<DenseElementsAttr>(c.getValue()))
+        return e.isSplat() ? e.getSplatValue<TypedAttr>() : TypedAttr();
+      return dyn_cast<TypedAttr>(c.getValue());
+    }
+    if (auto l = dyn_cast<tt::LoadOp>(d))
+      return bounded.count(l) && l.getOther() ? masked(l.getOther()) : TypedAttr();
+    if (isa<tt::SplatOp, tt::BroadcastOp, tt::ExpandDimsOp, tt::ReshapeOp, tt::TransOp>(d))
+      return masked(d->getOperand(0));
+    if (isa<arith::ExtFOp, arith::TruncFOp, tt::FpToFpOp>(d)) {
+      auto f = dyn_cast_or_null<FloatAttr>(masked(d->getOperand(0)));
+      if (!f)
+        return {};
+      auto et = cast<FloatType>(getElementTypeOrSelf(v.getType()));
+      APFloat x = f.getValue();
+      bool lost;
+      x.convert(et.getFloatSemantics(), APFloat::rmNearestTiesToEven, &lost);
+      return FloatAttr::get(et, x);
+    }
+    if (auto sel = dyn_cast<arith::SelectOp>(d)) {
+      TypedAttr t = masked(sel.getTrueValue());
+      return t && t == masked(sel.getFalseValue()) ? t : TypedAttr();
+    }
+    if (auto r = dyn_cast<tt::ReduceOp>(d)) {
+      TypedAttr x = r->getNumOperands() == 1 ? masked(r->getOperand(0)) : TypedAttr();
+      return x && x == identityOf(r.getCombineOp().front()) ? x : TypedAttr();
+    }
+    if (isa<arith::AddFOp, arith::MulFOp>(d)) {
+      auto l = dyn_cast_or_null<FloatAttr>(masked(d->getOperand(0)));
+      auto r = dyn_cast_or_null<FloatAttr>(masked(d->getOperand(1)));
+      if (!l || !r)
+        return {};
+      APFloat x = l.getValue();
+      if (isa<arith::AddFOp>(d))
+        x.add(r.getValue(), APFloat::rmNearestTiesToEven);
+      else
+        x.multiply(r.getValue(), APFloat::rmNearestTiesToEven);
+      return FloatAttr::get(l.getType(), x);
+    }
+    return {};
+  };
+  auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+  for (auto [arg, next] : llvm::zip(loop.getRegionIterArgs(), yield.getOperands())) {
+    Operation *upd = next.getDefiningOp();
+    if (!upd || upd->getParentOp() != loop.getOperation() || upd->getNumOperands() != 2 || !arg.hasOneUse() ||
+        !llvm::is_contained(upd->getOperands(), arg))
+      return false;
+    Value term = upd->getOperand(0) == arg ? upd->getOperand(1) : upd->getOperand(0);
+    TypedAttr id = identityOfOp(upd, getElementTypeOrSelf(arg.getType()));
+    if (!id || masked(term) != id)
+      return false;
+  }
+  return true;
 }
 
 class Raiser {
@@ -1381,6 +1487,42 @@ LogicalResult Raiser::evaluate() {
       continue;
     if (llvm::all_of(evals, [&](auto &ev) { return !ev->lowers.count(id) || (ev->lowers.lookup(id) - *base) % *step == 0; }))
       rebase[id] = {*base, *step};
+  }
+  // A loop whose bounds are data (a segment's rows from off[s] to off[s + 1]) runs over every counter value its loads
+  // can reach in their buffers, each iteration guarded by the bounds (firstGuard). An iteration past those reaches its
+  // loads with every lane outside their buffers, so masked off in a valid program: it must leave the state as it is,
+  // each state an accumulation whose term is its identity where those loads yield their `other`.
+  for (auto [op, id] : loopIds) {
+    if (llvm::none_of(evals, [&](auto &ev) { return ev->dataBounds.count(id); }))
+      continue;
+    auto loop = cast<scf::ForOp>(op);
+    std::optional<int64_t> lo, hi;
+    DenseMap<Operation *, unsigned> seen; // per load: the instances it bounds the counter in
+    unsigned running = 0;
+    for (auto &ev : evals) {
+      running += ev->dataBounds.count(id);
+      for (auto [l, load, arg, a, restLo, restHi] : ev->reach)
+        if (l == id) {
+          ++seen[load];
+          int64_t numel = buffers[arg].numel();
+          // Some lane in the buffer: a * u in [-restHi, numel - 1 - restLo].
+          auto down = [](int64_t x, int64_t d) { return d < 0 ? floorDiv(-x, -d) : floorDiv(x, d); };
+          auto up = [&](int64_t x, int64_t d) { return -down(-x, d); };
+          int64_t from = a > 0 ? up(-restHi, a) : up(numel - 1 - restLo, a);
+          int64_t to = a > 0 ? down(numel - 1 - restLo, a) : down(-restHi, a);
+          lo = std::min(lo.value_or(from), from);
+          hi = std::max(hi.value_or(to), to);
+        }
+    }
+    DenseSet<Operation *> bounded;
+    for (auto [load, n] : seen)
+      if (n == running)
+        bounded.insert(load);
+    auto step = getConstantIntValue(loop.getStep());
+    if (!lo || *hi < *lo || !step || !accumulatesOnly(loop, bounded))
+      return loop.emitError("furiosa: loop bounds vary inside a program instance (data bounds are raised for a loop "
+                            "that only accumulates and loads what its counter moves)");
+    rebase[id] = {*lo, 1, *hi - *lo + 1, *step};
   }
   if (!rebase.empty() && failed(run()))
     return failure();
@@ -2250,6 +2392,8 @@ FailureOr<AffineExpr> Raiser::fitOrigins(Operation *at, const Gen &g, ArrayRef<i
 /// count. A trip up to a min of bounds (rows from start to min(start + ROWS, M)) need not be affine in the tile
 /// origins where the distance to each term of the min is: then one bound per term, (term - lower bound) ceildiv step.
 FailureOr<SmallVector<AffineExpr>> Raiser::tripBounds(Gen &g, unsigned id) {
+  if (auto it = rebase.find(id); it != rebase.end() && it->second.dataStep)
+    return SmallVector<AffineExpr>(); // firstGuard has both bounds
   scf::ForOp loop;
   for (auto [op, i] : loopIds)
     if (i == id)
@@ -2335,6 +2479,22 @@ FailureOr<Value> Raiser::firstGuard(Gen &g, unsigned id, Value t) {
     return arith::AddIOp::create(ob, loc, arith::MulIOp::create(ob, loc, t, arith::ConstantIndexOp::create(ob, loc, r.step)),
                                  arith::ConstantIndexOp::create(ob, loc, r.base));
   };
+  if (r.dataStep) { // lb <= at < ub, a whole number of steps past lb
+    auto lb = emit(g, loop.getLowerBound(), {}), ub = emit(g, loop.getUpperBound(), {});
+    if (failed(lb) || failed(ub))
+      return failure();
+    Value at = counter();
+    Value lo = arith::IndexCastOp::create(ob, loc, ob.getIndexType(), *lb);
+    Value hi = arith::IndexCastOp::create(ob, loc, ob.getIndexType(), *ub);
+    Value on = arith::AndIOp::create(ob, loc, arith::CmpIOp::create(ob, loc, arith::CmpIPredicate::sge, at, lo),
+                                     arith::CmpIOp::create(ob, loc, arith::CmpIPredicate::slt, at, hi));
+    if (r.dataStep == 1)
+      return on;
+    Value past = arith::RemSIOp::create(ob, loc, arith::SubIOp::create(ob, loc, at, lo),
+                                        arith::ConstantIndexOp::create(ob, loc, r.dataStep));
+    Value whole = arith::CmpIOp::create(ob, loc, arith::CmpIPredicate::eq, past, arith::ConstantIndexOp::create(ob, loc, 0));
+    return arith::AndIOp::create(ob, loc, on, whole).getResult();
+  }
   SmallVector<int64_t> first;
   for (Evaluator *ev : act)
     first.push_back(ev->firsts.lookup(id));
@@ -2527,9 +2687,15 @@ FailureOr<Value> Raiser::emitLoad(Gen &g, Read load, ArrayRef<Axis> env) {
   Value on;
   if (load.getMask()) {
     const Sym *m0 = act[0]->get(load.getMask());
-    if (!m0 || m0->kind != Sym::Mask)
+    if (m0 && m0->kind != Sym::Mask)
       return load.emitError("furiosa: load mask is not an index predicate"), failure();
-    for (unsigned c = 0; c < m0->conds.size(); ++c) {
+    if (!m0) { // a mask on data (rows below a loaded end): computed
+      auto m = emit(g, load.getMask(), env);
+      if (failed(m))
+        return failure();
+      on = *m;
+    }
+    for (unsigned c = 0; m0 && c < m0->conds.size(); ++c) {
       auto e = rewrite(load, g, env, [c](const Sym &s) { return s.conds[c]; }, load.getMask());
       if (failed(e))
         return failure();
@@ -2539,7 +2705,7 @@ FailureOr<Value> Raiser::emitLoad(Gen &g, Read load, ArrayRef<Axis> env) {
                                           arith::ConstantIndexOp::create(ob, loc, 0));
       on = on ? arith::AndIOp::create(ob, loc, on, ok).getResult() : ok;
     }
-    if (m0->never)
+    if (m0 && m0->never)
       on = arith::ConstantIntOp::create(ob, loc, ob.getI1Type(), 0);
   }
 
