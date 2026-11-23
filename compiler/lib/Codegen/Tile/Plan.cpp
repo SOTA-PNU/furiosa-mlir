@@ -177,6 +177,15 @@ LogicalResult Plan::tryGemm(unsigned node) {
   for (unsigned a : llvm::concat<unsigned>(o[0], o[1], batch))
     if (!llvm::is_contained(p.out, a))
       return fail("a contraction whose output axis an enclosing reduction reduces");
+  // Nor may an enclosing reduction read it at all (a mean recomputed inside a variance): its body runs over that
+  // reduction's axes in time, which the contraction's stream does not have.
+  std::set<unsigned> seen;
+  std::function<bool(unsigned)> reaches = [&](unsigned n) {
+    return n == node || (seen.insert(n).second && llvm::any_of(p.nodes[n].args, reaches));
+  };
+  for (auto [i, n] : llvm::enumerate(p.nodes))
+    if (n.kind == Node::Reduce && i != node && reaches(n.args[0]))
+      return fail("a contraction an enclosing reduction reads");
   Gemm g;
   g.node = node;
   g.stream = factors[mainOf[s]];
