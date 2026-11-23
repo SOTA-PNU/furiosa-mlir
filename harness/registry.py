@@ -115,10 +115,13 @@ CASES = {
                        graph=Tol(rtol=3e-2, atol=0), npu=Tol(rtol=5.4e-2, atol=0)),
     # Larger Qwen3 sizes (models/qwen3_0_6b.py at their configs), by the same rule; the two implementations are
     # the GPU graph and transformers' Qwen3 on the same weights and prompt, at the worst output (that measure
-    # gives 3.05% for 0.6B): graph = the drift, npu = twice it. A seed other than 0 is the first whose golden
+    # gives 3.05% for 0.6B): graph = the drift, npu = twice it. L1's raised graph on the CPU JIT against the
+    # GPU golden is a second pair of correct implementations; where its drift is larger (measured once L1 runs),
+    # it sets graph and npu instead. A seed other than 0 is the first whose golden
     # greedy tokens both lead the runner-up by more than the two implementations' logits differ.
     "qwen3_1_7b": Case("models/qwen3_1_7b.py", weights="huggingface", int_ranges={"input_ids": (0, 151936)},
-                       graph=Tol(rtol=2.5e-2, atol=0), npu=Tol(rtol=5e-2, atol=0), seed=2),  # 2.47% kv_cache.14.v
+                       graph=Tol(rtol=3e-2, atol=0), npu=Tol(rtol=5.4e-2, atol=0), seed=2),
+    # transformers 2.47% kv_cache.14.v; L1 CPU JIT vs GPU 2.69% kv_cache.27.v (every launch within one ulp)
     "qwen3_4b": Case("models/qwen3_4b.py", weights="huggingface", int_ranges={"input_ids": (0, 151936)},
                      graph=Tol(rtol=1.8e-2, atol=0), npu=Tol(rtol=3.6e-2, atol=0), seed=2),  # 1.79% kv_cache.13.v
     "qwen3_8b": Case("models/qwen3_8b.py", weights="huggingface", int_ranges={"input_ids": (0, 151936)},
