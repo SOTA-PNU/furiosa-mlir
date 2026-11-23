@@ -51,6 +51,9 @@ npu stage) against GPU goldens.
   `FURIOSA_VISIBLE_CHIPS` names the NPUs (default the last N). Every run locks each NPU it opens and checks right
   before that each is idle, waiting otherwise; L4 passes only if the run opened exactly its NPUs. N = 1 is
   byte-identical. At N = 2 (npu2 and npu3) eight cases pass L4, from vector_add to LeNet-5.
+- Tiled class: a K window over a dim the K blocks do not divide (32 keys of 100) reads a copy padded to whole blocks
+  (984cc71; furiosa-dma had failed with "an inner contraction digit wider than its padded extent"). Only kernels
+  that failed so take the copy. `heldout3_sliding_window_attention` passes L1 to L4 (rel 0.0024, tolerance 6.4e-3).
 ## 1.4.0 (2026-11-18, release/1.4.0)
 
 Milestone: kernels the compiler was not written for. The second held-out batch (ten standard ML ops written from their
