@@ -1426,12 +1426,20 @@ linalg::GenericOp initsToInputs(linalg::GenericOp g) {
 /// A loop that reads take apart with floordiv or mod (a row index read as the bits of tl.sort's [2, ..., 2]
 /// stages) splits into those digits when every read is linear afterwards (delinearizeRead then projects it): the
 /// places are k / c for each floordiv or mod by k of a dividend holding the loop at coefficient c, nesting and
-/// dividing its extent. Outputs spanning the loop are reshaped by its digits.
-linalg::GenericOp splitLoopDigits(linalg::GenericOp g) {
+/// dividing its extent. Outputs spanning the loop are reshaped by its digits. In a generic no class maps as it is, a
+/// place need not divide the extent (a row stepped in tiles of 128 with a masked tail): the loop then pads to whole
+/// digits where every read stays in its tensor, the outputs (fills) computed padded and sliced back.
+linalg::GenericOp splitLoopDigits(linalg::GenericOp g, function_ref<bool(linalg::GenericOp)> mapsAlone) {
   MLIRContext *ctx = g.getContext();
   SmallVector<int64_t> ranges = g.getStaticLoopRanges();
   if (ShapedType::isDynamicShape(ranges))
     return g;
+  std::optional<bool> unmapped;
+  auto mayPad = [&] {
+    if (!unmapped)
+      unmapped = mapsAlone && !mapsAlone(g);
+    return *unmapped;
+  };
   std::map<unsigned, SmallVector<int64_t>> places;
   for (OpOperand *in : g.getDpsInputOperands())
     for (AffineExpr e : g.getMatchingIndexingMap(in).getResults())
@@ -1442,8 +1450,8 @@ linalg::GenericOp splitLoopDigits(linalg::GenericOp g) {
           return;
         auto lin = linearForm(bin.getLHS());
         for (auto [d, c] : succeeded(lin) ? lin->second : std::map<unsigned, int64_t>{})
-          if (c > 0 && k.getValue() % c == 0 && k.getValue() / c > 1 && ranges[d] % (k.getValue() / c) == 0 &&
-              k.getValue() / c < ranges[d] && !llvm::is_contained(places[d], k.getValue() / c))
+          if (c > 0 && k.getValue() % c == 0 && k.getValue() / c > 1 && k.getValue() / c < ranges[d] &&
+              !llvm::is_contained(places[d], k.getValue() / c) && (ranges[d] % (k.getValue() / c) == 0 || mayPad()))
             places[d].push_back(k.getValue() / c);
       });
   // The new loops: each loop's digits in its place, outermost first, and its value over them.
@@ -1451,6 +1459,7 @@ linalg::GenericOp splitLoopDigits(linalg::GenericOp g) {
   SmallVector<SmallVector<unsigned>> digits;
   SmallVector<int64_t> newRanges;
   SmallVector<utils::IteratorType> iters;
+  SmallVector<int64_t> padded(ranges); // each loop's extent in whole digits
   bool split = false;
   for (auto [d, n] : llvm::enumerate(ranges)) {
     SmallVector<int64_t> chain = places[d];
@@ -1459,8 +1468,10 @@ linalg::GenericOp splitLoopDigits(linalg::GenericOp g) {
       if (chain[i + 1] % chain[i])
         chain.clear();
     split |= !chain.empty();
+    if (!chain.empty())
+      padded[d] = llvm::divideCeil(n, chain.back()) * chain.back();
     chain.insert(chain.begin(), 1);
-    chain.push_back(n);
+    chain.push_back(padded[d]);
     value.push_back(getAffineConstantExpr(0, ctx));
     digits.emplace_back();
     for (int i = chain.size() - 2; i >= 0; --i) {
@@ -1484,14 +1495,21 @@ linalg::GenericOp splitLoopDigits(linalg::GenericOp g) {
     groups.emplace_back();
     shapes.emplace_back();
     if (!g.isDpsInit(&o) && !(o.get().getDefiningOp<tensor::EmptyOp>() && m.isProjectedPermutation())) {
-      for (AffineExpr e : m.getResults()) {
+      for (auto [k, e] : llvm::enumerate(m.getResults())) {
         AffineExpr r = withinRanges(simplifyAffineExpr(e.replaceDimsAndSymbols(value, {}), nd, 0), newRanges);
-        if (failed(linearForm(r)))
+        auto lin = linearForm(r);
+        if (failed(lin))
+          return g;
+        // Padded loops: the read stays in the tensor.
+        auto [lo, hi] = span(*lin, newRanges);
+        if (padded != ranges && (lo < 0 || hi >= cast<RankedTensorType>(o.get().getType()).getDimSize(k)))
           return g;
         exprs.push_back(simplifyAffineExpr(r, nd, 0));
       }
     } else {
-      if (!m.isProjectedPermutation())
+      // A padded output is computed whole from a fill (or nothing).
+      if (!m.isProjectedPermutation() || (g.isDpsInit(&o) && padded != ranges &&
+                                          !o.get().getDefiningOp<linalg::FillOp>() && !o.get().getDefiningOp<tensor::EmptyOp>()))
         return g;
       for (AffineExpr r : m.getResults()) {
         groups.back().emplace_back();
@@ -1511,9 +1529,12 @@ linalg::GenericOp splitLoopDigits(linalg::GenericOp g) {
   SmallVector<Value> operands;
   for (auto [o, shape, group] : llvm::zip(g->getOpOperands(), shapes, groups)) {
     auto t = cast<RankedTensorType>(o.get().getType());
+    auto fill = o.get().getDefiningOp<linalg::FillOp>();
+    Value empty = group.empty() ? Value() : tensor::EmptyOp::create(b, loc, shape, t.getElementType()).getResult();
     operands.push_back(group.empty() ? o.get()
-                       : o.get().getDefiningOp<tensor::EmptyOp>()
-                           ? tensor::EmptyOp::create(b, loc, shape, t.getElementType()).getResult()
+                       : o.get().getDefiningOp<tensor::EmptyOp>() ? empty
+                       : fill && t.getNumElements() != ShapedType::getNumElements(shape)
+                           ? linalg::FillOp::create(b, loc, fill.getInputs()[0], empty).getResult(0)
                            : tensor::ExpandShapeOp::create(b, loc, t.clone(shape), o.get(), group).getResult());
   }
   unsigned ni = g.getNumDpsInputs();
@@ -1534,10 +1555,27 @@ linalg::GenericOp splitLoopDigits(linalg::GenericOp g) {
     index.replaceAllUsesWith(v);
     index.erase();
   }
-  for (auto [old, now, group] : llvm::zip(g.getResults(), fresh.getResults(), groups))
-    old.replaceAllUsesWith(old.getType() == now.getType()
-                               ? Value(now)
-                               : tensor::CollapseShapeOp::create(b, loc, old.getType(), now, group).getResult());
+  for (auto [old, now, group] : llvm::zip(g.getResults(), fresh.getResults(), groups)) {
+    auto t = cast<RankedTensorType>(old.getType());
+    if (old.getType() == now.getType()) {
+      old.replaceAllUsesWith(now);
+      continue;
+    }
+    SmallVector<int64_t> whole;
+    for (ReassociationIndices &dims : group) {
+      whole.push_back(1);
+      for (int64_t i : dims)
+        whole.back() *= cast<RankedTensorType>(now.getType()).getDimSize(i);
+    }
+    Value v = tensor::CollapseShapeOp::create(b, loc, t.clone(whole), now, group);
+    if (whole != t.getShape()) {
+      SmallVector<OpFoldResult> zeros(whole.size(), b.getIndexAttr(0)), ones(whole.size(), b.getIndexAttr(1)), sizes;
+      for (int64_t n : t.getShape())
+        sizes.push_back(b.getIndexAttr(n));
+      v = tensor::ExtractSliceOp::create(b, loc, v, zeros, sizes, ones);
+    }
+    old.replaceAllUsesWith(v);
+  }
   g.erase();
   return fresh;
 }
@@ -2566,7 +2604,7 @@ void mlir::furiosa::normalizeKernels(ModuleOp module, function_ref<bool(linalg::
   SmallVector<linalg::GenericOp> generics;
   module.walk([&](linalg::GenericOp g) { generics.push_back(g); });
   for (linalg::GenericOp &g : generics) {
-    g = splitLoopDigits(initsToInputs(dropUnitReductions(promoteExtracts(g))));
+    g = splitLoopDigits(initsToInputs(dropUnitReductions(promoteExtracts(g))), mapsAlone);
     for (unsigned i = 0; i < g.getNumDpsInputs(); ++i) {
       delinearizeRead(g, i);
       maskToPad(g, i);
