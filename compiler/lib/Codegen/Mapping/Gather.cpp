@@ -23,7 +23,7 @@ using namespace mlir::furiosa::mapping;
 
 namespace {
 
-constexpr int64_t kSlices = 256;
+constexpr int64_t kSlices = 256, kDmBudget = 384 * 1024;
 
 /// An index-valued body expression as constant + sum(coefficient * linalg.index) + sum(coefficient * input).
 struct Linear {
@@ -276,11 +276,14 @@ LogicalResult map(RaisedKernel &kernel) {
   OpBuilder &b = kb.builder();
   Location loc = kb.loc();
 
-  // The index list in one slice, an even count of i32 (DM writes are whole 8-byte words).
-  MapAttr oneSlice = kb.one().padTo(kSlices);
-  MapAttr list = g.count % 2 ? T.padTo(g.count + 1) : T;
+  // The index list in one slice, an even count of i32 (DM writes are whole 8-byte words); a list that would not fit
+  // a slice's DM with its offsets spreads over the slices as the rows do, whole packets of 8 in each.
+  int64_t per = g.count / kSlices;
+  bool spread = 8 * g.count > kDmBudget && g.count > kSlices && per % 8 == 0;
+  MapAttr oneSlice = spread ? T.stride(per) : kb.one().padTo(kSlices);
+  MapAttr list = spread ? T.modulo(per) : g.count % 2 ? T.padTo(g.count + 1) : T;
   Value indexDm;
-  if (g.count % 2) {
+  if (g.count % 2 && !spread) {
     Value v = ViewOp::create(b, loc, HbmViewType::get(ctx, i32, kb.chip(), T, false), kb.param(indexParam));
     v = PadOp::create(b, loc, HbmViewType::get(ctx, i32, kb.chip(), list, false), v);
     indexDm = ViewToDmOp::create(b, loc, kb.dmType(i32, oneSlice, list), v);
@@ -289,7 +292,7 @@ LogicalResult map(RaisedKernel &kernel) {
   }
   // Byte offsets: index * row bytes, through the Vector Engine's fixed-point ALU.
   auto stream = [&](MapAttr time, MapAttr packet) { return kb.streamType(i32, oneSlice, time, packet); };
-  MapAttr time = g.count > 8 ? T.stride(8) : kb.one();
+  MapAttr time = spread ? T.stride(8).modulo(per / 8) : g.count > 8 ? T.stride(8) : kb.one();
   MapAttr packet = g.count > 8 ? T.modulo(8) : list;
   MapAttr flit = g.count > 8 ? packet : T.padTo(8);
   Value s = BeginOp::create(b, loc, stream(kb.one(), list), indexDm, ContextKind::Main);
