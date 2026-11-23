@@ -165,6 +165,10 @@ FailureOr<Dag> fold(func::FuncOp func, ArrayRef<int64_t> written, std::string &w
     FailureOr<std::optional<tile::TileNest>> nest = tile::tileNest(v, why);
     if (failed(nest))
       return failure();
+    if (!*nest) {
+      why = "a stored value of a K loop (the tiled class's)";
+      return failure();
+    }
     auto tiledDims = llvm::count_if((*nest)->loopOf, [](std::optional<unsigned> l) { return l.has_value(); });
     if ((*nest)->loops.size() != 1 || tiledDims != 1 || (iv && iv != (*nest)->loops[0].iv)) {
       why = "row tiles other than one loop over one row dim";
