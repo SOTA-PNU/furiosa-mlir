@@ -421,12 +421,29 @@ std::optional<int64_t> evalAt(Value v, unsigned dim, int64_t at) {
   return isa<arith::AddIOp>(op) ? *a + *b : isa<arith::SubIOp>(op) ? *a - *b : *a * *b;
 }
 
+/// Whether body value `v` depends on block argument `arg`.
+bool dependsOn(Value v, BlockArgument arg) {
+  SmallVector<Value> work{v};
+  llvm::DenseSet<Value> seen;
+  while (!work.empty()) {
+    Value x = work.pop_back_val();
+    if (x == arg)
+      return true;
+    if (Operation *op = x.getDefiningOp(); op && op->getBlock() == arg.getOwner() && seen.insert(x).second)
+      llvm::append_range(work, op->getOperands());
+  }
+  return false;
+}
+
 /// A selection reduction: one accumulator takes the greatest (least) value, the other the payload at the same
 /// element, ties going to the least (greatest) payload. tl.argmax/argmin's combiner, read by what it does:
-/// select both accumulators by order(acc, x) | (acc == x & tie(acc_payload, x_payload)).
+/// select both accumulators by order(acc, x) | (acc == x & tie(acc_payload, x_payload)). The compared x is an
+/// input's element or computed from it, other inputs the reduced loop does not index, and the loop indices (a
+/// softmax probability, masked where it was the first pick: top-2 gating's second argmax).
 struct Selection {
   unsigned value, payload; // result indices
-  BlockArgument in;        // the compared input's block argument
+  BlockArgument in;        // the input whose elements are compared (the only one the reduced loop indexes)
+  Value compared;          // the compared value: `in` or computed from it
   Value term;              // the payload's term (the element's)
   bool max, leastPayload;
 };
@@ -487,8 +504,16 @@ std::optional<Selection> matchSelection(linalg::GenericOp g) {
   for (unsigned v : {0u, 1u}) {
     Value outV = body.getArgument(nIn + v), outP = body.getArgument(nIn + 1 - v);
     Value inV = (v ? s1 : s0).getFalseValue(), inP = (v ? s0 : s1).getFalseValue();
-    auto inArg = dyn_cast<BlockArgument>(inV);
-    if (!inArg || inArg.getOwner() != &body || inArg.getArgNumber() >= nIn || readsOuts(inP))
+    // The input the reduced loop indexes that the compared value reads: exactly one.
+    BlockArgument inArg;
+    unsigned reads = 0;
+    unsigned r = *llvm::find_if(llvm::seq(g.getNumLoops()), [&](unsigned d) {
+      return g.getIteratorTypesArray()[d] == utils::IteratorType::reduction;
+    });
+    for (unsigned a = 0; a < nIn; ++a)
+      if (g.getIndexingMapsArray()[a].isFunctionOfDim(r) && dependsOn(inV, body.getArgument(a)))
+        inArg = body.getArgument(a), ++reads;
+    if (reads != 1 || readsOuts(inV) || readsOuts(inP))
       continue;
     std::optional<int> order = rel(c, outV, inV), tie;
     if (order == 0)
@@ -506,7 +531,7 @@ std::optional<Selection> matchSelection(linalg::GenericOp g) {
         }
       }
     if (order)
-      return Selection{v, 1 - v, inArg, inP, *order > 0, !tie || *tie < 0};
+      return Selection{v, 1 - v, inArg, inV, inP, *order > 0, !tie || *tie < 0};
   }
   return std::nullopt;
 }
@@ -515,8 +540,9 @@ std::optional<Selection> matchSelection(linalg::GenericOp g) {
 /// accumulators from element 0, the reduction over elements 1..) becomes two reductions with identities over all
 /// the elements: the greatest (least) value m, then the least (greatest) payload of the elements equal to m.
 /// Seeded means: the compared input is a box of some tensor T from element 1 along the reduced dim; the
-/// accumulators come from one parallel generic that reads T's element 0 there and yields it and, for the payload,
-/// a constant the payload's term (an index-only value of the reduced dim) takes at element 0.
+/// accumulators come from one parallel generic that reads T's element 0 there and yields it (or the compared value
+/// computed from it, op for op) and, for the payload, a constant the payload's term (an index-only value of the
+/// reduced dim) takes at element 0.
 void selectionReductions(ModuleOp module) {
   SmallVector<linalg::GenericOp> generics;
   module.walk([&](linalg::GenericOp g) { generics.push_back(g); });
@@ -554,32 +580,93 @@ void selectionReductions(ModuleOp module) {
     int64_t n = tType.getDimSize(*k);
     Value initV = g.getDpsInits()[sel->value], initP = g.getDpsInits()[sel->payload];
     auto seed = initV.getDefiningOp<linalg::GenericOp>();
-    if (!isBox(box, 1, n - 1) || !seed || initP.getDefiningOp() != seed || seed.getNumDpsInputs() != 1 ||
-        seed.getNumReductionLoops() != 0 || !isBox(seed.getDpsInputs()[0].getDefiningOp<tensor::ExtractSliceOp>(), 0, 1))
+    if (!isBox(box, 1, n - 1) || !seed || initP.getDefiningOp() != seed || seed.getNumReductionLoops() != 0)
+      continue;
+    // The seed's input that is T's element 0.
+    OpOperand *first = nullptr;
+    for (OpOperand *in : seed.getDpsInputOperands())
+      if (isBox(in->get().getDefiningOp<tensor::ExtractSliceOp>(), 0, 1))
+        first = in;
+    if (!first)
       continue;
     // The seed reads element 0 where the reduction reads its element: the reduced dim at 0, each other dim the
     // seed's loop the generic's output places it at.
     AffineMap outMap = g.getIndexingMapsArray()[g.getNumDpsInputs() + sel->value];
-    AffineMap seedMap = seed.getIndexingMapsArray()[0];
-    bool aligned = seedMap.getNumResults() == xMap.getNumResults() &&
-                   llvm::all_of(ArrayRef(seed.getIndexingMapsArray()).drop_front(), [](AffineMap m) { return m.isIdentity(); });
-    for (unsigned i = 0; aligned && i < xMap.getNumResults(); ++i) {
-      AffineExpr e = xMap.getResult(i), s = seedMap.getResult(i);
-      if (i == *k || isa<AffineConstantExpr>(e)) {
-        aligned = s == (i == *k ? getAffineConstantExpr(0, g.getContext()) : e);
-        continue;
+    // Whether the seed reads with `seedMap` where the reduction reads with `map` (the reduced dim at element 0 of
+    // the box, `at0`), each other dim the seed's loop the generic's output places it at.
+    auto aligned = [&](AffineMap map, AffineMap seedMap, std::optional<unsigned> at0) {
+      if (seedMap.getNumResults() != map.getNumResults())
+        return false;
+      for (unsigned i = 0; i < map.getNumResults(); ++i) {
+        AffineExpr e = map.getResult(i), s = seedMap.getResult(i);
+        if (i == at0 || isa<AffineConstantExpr>(e)) {
+          if (s != (i == at0 ? getAffineConstantExpr(0, g.getContext()) : e))
+            return false;
+          continue;
+        }
+        auto d = dyn_cast<AffineDimExpr>(e);
+        std::optional<unsigned> at = d ? outMap.getResultPosition(d) : std::nullopt;
+        if (!at || s != getAffineDimExpr(*at, g.getContext()))
+          return false;
       }
-      auto d = dyn_cast<AffineDimExpr>(e);
-      std::optional<unsigned> at = d ? outMap.getResultPosition(d) : std::nullopt;
-      aligned = at && s == getAffineDimExpr(*at, g.getContext());
-    }
-    auto seedYield = cast<linalg::YieldOp>(seed.getBody()->getTerminator());
+      return true;
+    };
+    Block &body = *g.getBody(), &seedBody = *seed.getBody();
+    // Whether seed value `s` is the compared value `v` at element 0: the same ops on T's element 0, the same reads
+    // of the other inputs, the reduced index's values at element 0 (index -1 of the box).
+    std::function<bool(Value, Value)> same = [&](Value s, Value v) {
+      if (s == v)
+        return true;
+      APInt c;
+      if (std::optional<int64_t> at = evalAt(v, r, -1))
+        return matchPattern(s, m_ConstantInt(&c)) && c.getSExtValue() == *at;
+      auto a = dyn_cast<BlockArgument>(v), sa = dyn_cast<BlockArgument>(s);
+      if (a || sa) {
+        if (!a || !sa || a.getOwner() != &body || sa.getOwner() != &seedBody || a.getArgNumber() >= g.getNumDpsInputs() ||
+            sa.getArgNumber() >= seed.getNumDpsInputs())
+          return false;
+        OpOperand *in = g.getDpsInputOperand(a.getArgNumber()), *seedIn = seed.getDpsInputOperand(sa.getArgNumber());
+        return a == sel->in ? seedIn == first
+                            : seedIn->get() == in->get() &&
+                                  aligned(g.getMatchingIndexingMap(in), seed.getMatchingIndexingMap(seedIn), std::nullopt);
+      }
+      Operation *op = v.getDefiningOp(), *sop = s.getDefiningOp();
+      if (op->getBlock() != &body || sop->getBlock() != &seedBody) {
+        Attribute x, y;
+        return matchPattern(v, m_Constant(&x)) && matchPattern(s, m_Constant(&y)) && x == y;
+      }
+      if (auto i = dyn_cast<linalg::IndexOp>(op)) {
+        auto si = dyn_cast<linalg::IndexOp>(sop);
+        return si && outMap.getResultPosition(getAffineDimExpr(i.getDim(), g.getContext())) == si.getDim();
+      }
+      if (op->getName() != sop->getName() || op->getAttrDictionary() != sop->getAttrDictionary() ||
+          op->getNumOperands() != sop->getNumOperands() ||
+          cast<OpResult>(v).getResultNumber() != cast<OpResult>(s).getResultNumber())
+        return false;
+      auto pairs = [&](bool swap) {
+        return llvm::all_of(llvm::seq(op->getNumOperands()), [&](unsigned i) {
+          return same(sop->getOperand(swap ? op->getNumOperands() - 1 - i : i), op->getOperand(i));
+        });
+      };
+      auto cmp = dyn_cast<arith::CmpIOp>(op);
+      bool symmetric = op->hasTrait<OpTrait::IsCommutative>() ||
+                       (cmp && (cmp.getPredicate() == arith::CmpIPredicate::eq || cmp.getPredicate() == arith::CmpIPredicate::ne));
+      return pairs(false) || (symmetric && op->getNumOperands() == 2 && pairs(true));
+    };
+    auto seedYield = cast<linalg::YieldOp>(seedBody.getTerminator());
     unsigned vAt = cast<OpResult>(initV).getResultNumber(), pAt = cast<OpResult>(initP).getResultNumber();
     APInt seedPayload;
-    if (!aligned || seedYield.getOperand(vAt) != seed.getBody()->getArgument(0) ||
+    if (!aligned(xMap, seed.getMatchingIndexingMap(first), *k) ||
+        !llvm::all_of(seed.getDpsInitsMutable(), [&](OpOperand &o) { return seed.getMatchingIndexingMap(&o).isIdentity(); }) ||
+        !same(seedYield.getOperand(vAt), sel->compared) ||
         !matchPattern(seedYield.getOperand(pAt), m_ConstantInt(&seedPayload)) ||
         evalAt(sel->term, r, -1) != seedPayload.getSExtValue())
       continue;
+    // The other inputs the compared value reads, as the new generics read them.
+    SmallVector<BlockArgument> extras;
+    for (unsigned a = 0; a < g.getNumDpsInputs(); ++a)
+      if (body.getArgument(a) != sel->in && dependsOn(sel->compared, body.getArgument(a)))
+        extras.push_back(body.getArgument(a));
 
     Type vt = getElementTypeOrSelf(initV.getType()), pt = getElementTypeOrSelf(initP.getType());
     bool fv = isa<FloatType>(vt);
@@ -607,45 +694,68 @@ void selectionReductions(ModuleOp module) {
     auto widened = [&](OpBuilder &nb, Location l, Value x) {
       return narrow ? arith::ExtSIOp::create(nb, l, wt, x).getResult() : x;
     };
+    // A body value over t, from the new generic's arguments (t's element, then the extras): the compared value
+    // or the payload's term, whose reduced index is one less over t than over the box.
+    auto over = [&](OpBuilder &nb, Location l, ValueRange args, Value v) {
+      IRMapping map;
+      map.map(sel->in, args[0]);
+      for (auto [i, e] : llvm::enumerate(extras))
+        map.map(e, args[1 + i]);
+      Value before;
+      std::function<Value(Value)> clone = [&](Value v) -> Value {
+        if (Value m = map.lookupOrNull(v))
+          return m;
+        Operation *op = v.getDefiningOp();
+        if (op->getBlock() != &body && !op->hasTrait<OpTrait::ConstantLike>())
+          return v; // a value from above, read as it is
+        if (auto i = dyn_cast<linalg::IndexOp>(op); i && i.getDim() == r) {
+          if (!before) {
+            Value index = linalg::IndexOp::create(nb, l, r);
+            before = arith::SubIOp::create(nb, l, index, arith::ConstantIndexOp::create(nb, l, 1));
+          }
+          map.map(v, before);
+          return before;
+        }
+        for (Value o : op->getOperands())
+          clone(o);
+        return nb.clone(*op, map)->getResult(cast<OpResult>(v).getResultNumber());
+      };
+      return clone(v);
+    };
+    SmallVector<Value> ins{t};
+    SmallVector<AffineMap> inMaps{xMap};
+    for (BlockArgument e : extras) {
+      ins.push_back(g.getDpsInputs()[e.getArgNumber()]);
+      inMaps.push_back(g.getIndexingMapsArray()[e.getArgNumber()]);
+    }
+    unsigned nx = ins.size();
+    SmallVector<AffineMap> valueMaps(inMaps);
+    valueMaps.push_back(outMap);
     auto value = linalg::GenericOp::create(
-        b, loc, TypeRange{wideType}, ValueRange{t}, ValueRange{wideInit},
-        ArrayRef<AffineMap>{xMap, outMap}, iters, [&](OpBuilder &nb, Location l, ValueRange a) {
-          SmallVector<Value> args{widened(nb, l, a[0]), a[1]};
+        b, loc, TypeRange{wideType}, ins, ValueRange{wideInit}, valueMaps, iters,
+        [&](OpBuilder &nb, Location l, ValueRange a) {
+          SmallVector<Value> args{widened(nb, l, over(nb, l, a, sel->compared)), a[nx]};
           Value m = fv ? (sel->max ? arith::MaximumFOp::create(nb, l, args[1], args[0]).getResult()
                                    : arith::MinimumFOp::create(nb, l, args[1], args[0]).getResult())
                        : (sel->max ? arith::MaxSIOp::create(nb, l, args[1], args[0]).getResult()
                                    : arith::MinSIOp::create(nb, l, args[1], args[0]).getResult());
           linalg::YieldOp::create(nb, l, m);
         });
-    // The payload: the least (greatest) term of the elements equal to m. The term moves with the elements: its
-    // index is one less over t than over the box.
+    // The payload: the least (greatest) term of the elements equal to m.
     TypedAttr none = extreme(pt, sel->leastPayload);
+    ins.push_back(value.getResult(0));
+    inMaps.push_back(outMap);
+    inMaps.push_back(g.getIndexingMapsArray()[g.getNumDpsInputs() + sel->payload]);
     auto payload = linalg::GenericOp::create(
-        b, loc, TypeRange{initP.getType()}, ValueRange{t, value.getResult(0)}, ValueRange{fill(initP, none)},
-        ArrayRef<AffineMap>{xMap, outMap, g.getIndexingMapsArray()[g.getNumDpsInputs() + sel->payload]}, iters,
+        b, loc, TypeRange{initP.getType()}, ins, ValueRange{fill(initP, none)}, inMaps, iters,
         [&](OpBuilder &nb, Location l, ValueRange args) {
-          IRMapping map;
-          Value index = linalg::IndexOp::create(nb, l, r);
-          Value before = arith::SubIOp::create(nb, l, index, arith::ConstantIndexOp::create(nb, l, 1));
-          std::function<Value(Value)> clone = [&](Value v) -> Value {
-            if (Value m = map.lookupOrNull(v))
-              return m;
-            Operation *op = v.getDefiningOp();
-            if (auto i = dyn_cast<linalg::IndexOp>(op); i && i.getDim() == r) {
-              map.map(v, before);
-              return before;
-            }
-            for (Value o : op->getOperands())
-              clone(o);
-            return nb.clone(*op, map)->getResult(cast<OpResult>(v).getResultNumber());
-          };
-          Value term = clone(sel->term);
-          Value x = widened(nb, l, args[0]);
-          Value eq = fv ? arith::CmpFOp::create(nb, l, arith::CmpFPredicate::OEQ, x, args[1]).getResult()
-                        : arith::CmpIOp::create(nb, l, arith::CmpIPredicate::eq, x, args[1]).getResult();
+          Value term = over(nb, l, args, sel->term);
+          Value x = widened(nb, l, over(nb, l, args, sel->compared));
+          Value eq = fv ? arith::CmpFOp::create(nb, l, arith::CmpFPredicate::OEQ, x, args[nx]).getResult()
+                        : arith::CmpIOp::create(nb, l, arith::CmpIPredicate::eq, x, args[nx]).getResult();
           Value candidate = arith::SelectOp::create(nb, l, eq, term, arith::ConstantOp::create(nb, l, none));
-          Value p = sel->leastPayload ? arith::MinSIOp::create(nb, l, args[2], candidate).getResult()
-                                      : arith::MaxSIOp::create(nb, l, args[2], candidate).getResult();
+          Value p = sel->leastPayload ? arith::MinSIOp::create(nb, l, args[nx + 1], candidate).getResult()
+                                      : arith::MaxSIOp::create(nb, l, args[nx + 1], candidate).getResult();
           linalg::YieldOp::create(nb, l, p);
         });
     if (!narrow)
@@ -2510,3 +2620,4 @@ void mlir::furiosa::padsToInserts(ModuleOp module) {
     pad.erase();
   }
 }
+
