@@ -1011,6 +1011,10 @@ struct StoreSpace {
   // Per stored axis: its step along its view dim (coordinate = origin + step * axis); origins of a
   // stepped axis lie in [0, step), so axis = G floordiv step and origin = G mod step.
   SmallVector<int64_t> step;
+  // Per instance, the first coordinate it writes along each view dim; per view dim, the tile extent and the phase
+  // at which every instance's tile starts (-1: not aligned), so a coordinate determines its tile's origin there.
+  std::vector<SmallVector<int64_t>> viewLo;
+  SmallVector<int64_t> viewExtent, viewPhase;
   SmallVector<unsigned> loops;                 // ids of the loops around the store: its leading axes
   SmallVector<unsigned> freeDims;              // view dims no axis moves along
   // Per instance: the origin of each stored axis, then the coordinate of each free dim.
@@ -1884,6 +1888,8 @@ FailureOr<StoreSpace> Raiser::storeSpace(Write store, ArrayRef<int64_t> extraStr
     sp.boxHi.assign(nd, std::numeric_limits<int64_t>::min());
     int64_t count = 0;
     SmallVector<int64_t> idx(rank), coord(nd), live(rank, 0); // live: per axis, past the last index written
+    sp.viewLo.assign(act.size(), SmallVector<int64_t>(nd, std::numeric_limits<int64_t>::max()));
+    std::vector<SmallVector<int64_t>> viewHi(act.size(), SmallVector<int64_t>(nd, std::numeric_limits<int64_t>::min()));
     why.clear();
     for (auto [n, ev] : llvm::enumerate(act)) {
       if (maskNever[n])
@@ -1930,6 +1936,8 @@ FailureOr<StoreSpace> Raiser::storeSpace(Write store, ArrayRef<int64_t> extraStr
         for (unsigned j = 0; j < nd; ++j) {
           sp.boxLo[j] = std::min(sp.boxLo[j], coord[j]);
           sp.boxHi[j] = std::max(sp.boxHi[j], coord[j]);
+          sp.viewLo[n][j] = std::min(sp.viewLo[n][j], coord[j]);
+          viewHi[n][j] = std::max(viewHi[n][j], coord[j]);
         }
       }
       if (!why.empty())
@@ -1947,6 +1955,18 @@ FailureOr<StoreSpace> Raiser::storeSpace(Write store, ArrayRef<int64_t> extraStr
       return std::nullopt;
     }
     sp.full = (count == numel);
+    sp.viewExtent.assign(nd, 0);
+    sp.viewPhase.assign(nd, -1);
+    for (unsigned j = 0; j < nd; ++j) {
+      bool all = true;
+      for (unsigned n = 0; n < act.size(); ++n) {
+        all &= viewHi[n][j] >= sp.viewLo[n][j];
+        sp.viewExtent[j] = std::max(sp.viewExtent[j], viewHi[n][j] - sp.viewLo[n][j] + 1);
+      }
+      int64_t e = sp.viewExtent[j], ph = all ? ((sp.viewLo[0][j] % e) + e) % e : -1;
+      if (ph >= 0 && llvm::all_of(sp.viewLo, [&](auto &lo) { return ((lo[j] % e) + e) % e == ph; }))
+        sp.viewPhase[j] = ph;
+    }
     // Tile phase per axis, for recovering origins from global indices.
     sp.extent.assign(rank, 0);
     sp.phase.assign(rank, -1);
@@ -2274,6 +2294,32 @@ FailureOr<AffineExpr> Raiser::rewriteSymbolic(Operation *at, const Gen &g, Array
         if (k < space->global.size() && select(*s).isFunctionOfSymbol(nl + d))
           originUses.insert(k);
       }
+    }
+    // Else from the tile origin along a view dim, which the coordinate there determines: one digit of it when the
+    // origin mixes program ids in mixed radix (rows of sequence b, block i at b * T + i * BLOCK), as when a digit
+    // axis's origin mixes those of its dims (rows t * GROUP + j over a [T, heads] view).
+    for (unsigned j = 0; j < space->viewPhase.size() && !pidExpr[d] && space->viewLo.size() == act.size(); ++j) {
+      if (space->viewPhase[j] < 0 || g.coordPos[j] < 0)
+        continue;
+      SmallVector<int64_t> y;
+      for (auto &lo : space->viewLo)
+        y.push_back(lo[j]);
+      auto c = fitAffine(pids, y);
+      if (!c || (*c)[d] <= 0)
+        continue;
+      int64_t a = (*c)[d], up = 0; // the next larger coefficient bounds the digit
+      for (unsigned e = 0; e < 3; ++e)
+        if (e != d && (*c)[e] > a && (!up || (*c)[e] < up))
+          up = (*c)[e];
+      auto digit = [&](int64_t o) {
+        int64_t q = floorDiv(o - (*c)[3], a);
+        return up ? ((q % (up / a)) + up / a) % (up / a) : q;
+      };
+      if (up % a || llvm::any_of(llvm::seq<size_t>(0, act.size()), [&](size_t n) { return digit(y[n]) != pids[n][d]; }))
+        continue;
+      AffineExpr x = getAffineDimExpr(g.coordPos[j], ctx);
+      AffineExpr q = (x - (x - space->viewPhase[j]) % space->viewExtent[j] - (*c)[3]).floorDiv(a);
+      pidExpr[d] = up ? q % (up / a) : q;
     }
     if (!pidExpr[d])
       return failure();
