@@ -122,7 +122,10 @@ npu stage) against GPU goldens.
     frames) and a decoder step with causal self-attention and cross-attention; next token identical.
 - Larger models: the Qwen3 graphs build every size from a Config, qwen3_0_6b's TTIR unchanged byte for byte
   (0ff6f16); `qwen3_1_7b` runs them at Qwen3-1.7B's config with the official weights, greedy tokens identical to
-  transformers' (42b818b).
+  transformers' (42b818b), as do `qwen3_4b` (6dd5987) and `qwen3_8b` (5115db6, untied head); `llama3_1_8b`
+  (b99cd56) is a new pure-Triton module written from the math (GQA with Llama 3's rope scaling, SwiGLU, an untied
+  head over 128256 tokens; weights unsloth/Llama-3.1-8B-Instruct, bf16). The sizes from 1.7B up stop at L1 with an
+  LLVM assertion (`cast<AffineDimExpr>`) in the prefill's final RMSNorm once hidden >= 2048: a fix is in progress.
 - Codegen for scatter-add and segment sum (each with a lit test):
   - A float reduction step a data condition guards adds `select(c, x, -0.0)` (1771109), extending the integer form.
   - An index compared with data, or masked into such a comparison, is a hoisted table (e841e2c); `rem(a, 2^k) == 0`
