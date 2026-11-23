@@ -122,7 +122,7 @@ tiles are cut from) and `fopt.read` (one tile of it in DM). `furiosa-dma` (lib/C
 data-movement decisions and lowers both to HBM staging buffers and DMAs: padded copies and their fills (one copy
 shared by the stages of a buffer that differ only in their windows, such as unrolled taps), tap-major or
 row-major K for contraction operands, inner digits zero-padded in the source copy (a K window of a longer dim,
-such as attention's P x V reading one key block of V, is one block of the padded K digit), the taps' DMAs as kept loops
+such as attention's P x V reading one key block of V, is one block of the padded K digit, the dim padded to whole blocks in the copy when they do not divide it), the taps' DMAs as kept loops
 over affine tap classes. `furiosa-ve-fuse` (lib/Codegen/Tile/VeFuse.cpp) groups the `fopt.ve` ops into passes:
 an op joins the pass of its input when that input has no other use and the op fits the engine's stage order
 (stages never go back; the float and clip stages take several ops, each on its own ALU; multiplications take

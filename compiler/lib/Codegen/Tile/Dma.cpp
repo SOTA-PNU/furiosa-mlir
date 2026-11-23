@@ -359,6 +359,10 @@ FailureOr<Value> Stager::materialize(const Read &r, ArrayRef<unsigned> rowAxes, 
       extent[j] = k->innerPad;
     if (!rem[j].empty())
       extent[j] = roundUp(extent[j], rem[j].front().second);
+    // A K window of a longer dim the K blocks do not divide (32 keys of 100): the copy pads it to whole blocks.
+    if (k && k->innerPad > 1 && !rem[j].empty() && innerAxis && rem[j].front().first == *innerAxis &&
+        extent[j] > rem[j].front().second * k->innerPad)
+      extent[j] = roundUp(extent[j], rem[j].front().second * k->innerPad);
   }
   // A copy shared with other stages of the buffer: the union of their windows.
   if (shared) {
