@@ -43,6 +43,21 @@ std::string structure(const std::string &text) {
   return out;
 }
 
+/// Runs furiosa-raise-to-linalg on a TTIR module in place; its diagnostics become the error, so a kernel outside the
+/// subset reports why wherever the exception lands (the harness shows its last lines).
+void raiseToLinalg(mlir::ModuleOp &module) {
+  std::string diagnostics;
+  llvm::raw_string_ostream diag(diagnostics);
+  mlir::ScopedDiagnosticHandler handler(module.getContext(), [&](mlir::Diagnostic &d) {
+    diag << d.getLocation() << ": " << d << "\n";
+    return mlir::success();
+  });
+  mlir::PassManager pm(module.getContext());
+  pm.addPass(mlir::furiosa::createRaiseToLinalgPass());
+  if (mlir::failed(pm.run(module)))
+    throw std::runtime_error("furiosa-raise-to-linalg failed:\n" + diagnostics);
+}
+
 } // namespace
 
 void init_furiosa_passes(nb::module_ &m) {
@@ -50,6 +65,6 @@ void init_furiosa_passes(nb::module_ &m) {
   m.def("load_dialects", [](mlir::MLIRContext &context) {});
 
   auto passes = m.def_submodule("passes");
-  passes.def("add_raise_to_linalg", [](mlir::PassManager &pm) { pm.addPass(mlir::furiosa::createRaiseToLinalgPass()); });
+  passes.def("raise_to_linalg", &raiseToLinalg, "TTIR module -> raised linalg, in place");
   passes.def("structure", &structure, "Gather-form raised linalg (text) -> structured linalg (text)");
 }

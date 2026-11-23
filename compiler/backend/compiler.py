@@ -118,10 +118,7 @@ class FuriosaBackend(BaseBackend):
         launch = json.dumps({"grid": list(options.grid), "buffers": json.loads(options.buffers),
                              "scalars": json.loads(options.scalars)})
         mod.set_attr("furiosa.launch", builder.get_string_attr(launch))
-        pm = ir.pass_manager(mod.context)
-        pm.enable_debug()
-        furiosa.passes.add_raise_to_linalg(pm)
-        pm.run(mod, "make_linalg")
+        furiosa.passes.raise_to_linalg(mod)
         metadata["name"] = mod.get_entry_func_name()
         return str(mod)
 
