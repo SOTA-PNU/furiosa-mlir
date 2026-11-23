@@ -25,9 +25,11 @@ struct RaisedKernel {
 };
 
 /// SPMD over chips: the kernels of a module with `furiosa.chips = N` run on N chips, each on its own copy of the
-/// data (every type's chip mapping is the CHIP axis) (LinalgToFopt.cpp).
+/// data (every type's chip mapping is the CHIP axis), and furiosa-shard may split one parallel dim of a kernel over
+/// them, marking the pointer arguments it splits with `furiosa.shard` (the dim) (LinalgToFopt.cpp).
 inline constexpr llvm::StringLiteral kChipAxis = "CHIP";
 inline constexpr llvm::StringLiteral kChipsAttr = "furiosa.chips";
+inline constexpr llvm::StringLiteral kShardAttr = "furiosa.shard";
 /// The chips the module of `op` runs its kernels on (1 without `furiosa.chips`).
 int64_t chipCount(Operation *op);
 /// The chip mapping of the kernels in the module of `op`: m![1], or the CHIP axis.
@@ -54,8 +56,9 @@ public:
 
   /// A pointer argument the kernel reads, as `&HbmTensor<D, Chip, element>`; returns its parameter index.
   unsigned input(int64_t ptrArg, Type elementType, fopt::MapAttr element);
-  /// The kernel parameter `i` (after beginBody).
-  Value param(unsigned i) { return kernel.getArgument(i); }
+  /// The kernel parameter `i` (after beginBody): the argument, or this chip's shard of it when furiosa-shard split
+  /// the argument over the chips.
+  Value param(unsigned i) { return params[i]; }
   /// A pointer argument the kernel writes, as a returned `HbmTensor<D, Chip, element>`.
   void output(int64_t ptrArg, Type elementType, fopt::MapAttr element);
   /// A pointer argument the kernel updates in place, as `&mut HbmTensor<D, Chip, element>` (the kernel
@@ -87,6 +90,13 @@ private:
   SmallVector<int64_t> inputArgs, outputArgs;
   SmallVector<bool> inoutParams;
   func::FuncOp kernel;
+  SmallVector<Value> params;
+
+  /// The whole buffer's HBM type behind a parameter or result of `shard` type, for a pointer argument whose dim
+  /// furiosa-shard split over the chips (null when it did not).
+  fopt::HbmTensorType wholeType(fopt::HbmTensorType shard, RankedTensorType tensor, Attribute dim);
+  /// One HBM-to-HBM DMA of tensor `from` into tensor `to` (a chip's block of a whole buffer, or back).
+  void copy(Value from, Value to);
 };
 
 /// The loops furiosa-tile makes before a class maps a kernel (lib/Codegen/Tile/TilePass.cpp): tile sizes of the

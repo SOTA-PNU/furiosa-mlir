@@ -599,7 +599,8 @@ def build_crate(result: dict, out: Path, crate: Path) -> Path:
     if errors:
         raise CrateError("\n".join(errors))
 
-    name = ident(model.stem).lower()
+    # Crates of one name share cargo's unit hashes in a target dir: an N-chip crate is named apart from the 1-chip one.
+    name = ident(model.stem).lower() + (f"_chips{CHIPS}" if CHIPS > 1 else "")
     run_graph = RunGraph(result["graphs"], signatures, plans, name).source(model.name)
     reset(crate)
     (crate / "src" / "kernel").mkdir(parents=True, exist_ok=True)

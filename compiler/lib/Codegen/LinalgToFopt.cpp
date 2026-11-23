@@ -3,6 +3,7 @@
 #include "Mapping/Mapping.h"
 #include "furiosa/Codegen/Codegen.h"
 
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
 #include "mlir/Dialect/Linalg/Transforms/TilingInterfaceImpl.h"
@@ -12,7 +13,9 @@
 #include "mlir/Dialect/Tensor/IR/TensorInferTypeOpInterfaceImpl.h"
 #include "mlir/Dialect/Tensor/IR/TensorTilingInterfaceImpl.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Verifier.h"
+#include "mlir/Pass/PassManager.h"
 
 using namespace mlir;
 using namespace mlir::furiosa;
@@ -21,6 +24,9 @@ using namespace mlir::furiosa::mapping;
 //===----------------------------------------------------------------------===//
 // KernelBuilder
 //===----------------------------------------------------------------------===//
+
+/// A kernel whose split pointer argument has no digit boundary at its split dim in the class's layout of it.
+static constexpr StringLiteral kUnsplitAttr = "furiosa.unsplit";
 
 int64_t mapping::chipCount(Operation *op) {
   ModuleOp module = isa<ModuleOp>(op) ? cast<ModuleOp>(op) : op->getParentOfType<ModuleOp>();
@@ -35,6 +41,56 @@ fopt::MapAttr mapping::chipMapping(Operation *op) {
 
 KernelBuilder::KernelBuilder(RaisedKernel &raised)
     : raised(raised), ctx(raised.func.getContext()), b(raised.func.getContext()), chips(chipCount(raised.func)) {}
+
+void KernelBuilder::copy(Value from, Value to) {
+  auto view = [&](Value v, bool mut) {
+    auto t = cast<fopt::HbmTensorType>(v.getType());
+    return fopt::ViewOp::create(b, loc(), fopt::HbmViewType::get(ctx, t.getElementType(), t.getChip(), t.getElement(), mut),
+                                v);
+  };
+  Value src = view(from, false), dst = view(to, true);
+  fopt::HbmToHbmViewOp::create(b, loc(), src, dst);
+}
+
+fopt::HbmTensorType KernelBuilder::wholeType(fopt::HbmTensorType shard, RankedTensorType tensor, Attribute dim) {
+  auto d = dyn_cast_or_null<IntegerAttr>(dim);
+  if (!d)
+    return {};
+  // The whole buffer is chip-major within the split dim: its layout is the shard's with the chip axis before the
+  // digits of that dim and the ones after it (a digit straddling that boundary splits there).
+  fopt::MapAttr element = shard.getElement();
+  SmallVector<fopt::MapAttr> parts;
+  if (element.getKind() == fopt::MapKind::Pair)
+    for (Attribute p : element.getOperands())
+      parts.push_back(cast<fopt::MapAttr>(p));
+  else
+    parts.push_back(element);
+  int64_t inner = 1;
+  for (int64_t s : tensor.getShape().drop_front(d.getInt()))
+    inner *= s;
+  size_t at = parts.size();
+  int64_t acc = 1;
+  while (acc < inner) {
+    if (inner % acc || !at)
+      return {};
+    fopt::MapAttr part = parts[--at];
+    int64_t need = inner / acc;
+    if (part.size() > need) {
+      if (part.size() % need)
+        return {};
+      parts[at] = part.stride(need);
+      parts.insert(parts.begin() + at + 1, part.modulo(need));
+      ++at;
+    }
+    acc *= parts[at].size();
+  }
+  if (acc != inner)
+    return {};
+  parts.insert(parts.begin() + at, axis(kChipAxis, chips));
+  // The same on every chip: a broadcast chip mapping.
+  return fopt::HbmTensorType::get(ctx, shard.getElementType(), fopt::MapAttr::broadcast(ctx, chips),
+                                  fopt::MapAttr::pair(ctx, parts));
+}
 
 fopt::MapAttr KernelBuilder::axis(StringRef name, int64_t size) {
   for (auto &[existing, n] : axes)
@@ -69,7 +125,27 @@ void KernelBuilder::output(int64_t ptrArg, Type elementType, fopt::MapAttr eleme
 void KernelBuilder::beginBody() {
   func::FuncOp src = raised.func;
   b.setInsertionPoint(src);
-  kernel = func::FuncOp::create(b, src.getLoc(), src.getName(), b.getFunctionType(inputTypes, outputTypes));
+  // A pointer argument furiosa-shard split over the chips: the kernel takes (returns) the whole buffer, the same on
+  // every chip, and the class maps one chip's shard: copied out of it first (finish gathers results back).
+  SmallVector<Type> ins(inputTypes), outs(outputTypes);
+  bool unsplit = false;
+  auto whole = [&](Type shard, int64_t arg, bool result) -> Type {
+    unsigned r = llvm::find(raised.written, arg) - raised.written.begin();
+    if (result && r == raised.written.size())
+      return shard;
+    Attribute dim = result ? src.getResultAttr(r, kShardAttr) : src.getArgAttr(arg, kShardAttr);
+    auto tensor = dyn_cast<RankedTensorType>(result ? src.getResultTypes()[r] : src.getArgumentTypes()[arg]);
+    fopt::HbmTensorType t = tensor ? wholeType(cast<fopt::HbmTensorType>(shard), tensor, dim) : nullptr;
+    unsplit |= dim && !t;
+    return t ? t : shard;
+  };
+  for (auto [i, arg] : llvm::enumerate(inputArgs))
+    ins[i] = whole(inputTypes[i], arg, false);
+  for (auto [i, arg] : llvm::enumerate(outputArgs))
+    outs[i] = whole(outputTypes[i], arg, true);
+  kernel = func::FuncOp::create(b, src.getLoc(), src.getName(), b.getFunctionType(ins, outs));
+  if (unsplit) // no digit boundary of a parameter's layout at its split dim: mapKernel fails the kernel
+    kernel->setAttr(kUnsplitAttr, b.getUnitAttr());
   kernel->setAttr(fopt::kChipAttr, b.getI64IntegerAttr(chips));
   kernel->setAttr(fopt::kPeAttr, b.getI64IntegerAttr(8));
   for (auto [i, arg] : llvm::enumerate(inputArgs)) {
@@ -83,14 +159,36 @@ void KernelBuilder::beginBody() {
     kernel.setResultAttr(i, "fopt.arg", b.getI64IntegerAttr(arg));
   }
   b.setInsertionPointToStart(kernel.addEntryBlock());
+  params = llvm::to_vector_of<Value>(kernel.getArguments());
+  Location loc = src.getLoc();
+  for (auto [i, t] : llvm::enumerate(ins)) {
+    if (t == inputTypes[i])
+      continue;
+    // Chip c copies block c of the split dim out of its own copy of the whole buffer.
+    params[i] = fopt::AllocHbmOp::create(b, loc, inputTypes[i]);
+    copy(kernel.getArgument(i), params[i]);
+  }
 }
 
 void KernelBuilder::finish(ArrayRef<Value> results) {
+  SmallVector<Value> returned(results);
+  Location loc = raised.func.getLoc();
+  for (auto [r, t] : llvm::enumerate(kernel.getResultTypes())) {
+    if (t == outputTypes[r])
+      continue;
+    // All-gather: every chip's block into every chip's copy of the whole buffer (a DMA across chips).
+    returned[r] = fopt::AllocHbmOp::create(b, loc, t);
+    copy(results[r], returned[r]);
+  }
+  // A split buffer updated in place: its block back into every chip's copy.
+  for (auto [i, t] : llvm::enumerate(kernel.getArgumentTypes()))
+    if (t != inputTypes[i] && inoutParams[i])
+      copy(params[i], kernel.getArgument(i));
   SmallVector<Attribute> decls;
   for (auto &[name, size] : axes)
     decls.push_back(b.getArrayAttr({b.getStringAttr(name), b.getI64IntegerAttr(size)}));
   kernel->setAttr(fopt::kAxesAttr, b.getArrayAttr(decls));
-  func::ReturnOp::create(b, raised.func.getLoc(), results);
+  func::ReturnOp::create(b, loc, returned);
   raised.func.erase();
 }
 
@@ -339,7 +437,8 @@ bool mapping::mapsOnCopy(func::FuncOp func, const OpClass &c, unsigned maxDmas) 
       dmas += isa<fopt::StageOp, fopt::ReadOp, fopt::ToDmOp, fopt::ViewToDmOp, fopt::ToHbmOp, fopt::DmToHbmViewOp,
                   fopt::HbmToHbmViewOp, fopt::GatherOp>(op);
     });
-  return kernel && kernel.getNumArguments() <= kMaxParams && dmas <= maxDmas && succeeded(verify(kernel));
+  return kernel && !kernel->hasAttr(kUnsplitAttr) && kernel.getNumArguments() <= kMaxParams && dmas <= maxDmas &&
+         succeeded(verify(kernel));
 }
 
 LogicalResult mapping::mapKernel(func::FuncOp func) {
@@ -371,11 +470,235 @@ LogicalResult mapping::mapKernel(func::FuncOp func) {
   Location loc = func.getLoc();
   if (failed(chosen->map(kernel)))
     return failure();
-  if (auto mapped = module.lookupSymbol<func::FuncOp>(name); mapped && mapped.getNumArguments() > kMaxParams)
+  auto mapped = module.lookupSymbol<func::FuncOp>(name);
+  if (mapped && mapped.getNumArguments() > kMaxParams)
     return emitError(loc) << chosen->name << ": " << mapped.getNumArguments() << " parameters, more than the "
                           << kMaxParams << " a launch passes";
+  if (mapped && mapped->hasAttr(kUnsplitAttr))
+    return emitError(loc) << chosen->name << ": a buffer's layout has no digit boundary at the dim split over chips";
   return success();
 }
+
+//===----------------------------------------------------------------------===//
+// furiosa-shard: one parallel dim of a kernel split over the chips
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// A parallel dim split over the chips: the tensor values it reaches with the dim of each the chips split, and the
+/// linalg ops computing them with the loop the chips split.
+struct Split {
+  DenseMap<Value, int64_t> dims;
+  DenseMap<Operation *, unsigned> loops;
+};
+
+/// Splits dim `dim` of `seed` over `n` chips through `func`: each linalg op computing or reading a split value runs
+/// that loop split, so every value the split reaches is computed block by block, one block per chip, from blocks of
+/// its operands along the same loop (or their whole value where the loop does not index them). Fails where a block
+/// would not be a box of one dim of every operand (a window, the loop's index used as data, an op outside linalg),
+/// or would not divide.
+LogicalResult propagate(func::FuncOp func, Value seed, int64_t dim, int64_t n, Split &s) {
+  SmallVector<std::pair<Value, int64_t>> work;
+  SmallVector<Value> whole; // read whole by a split op
+  auto mark = [&](Value v, int64_t d) -> LogicalResult {
+    auto [it, fresh] = s.dims.try_emplace(v, d);
+    if (!fresh)
+      return success(it->second == d);
+    auto t = dyn_cast<RankedTensorType>(v.getType());
+    if (!t || !t.hasStaticShape() || t.getDimSize(d) % n)
+      return failure();
+    work.push_back({v, d});
+    return success();
+  };
+  auto at = [](AffineMap map, unsigned l) -> std::optional<int64_t> {
+    std::optional<int64_t> pos;
+    for (auto [i, e] : llvm::enumerate(map.getResults())) {
+      if (auto d = dyn_cast<AffineDimExpr>(e); d && d.getPosition() == l) {
+        if (pos)
+          return -1;
+        pos = i;
+      } else if (e.isFunctionOfDim(l)) {
+        return -1;
+      }
+    }
+    return pos;
+  };
+  auto splitOp = [&](linalg::LinalgOp op, unsigned l) -> LogicalResult {
+    auto [it, fresh] = s.loops.try_emplace(op, l);
+    if (!fresh)
+      return success(it->second == l);
+    if (op.getIteratorTypesArray()[l] != utils::IteratorType::parallel)
+      return failure();
+    bool local = !op->walk([&](Operation *inner) {
+                      auto index = dyn_cast<linalg::IndexOp>(inner);
+                      return (index && index.getDim() == l) || isa<tensor::ExtractOp>(inner) ? WalkResult::interrupt()
+                                                                                              : WalkResult::advance();
+                    }).wasInterrupted();
+    if (!local)
+      return failure();
+    for (OpOperand &o : op->getOpOperands()) {
+      if (!isa<RankedTensorType>(o.get().getType()))
+        continue;
+      std::optional<int64_t> p = at(op.getMatchingIndexingMap(&o), l);
+      if (!p)
+        whole.push_back(o.get());
+      else if (*p < 0 || failed(mark(o.get(), *p)))
+        return failure();
+    }
+    for (OpResult r : op->getResults()) {
+      std::optional<int64_t> p = at(op.getIndexingMapMatchingResult(r), l);
+      if (!p || *p < 0 || failed(mark(r, *p)))
+        return failure();
+    }
+    return success();
+  };
+  auto loopOf = [](AffineMap map, int64_t d) -> std::optional<unsigned> {
+    if (auto e = dyn_cast<AffineDimExpr>(map.getResult(d)))
+      return e.getPosition();
+    return std::nullopt;
+  };
+  if (failed(mark(seed, dim)))
+    return failure();
+  while (!work.empty()) {
+    auto [v, d] = work.pop_back_val();
+    // Its producer computes it split.
+    if (auto arg = dyn_cast<BlockArgument>(v)) {
+      if (arg.getOwner() != &func.getBody().front())
+        return failure();
+    } else if (auto op = v.getDefiningOp<linalg::LinalgOp>()) {
+      std::optional<unsigned> l = loopOf(op.getIndexingMapMatchingResult(cast<OpResult>(v)), d);
+      if (!l || failed(splitOp(op, *l)))
+        return failure();
+    } else if (!v.getDefiningOp<tensor::EmptyOp>()) {
+      return failure();
+    }
+    // Its readers read it split.
+    for (OpOperand &use : v.getUses()) {
+      if (isa<func::ReturnOp>(use.getOwner()))
+        continue;
+      auto op = dyn_cast<linalg::LinalgOp>(use.getOwner());
+      std::optional<unsigned> l = op ? loopOf(op.getMatchingIndexingMap(&use), d) : std::nullopt;
+      if (!l || failed(splitOp(op, *l)))
+        return failure();
+    }
+  }
+  return success(llvm::none_of(whole, [&](Value v) { return s.dims.count(v); }));
+}
+
+/// Gives every value `s` reaches its block's type (and a written buffer its result's: the kernel does not read it)
+/// and marks the split arguments and results with their dim.
+void applySplit(func::FuncOp func, const Split &s, int64_t n) {
+  Builder b(func.getContext());
+  for (auto [v, d] : s.dims) {
+    auto t = cast<RankedTensorType>(v.getType());
+    SmallVector<int64_t> shape(t.getShape());
+    shape[d] /= n;
+    v.setType(t.clone(shape));
+  }
+  Operation *ret = func.getBody().front().getTerminator();
+  for (BlockArgument arg : func.getArguments())
+    if (auto it = s.dims.find(arg); it != s.dims.end())
+      func.setArgAttr(arg.getArgNumber(), kShardAttr, b.getI64IntegerAttr(it->second));
+  for (OpOperand &r : ret->getOpOperands())
+    if (auto it = s.dims.find(r.get()); it != s.dims.end())
+      func.setResultAttr(r.getOperandNumber(), kShardAttr, b.getI64IntegerAttr(it->second));
+  // A written buffer is its result's block too (a class may update it in place).
+  for (auto [r, a] : llvm::enumerate(writtenArgs(func))) {
+    func.getArgument(a).setType(ret->getOperand(r).getType());
+    if (Attribute dim = func.getResultAttr(r, kShardAttr))
+      func.setArgAttr(a, kShardAttr, dim);
+  }
+  func.setType(FunctionType::get(func.getContext(), func.getBody().getArgumentTypes(), ret->getOperandTypes()));
+}
+
+/// Splits the outermost parallel dim of a result that reaches the kernel's other values as blocks and still maps
+/// split (an op class maps the block kernel), trying the results in order; a kernel with none runs whole on every
+/// chip. A kernel that reads a buffer it writes (in place) is not split.
+void shardKernel(func::FuncOp func, int64_t n, function_ref<LogicalResult(ModuleOp)> maps) {
+  for (int64_t a : writtenArgs(func))
+    if (!func.getArgument(a).use_empty())
+      return;
+  Operation *ret = func.getBody().front().getTerminator();
+  // FURIOSA_DEBUG=1 says why a dim does not split.
+  auto why = [&](unsigned r, int64_t d, StringRef reason) {
+    if (getenv("FURIOSA_DEBUG"))
+      llvm::errs() << "shard: " << func.getName() << ": result " << r << " dim " << d << ": " << reason << "\n";
+  };
+  for (auto [i, r] : llvm::enumerate(ret->getOperands())) {
+    auto t = dyn_cast<RankedTensorType>(r.getType());
+    for (int64_t d = 0; t && d < t.getRank(); ++d) {
+      Split s;
+      if (failed(propagate(func, r, d, n, s))) {
+        why(i, d, "not a box of one dim of every operand");
+        continue;
+      }
+      // On a copy in a module like this one, nested in it while it maps: the block kernel must map all the way to
+      // fopt (a class's shape rules hold for it too).
+      ModuleOp parent = func->getParentOfType<ModuleOp>();
+      OpBuilder b = OpBuilder::atBlockEnd(parent.getBody());
+      auto scratch = ModuleOp::create(b, func.getLoc());
+      for (NamedAttribute attr : parent->getAttrs())
+        scratch->setAttr(attr.getName(), attr.getValue());
+      IRMapping map;
+      auto copy = cast<func::FuncOp>(func->clone(map));
+      scratch.push_back(copy);
+      Split c;
+      for (auto [v, dv] : s.dims)
+        c.dims[map.lookup(v)] = dv;
+      applySplit(copy, c, n);
+      LogicalResult mapped = failure();
+      {
+        ScopedDiagnosticHandler quiet(func.getContext(), [&](Diagnostic &diag) {
+          if (getenv("FURIOSA_DEBUG"))
+            llvm::errs() << "shard: " << func.getName() << ": " << diag << "\n";
+          return success();
+        });
+        mapped = maps(scratch);
+      }
+      scratch.erase();
+      if (failed(mapped)) {
+        why(i, d, "the block does not map");
+        continue;
+      }
+      applySplit(func, s, n);
+      return;
+    }
+  }
+}
+
+struct ShardPass : PassWrapper<ShardPass, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ShardPass)
+
+  StringRef getArgument() const override { return "furiosa-shard"; }
+  StringRef getDescription() const override {
+    return "Split one parallel dim of each kernel over the module's furiosa.chips chips";
+  }
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registerCodegenDialects(registry);
+    registry.insert<affine::AffineDialect>(); // furiosa-tile's, run on the trial copies
+  }
+
+  void runOnOperation() override {
+    int64_t n = chipCount(getOperation());
+    if (n < 2)
+      return;
+    auto maps = [&](ModuleOp m) {
+      OpPassManager pm(ModuleOp::getOperationName());
+      pm.addPass(createTilePass());
+      pm.addPass(createLinalgToFoptPass());
+      pm.addPass(createDmaPass());
+      pm.addPass(createVeFusePass());
+      return runPipeline(pm, m);
+    };
+    for (func::FuncOp func : llvm::to_vector(getOperation().getOps<func::FuncOp>()))
+      if (!func.isExternal() && !func->hasAttr(fopt::kChipAttr) && func->hasAttr("furiosa.written"))
+        shardKernel(func, n, maps);
+  }
+};
+
+} // namespace
+
+std::unique_ptr<Pass> mlir::furiosa::createShardPass() { return std::make_unique<ShardPass>(); }
 
 namespace {
 

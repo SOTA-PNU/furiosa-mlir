@@ -45,12 +45,15 @@ template <typename F> std::string withModule(const std::string &text, F body) {
 }
 
 /// The kernels mapped to fopt (furiosa-tile, furiosa-linalg-to-fopt, then with `lower` furiosa-dma and
-/// furiosa-ve-fuse) for `chips` chips: more than one sets the module's furiosa.chips (docs/usage.md).
+/// furiosa-ve-fuse) for `chips` chips: more than one sets the module's furiosa.chips and splits each kernel over them
+/// (furiosa-shard, docs/usage.md).
 std::string mapToFopt(const std::string &text, int64_t chips, bool lower) {
   return withModule(text, [&](mlir::ModuleOp module, llvm::raw_ostream &os) {
     mlir::PassManager pm(module->getContext());
-    if (chips > 1)
+    if (chips > 1) {
       module->setAttr("furiosa.chips", mlir::Builder(module->getContext()).getI64IntegerAttr(chips));
+      pm.addPass(mlir::furiosa::createShardPass());
+    }
     pm.addPass(mlir::furiosa::createTilePass());
     pm.addPass(mlir::furiosa::createLinalgToFoptPass());
     if (lower) {

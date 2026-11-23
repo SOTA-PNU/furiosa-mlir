@@ -18,6 +18,11 @@ namespace mlir::furiosa {
 /// dialect, op class by op class (lib/Codegen/Mapping/).
 std::unique_ptr<Pass> createLinalgToFoptPass();
 
+/// furiosa-shard: in a module with `furiosa.chips = N` (N > 1), splits one parallel dim of each kernel over the N
+/// chips where its blocks map, marking the split pointer arguments and results `furiosa.shard` (lib/Codegen/
+/// LinalgToFopt.cpp); mapping then gives every chip its block and gathers the results.
+std::unique_ptr<Pass> createShardPass();
+
 /// furiosa-split-steps: splitSteps as a pass over a module of structured kernels (lib/Codegen/Steps.cpp).
 std::unique_ptr<Pass> createSplitStepsPass();
 

@@ -82,8 +82,14 @@ FURIOSA_CHIPS=2 furiosa run out/vgg16-2                            # on npu2 and
 ```
 
 Between kernels every buffer is whole on every chip: uploads write each chip's copy (in DRAM the other chips may
-write), downloads read chip 0's. Every kernel runs on every chip, each on its own copy (every chip mapping is the
-`CHIP` axis), so the chips compute the same values.
+write), downloads read chip 0's. Every kernel runs on every chip (every chip mapping is the `CHIP` axis), and each
+kernel (each step of a split kernel) splits the outermost parallel dim of a result whose blocks are boxes of one dim
+of every operand (a matmul's rows, an image's output channels, a row-wise op's rows) and whose block still maps
+(`furiosa-shard`, lib/Codegen/LinalgToFopt.cpp): chip c copies block c of the inputs that dim indexes out of its
+own copy, computes block c of the result, and the result's blocks are gathered into every chip's copy (an
+all-gather: a DMA across chips). The other inputs are read whole. A kernel with no such dim (one whose blocks would
+be windows, use the dim's index as data, or do not divide by N), or that reads a buffer it writes, runs whole on
+every chip. `FURIOSA_DEBUG=1` says why a dim does not split.
 
 The NPUs are shared: npu0-npu2 run other users' services. A run opens exactly the NPUs it uses, holds a lock per
 NPU (`~/.cache/furiosa-npu/npu.lock` for npu3, `npu<i>.lock` for the others) and, right before it opens them, waits
