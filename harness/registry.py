@@ -99,13 +99,14 @@ CASES = {
                               top1="logits"),
     "vit_b16": Case("models/vit_b16.py", weights="torchvision", npu=Tol(rtol=5.8e-3, atol=0), top1="logits"),
     # Held-out vision models (written from torchvision's definitions without reading the compiler), by the same
-    # rule: twice the bf16 logit drift (efficientnet_b0 3.7%, convnext_tiny 0.74%, swin_t 1.13% of
-    # max|logit|).
+    # rule: twice the bf16 logit drift (efficientnet_b0 3.7%, convnext_tiny 0.74%, swin_t 1.13%,
+    # densenet121 1.94% of max|logit|).
     "efficientnet_b0": Case("models/efficientnet_b0.py", weights="torchvision", npu=Tol(rtol=7.4e-2, atol=0),
                             top1="logits"),
     "convnext_tiny": Case("models/convnext_tiny.py", weights="torchvision", npu=Tol(rtol=1.5e-2, atol=0),
                           top1="logits"),
     "swin_t": Case("models/swin_t.py", weights="torchvision", npu=Tol(rtol=2.3e-2, atol=0), top1="logits"),
+    "densenet121": Case("models/densenet121.py", weights="torchvision", npu=Tol(rtol=3.9e-2, atol=0), top1="logits"),
     # 28 bf16 layers: each kernel is held to one ulp per launch, but one-ulp differences compound over
     # the depth of a whole graph. NPU: the models' rule, twice the drift between two correct
     # implementations of the graph (L1's CPU JIT vs the GPU golden: 2.7% at kv_cache.27.v); the greedy
