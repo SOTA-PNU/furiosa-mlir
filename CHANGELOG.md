@@ -124,8 +124,11 @@ npu stage) against GPU goldens.
   (0ff6f16); `qwen3_1_7b` runs them at Qwen3-1.7B's config with the official weights, greedy tokens identical to
   transformers' (42b818b), as do `qwen3_4b` (6dd5987) and `qwen3_8b` (5115db6, untied head); `llama3_1_8b`
   (b99cd56) is a new pure-Triton module written from the math (GQA with Llama 3's rope scaling, SwiGLU, an untied
-  head over 128256 tokens; weights unsloth/Llama-3.1-8B-Instruct, bf16). The sizes from 1.7B up stop at L1 with an
-  LLVM assertion (`cast<AffineDimExpr>`) in the prefill's final RMSNorm once hidden >= 2048: a fix is in progress.
+  head over 128256 tokens; weights unsloth/Llama-3.1-8B-Instruct, bf16), and so is `qwen2_5_7b` (b6f2864: QKV bias, no
+  q/k norm). All five match transformers' greedy tokens in prefill and decode (logit drift 1.8-3.3%). All stop at L1:
+  an LLVM assertion (`cast<AffineDimExpr>`) in RMSNorm with residual run as one program at hidden >= 2048 (and
+  Llama's argmax), Llama's GQA prefill attention ("an address varies between program instances"), and silent
+  segfaults after tiling in GEMMs with N >= 12288 (SwiGLU, Llama's 128256-token head). Fixes are in progress.
 - Codegen for scatter-add and segment sum (each with a lit test):
   - A float reduction step a data condition guards adds `select(c, x, -0.0)` (1771109), extending the integer form.
   - An index compared with data, or masked into such a comparison, is a hoisted table (e841e2c); `rem(a, 2^k) == 0`
