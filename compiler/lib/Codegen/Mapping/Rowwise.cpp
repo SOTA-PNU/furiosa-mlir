@@ -1081,6 +1081,14 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
       if (a.kind == Node::Input && o.kind == Node::Input && a.type == o.type)
         step.zip = true;
     }
+    // A Full value of a Col input and a Row value (cols == idx[:, None]) streams the input: its DM tile holds its
+    // columns in every row's slice (the load broadcasts it over the rows).
+    if (streamed.empty() && want == Shape::Full)
+      if (auto col = llvm::find_if(other, [&](int a) { return dag.nodes[a].kind == Node::Input && dag.nodes[a].shape == Shape::Col; });
+          col != other.end()) {
+        streamed.push_back(*col);
+        other.erase(col);
+      }
     if (streamed.size() != 1)
       return fail(func, "an op combines more than two values of the streamed shape"), failure();
     if (!other.empty()) {
@@ -1112,8 +1120,8 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
   Type sourceType = f32();
   bool rowStream = false;
   if (leafNode.kind == Node::Input) {
-    if (leafNode.shape != Shape::Full && leafNode.shape != Shape::Row)
-      return fail(func, "a streamed input must vary along the rows"), failure();
+    if (leafNode.shape == Shape::Scalar)
+      return fail(func, "a streamed input must vary along the rows or columns"), failure();
     source = inputDm.at(leaf);
     sourceType = leafNode.type;
     rowStream = leafNode.shape == Shape::Row;
