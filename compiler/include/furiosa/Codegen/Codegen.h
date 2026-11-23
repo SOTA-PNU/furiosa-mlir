@@ -101,8 +101,9 @@ Value reshapeTo(OpBuilder &b, Location loc, Value v, RankedTensorType t);
 /// (lib/Codegen/Loops.cpp).
 LogicalResult unrollKeptLoops(ModuleOp module);
 
-/// A padded tensor only boxes are cut from becomes the source inserted into a constant (lib/Codegen/Normalize.cpp).
-void padsToInserts(ModuleOp module);
+/// A padded tensor only boxes are cut from (`reshaped`: or only reshaped) becomes the source inserted into a constant
+/// (lib/Codegen/Normalize.cpp).
+void padsToInserts(ModuleOp module, bool reshaped = false);
 
 /// Tiles the generics unrollKeptLoops lifted back to their iteration's slice (lib/Codegen/Loops.cpp).
 void sliceKeptLoops(ModuleOp module);

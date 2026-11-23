@@ -2583,6 +2583,7 @@ void mlir::furiosa::normalizeKernels(ModuleOp module, function_ref<bool(linalg::
     g = collapseLoopRuns(g, mapsAlone);
     broadcastStreams(g, mapsAlone);
   }
+  padsToInserts(module, /*reshaped=*/true);
   // The slices and carriers the reads no longer use.
   for (auto func : module.getOps<func::FuncOp>())
     for (bool erased = true; erased;) {
@@ -2623,22 +2624,26 @@ Value mlir::furiosa::reshapeTo(OpBuilder &b, Location loc, Value v, RankedTensor
 /// A padded tensor that only boxes are cut from (structure's masked tiles) is the source inserted into a constant
 /// of the padding value, which the copy steps map: one copy into the padded tensor, whose extent the boxes
 /// then divide (the NPU tiles an axis only in windows that grow into a divisor of it).
-/// Whether `v` is only cut into boxes (extract_slices, possibly of reshapes of it).
-static bool onlyBoxed(Value v) {
-  return llvm::all_of(v.getUsers(), [](Operation *u) {
+/// With `reshaped`, an integer padding also where a reshape of it is read whole (delinearizeRead's tiles of a masked
+/// row), which no class reads (the tiled class absorbs float paddings through reshapes, the row-wise class tail
+/// paddings only); the ones only boxed stay for the kept loops' pass.
+/// Whether `v` is only cut into boxes (extract_slices, possibly of reshapes of it), or reshaped.
+static bool onlyBoxed(Value v, bool reshaped) {
+  return llvm::all_of(v.getUsers(), [&](Operation *u) {
     return isa<tensor::ExtractSliceOp>(u) ||
-           (isa<tensor::CollapseShapeOp, tensor::ExpandShapeOp>(u) && onlyBoxed(u->getResult(0)));
+           (isa<tensor::CollapseShapeOp, tensor::ExpandShapeOp>(u) && (reshaped || onlyBoxed(u->getResult(0), false)));
   });
 }
 
-void mlir::furiosa::padsToInserts(ModuleOp module) {
+void mlir::furiosa::padsToInserts(ModuleOp module, bool reshaped) {
   SmallVector<tensor::PadOp> pads;
   module.walk([&](tensor::PadOp pad) {
     Attribute c;
     Value padding = pad.getConstantPaddingValue();
     if (padding && matchPattern(padding, m_Constant(&c)) && !ShapedType::isDynamicShape(pad.getStaticLow()) &&
         pad.getResultType().hasStaticShape() && !pad.getResult().use_empty() &&
-        onlyBoxed(pad.getResult()))
+        onlyBoxed(pad.getResult(), reshaped) &&
+        (!reshaped || (isa<IntegerAttr>(c) && !onlyBoxed(pad.getResult(), false))))
       pads.push_back(pad);
   });
   for (tensor::PadOp pad : pads) {
