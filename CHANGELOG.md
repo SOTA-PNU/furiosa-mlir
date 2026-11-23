@@ -71,6 +71,18 @@ npu stage) against GPU goldens.
   - A column input streams where it meets a row value (`cols == pick[:, None]`); `tl.histogram`'s values stream so
     too, with no relayout step (e3286a2).
   `heldout3_moe_topk_gating` passes L1 to L4 (rel 9.8e-8); segment sum's offsets kernel maps and is exact on npu3.
+- ViT-B/16 passes L0 to L4 on npu3: top-1 equal to the GPU's, rel 0.0015 at the logits (tolerance 0.0058); one
+  graph run 3.44 s including device open and 350 MB of weights; its NPU build 1m52s. Three general changes besides
+  66d40f0:
+  - An index-only value equal at every point (a mask true over its whole range) is a constant, and what it makes
+    trivial folds (8bb6122).
+  - The row-wise class divides a constant by the streamed value (`1 / sqrt(var / N + eps)`) with the divider's
+    operands swapped (d448fc6); ViT's layer norm maps as one row-wise kernel.
+  - A mapping whose Vector Engine reduction replicates its reads beyond 64M elements does not map, and the kernel
+    splits into smaller steps (fcfa5bf): attention at 197 tokens replicated 155M and its furiosa-opt build passed
+    50 GB of memory. The corpus's largest is 40M.
+  Six corpus cases change fopt (group norm, layer-norm and rmsnorm backward, add + layer norm, the layer-norm
+  tutorial, Qwen3-0.6B) and pass L0 to L4; the matrix is unchanged.
 ## 1.4.0 (2026-11-18, release/1.4.0)
 
 Milestone: kernels the compiler was not written for. The second held-out batch (ten standard ML ops written from their
