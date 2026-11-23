@@ -11,6 +11,7 @@ TORCHVISION = {
     "mobilenetv3_large": ("MobileNet_V3_Large_Weights", "IMAGENET1K_V2"),
     "vit_b16": ("ViT_B_16_Weights", "IMAGENET1K_V1"),
     "efficientnet_b0": ("EfficientNet_B0_Weights", "IMAGENET1K_V1"),
+    "convnext_tiny": ("ConvNeXt_Tiny_Weights", "IMAGENET1K_V1"),
 }
 HUGGINGFACE = {"qwen3_0_6b": ("Qwen/Qwen3-0.6B", "c1899de289a04d12100db370d81485cdf75e47ca")}
 
