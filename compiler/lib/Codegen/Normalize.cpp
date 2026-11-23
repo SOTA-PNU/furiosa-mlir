@@ -1142,6 +1142,42 @@ void splitGuardedReductions(ModuleOp module, function_ref<bool(linalg::GenericOp
   }
 }
 
+/// An integer reduction whose step a condition guards, yielding select(p, acc . t, acc) (a carry summed over the
+/// tiles before a column's), in a generic no class maps as it is, combines the identity where p does not hold:
+/// acc . select(p, t, e), e the identity of `.`, a masked term as the classes take. Integers only: a float term the
+/// guard skips may be inf, which the mask's product (selectsToArithmetic) would turn into NaN.
+void unguardSteps(ModuleOp module, function_ref<bool(linalg::GenericOp)> mapsAlone) {
+  SmallVector<linalg::GenericOp> generics;
+  module.walk([&](linalg::GenericOp g) { generics.push_back(g); });
+  for (linalg::GenericOp g : generics) {
+    if (g.getNumDpsInits() != 1 || !g.getNumReductionLoops() || !mapsAlone)
+      continue;
+    Block &body = *g.getBody();
+    BlockArgument acc = body.getArgument(g.getNumDpsInputs());
+    auto sel = cast<linalg::YieldOp>(body.getTerminator()).getOperand(0).getDefiningOp<arith::SelectOp>();
+    if (!sel || !sel.getType().isInteger() || dependsOn(sel.getCondition(), acc))
+      continue;
+    bool kept = sel.getTrueValue() == acc; // select(p, acc, acc . t): the step where p does not hold
+    Operation *c = (kept ? sel.getFalseValue() : sel.getTrueValue()).getDefiningOp();
+    if ((kept ? sel.getFalseValue() : sel.getTrueValue()) == acc || (kept ? sel.getTrueValue() : sel.getFalseValue()) != acc ||
+        !isa_and_nonnull<arith::AddIOp, arith::MaxSIOp, arith::MinSIOp>(c) || c->getBlock() != &body)
+      continue;
+    unsigned t = c->getOperand(0) == acc ? 1 : 0;
+    std::optional<TypedAttr> e = arith::getNeutralElement(c);
+    if (c->getOperand(1 - t) != acc || dependsOn(c->getOperand(t), acc) || !e || mapsAlone(g))
+      continue;
+    OpBuilder b(sel);
+    Value id = arith::ConstantOp::create(b, sel.getLoc(), *e), term = c->getOperand(t);
+    Value masked = arith::SelectOp::create(b, sel.getLoc(), sel.getCondition(), kept ? id : term, kept ? term : id);
+    Operation *step = b.clone(*c);
+    step->setOperand(t, masked);
+    sel.replaceAllUsesWith(step->getResult(0));
+    sel.erase();
+    if (c->use_empty())
+      c->erase();
+  }
+}
+
 /// A generic that only chooses between two reads by an index comparison one loop decides alone (tl.cat's
 /// `i < n ? a : b`, tl.join's `j == 0`) splits at that loop's thresholds: one copy per run of the loop, reading
 /// its own side, inserted into the result. No index table remains, and each run is a box copy. With the oracle, a
@@ -2511,6 +2547,7 @@ void mlir::furiosa::roundToF8(ModuleOp module) {
 void mlir::furiosa::normalizeKernels(ModuleOp module, function_ref<bool(linalg::GenericOp)> mapsAlone) {
   expandMath(module);
   splitGuardedReductions(module, mapsAlone);
+  unguardSteps(module, mapsAlone);
   nestSelectKeys(module);
   // Affine reads become inputs first: one that wraps splits like a select.
   SmallVector<linalg::GenericOp> reading;
