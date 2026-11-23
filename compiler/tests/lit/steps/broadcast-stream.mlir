@@ -1,9 +1,10 @@
 // RUN: furiosa-mlir-opt --furiosa-split-steps %s | FileCheck %s
 
-// tl.histogram of x + 1: count[b] = sum_i (x[i] + 1 == b), x varying along the reduced loop alone and the bins
-// along the other. The row-wise class streams a column input as it is (its load broadcasts it over the rows), but
-// not a value computed along the columns alone, so x is broadcast over the bins first (a relayout step, one DMA)
-// and the count reads it whole.
+// A histogram of x + 1 weighted by the value: count[b] = sum_i (x[i] + 1 == b ? x[i] + 1 : 0), x varying along the
+// reduced loop alone and the bins along the other. The row-wise class streams a column value against a row value
+// (its column input's load broadcasts it over the rows), but does not read a value computed along the columns
+// alone as a select's side, so x is broadcast over the bins first (a relayout step, one DMA) and the count reads it
+// whole.
 
 // CHECK-LABEL: func.func private @histogram__s0
 // CHECK: linalg.generic {{.*}} ins(%{{.*}} : tensor<4096xi32>) outs(%{{.*}} : tensor<64x4096xi32>)
@@ -21,7 +22,7 @@ module {
     ^bb0(%v: i32, %k: i32, %acc: i32):
       %w = arith.addi %v, %c1 : i32
       %eq = arith.cmpi eq, %w, %k : i32
-      %one = arith.select %eq, %c1, %c0 : i32
+      %one = arith.select %eq, %w, %c0 : i32
       %s = arith.addi %acc, %one : i32
       linalg.yield %s : i32
     } -> tensor<64xi32>

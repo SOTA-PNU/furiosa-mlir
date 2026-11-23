@@ -1108,10 +1108,10 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
       if (a.kind == Node::Input && o.kind == Node::Input && a.type == o.type)
         step.zip = true;
     }
-    // A Full value of a Col input and a Row value (cols == idx[:, None]) streams the input: its DM tile holds its
-    // columns in every row's slice (the load broadcasts it over the rows).
+    // A Full value of a Col input (or of a value computed from one, ids[t] * D) and a Row value (cols == idx[:, None])
+    // streams the input: its DM tile holds its columns in every row's slice (the load broadcasts it over the rows).
     if (streamed.empty() && want == Shape::Full)
-      if (auto col = llvm::find_if(other, [&](int a) { return dag.nodes[a].kind == Node::Input && dag.nodes[a].shape == Shape::Col; });
+      if (auto col = llvm::find_if(other, [&](int a) { return dag.nodes[a].shape == Shape::Col; });
           col != other.end()) {
         streamed.push_back(*col);
         other.erase(col);
