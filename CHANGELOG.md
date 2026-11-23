@@ -61,7 +61,14 @@ npu stage) against GPU goldens.
   HBM-to-HBM DMA, and each split result is all-gathered into every chip's copy by one DMA across chips; a kernel
   with no dim to split, or one that reads a buffer it writes, runs whole on every chip. N = 1 is unchanged. At
   N = 2 on npu2 and npu3 the micro kernels, all tutorials, 19 held-out kernels, LeNet-5, AlexNet, VGG16,
-  ResNet-101 and MobileNetV3 pass L4 against the same goldens.
+  ResNet-101 and MobileNetV3 pass L4 against the same goldens. Measured after both commits: at N = 2 all 51 corpus
+  cases that pass at N = 1 pass L4 (and 181 of 181 operator-matrix cases of add, exp, sum, argmax, dot, gather,
+  atomics, sort, softmax, cumsum, trans); at N = 4 on npu0 to npu3, ten cases from vector_add to Qwen3-0.6B.
+  Speedup is modest (ms, N = 1 / 2 / 4, warm): tutorial matmul 11.4 / 9.7 / 8.8, VGG16 2136 / 1897 / 1804,
+  ResNet-101 1574 / 1280 / 1160, Qwen3-0.6B prefill + decode 14790 / 11980 / 10735. A cross-chip gather runs at
+  about 8.6 GB/s per chip, a few ms per inference; the limits are kernels that stay whole (VGG16 6 of 18:
+  maxpool windows; Qwen3 37 of 66: attention, RoPE, RMSNorm, argmax, embedding) and weight blocks copied every
+  launch. ViT-B/16's N = 2 NPU build was killed (memory).
 - Selections and row-wise terms for MoE gating and segment offsets:
   - A seeded selection reduction (`tl.argmax`'s form) may compare a value computed from the element, other inputs
     and the index (softmax probabilities, a second pick masked to -1), when the seed computes it op for op at
