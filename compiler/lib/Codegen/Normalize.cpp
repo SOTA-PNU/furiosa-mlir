@@ -1857,6 +1857,91 @@ linalg::GenericOp collapseLoopRuns(linalg::GenericOp g, function_ref<bool(linalg
   return g;
 }
 
+/// A reduction's run of leading parallel loops that some input reads only part of (a segment's bounds, in a sum
+/// over [segments, columns, rows of the segment]; a gradient row dy[t, d] in a fold into [ids, d]), in a generic no
+/// class maps as it is, collapses into one loop once that input is broadcast over the run (a relayout, one DMA:
+/// [run..., its other dims]): the row-wise class lays the rows inside its outermost row dim over the 256 slices,
+/// which [13, 48, 208] rows overflow and [624, 208] do not. The shortest run whose collapsed generic maps is kept. A
+/// contraction (a sum of products) keeps its loops: normalizeContractions takes it apart.
+linalg::GenericOp broadcastRuns(linalg::GenericOp g, function_ref<bool(linalg::GenericOp)> mapsAlone) {
+  auto iters = g.getIteratorTypesArray();
+  SmallVector<int64_t> ranges = g.getStaticLoopRanges();
+  Operation *sum = cast<linalg::YieldOp>(g.getBody()->getTerminator()).getOperand(0).getDefiningOp();
+  if (isa_and_nonnull<arith::AddFOp, arith::AddIOp>(sum) && llvm::any_of(sum->getOperands(), [](Value v) {
+        return isa_and_nonnull<arith::MulFOp, arith::MulIOp>(v.getDefiningOp());
+      }))
+    return g;
+  if (!mapsAlone || ShapedType::isDynamicShape(ranges) || g.getNumDpsInits() != 1 || !g.getNumReductionLoops() ||
+      !llvm::all_of(g.getIndexingMapsArray(), [](AffineMap m) { return m.isProjectedPermutation(); }) ||
+      mapsAlone(g))
+    return g;
+  MLIRContext *ctx = g.getContext();
+  for (int64_t len = 2; len <= int64_t(iters.size()) && iters[len - 1] == utils::IteratorType::parallel; ++len) {
+    ReassociationIndices run(llvm::seq<int64_t>(0, len).begin(), llvm::seq<int64_t>(0, len).end());
+    auto whole = [&](AffineMap m) { return linalg::isDimSequencePreserved(m, run); };
+    if (!whole(g.getIndexingMapsArray().back()) ||
+        llvm::all_of(g.getDpsInputOperands(), [&](OpOperand *in) { return whole(g.getMatchingIndexingMap(in)); }))
+      continue;
+    Operation *before = g->getPrevNode();
+    OpBuilder b(g);
+    auto copy = cast<linalg::GenericOp>(b.clone(*g));
+    b.setInsertionPoint(copy); // the broadcasts come before the generic reading them
+    SmallVector<AffineMap> maps = copy.getIndexingMapsArray();
+    for (OpOperand *in : copy.getDpsInputOperands()) {
+      AffineMap m = maps[in->getOperandNumber()];
+      if (whole(m))
+        continue;
+      // The input as [run..., its other dims in order]: a generic that reads it there.
+      auto t = cast<RankedTensorType>(in->get().getType());
+      SmallVector<int64_t> shape(ranges.begin(), ranges.begin() + len);
+      SmallVector<AffineExpr> exprs, read;
+      for (int64_t d = 0; d < len; ++d)
+        exprs.push_back(getAffineDimExpr(d, ctx));
+      for (auto [j, e] : llvm::enumerate(m.getResults())) {
+        int64_t d = cast<AffineDimExpr>(e).getPosition();
+        if (d < len) {
+          read.push_back(getAffineDimExpr(d, ctx));
+          continue;
+        }
+        read.push_back(getAffineDimExpr(shape.size(), ctx));
+        shape.push_back(t.getDimSize(j));
+        exprs.push_back(e);
+      }
+      unsigned rank = shape.size();
+      Value empty = tensor::EmptyOp::create(b, g.getLoc(), shape, t.getElementType());
+      auto repeated = linalg::GenericOp::create(
+          b, g.getLoc(), TypeRange{empty.getType()}, ValueRange{in->get()}, ValueRange{empty},
+          ArrayRef<AffineMap>{AffineMap::get(rank, 0, read, ctx), b.getMultiDimIdentityMap(rank)},
+          SmallVector<utils::IteratorType>(rank, utils::IteratorType::parallel),
+          [](OpBuilder &nb, Location l, ValueRange args) { linalg::YieldOp::create(nb, l, args[0]); });
+      in->set(repeated.getResult(0));
+      maps[in->getOperandNumber()] = AffineMap::get(m.getNumDims(), 0, exprs, ctx);
+    }
+    copy.setIndexingMapsAttr(b.getAffineMapArrayAttr(maps));
+    IRRewriter rewriter(copy);
+    FailureOr<linalg::CollapseResult> collapsed = linalg::collapseOpIterationDims(copy, {run}, rewriter);
+    auto fresh = succeeded(collapsed) ? dyn_cast<linalg::GenericOp>(collapsed->collapsedOp.getOperation())
+                                      : linalg::GenericOp();
+    // A reduction's fill, collapsed, is a fill of the collapsed shape (the classes take a fill as its start).
+    auto reshaped = fresh ? fresh.getDpsInits()[0].getDefiningOp<tensor::CollapseShapeOp>() : tensor::CollapseShapeOp();
+    if (auto fill = reshaped ? reshaped.getSrc().getDefiningOp<linalg::FillOp>() : linalg::FillOp()) {
+      b.setInsertionPoint(fresh);
+      Value empty = tensor::EmptyOp::create(b, g.getLoc(), reshaped.getResultType().getShape(),
+                                            reshaped.getResultType().getElementType());
+      fresh.getDpsInitsMutable()[0].set(linalg::FillOp::create(b, g.getLoc(), fill.getInputs()[0], empty).getResult(0));
+    }
+    if (fresh && mapsAlone(fresh)) {
+      g->replaceAllUsesWith(collapsed->results);
+      g->erase();
+      copy->erase();
+      return fresh;
+    }
+    while (g->getPrevNode() != before)
+      g->getPrevNode()->erase();
+  }
+  return g;
+}
+
 /// A select keyed by an index-only condition between computed values, in a generic no class maps as it is, becomes
 /// the bitwise blend b ^ ((a ^ b) & m) under the index-only mask m = c ? ~0 : 0 (a table once hoisted, exact for any
 /// bits): the row-wise class selects by a streamed key and computes nothing along the columns alone, as tl.sort's
@@ -2647,6 +2732,7 @@ void mlir::furiosa::normalizeKernels(ModuleOp module, function_ref<bool(linalg::
     blendIndexSelects(g, mapsAlone);
     g = collapseLoopRuns(g, mapsAlone);
     broadcastStreams(g, mapsAlone);
+    broadcastRuns(g, mapsAlone);
   }
   padsToInserts(module, /*reshaped=*/true);
   // The slices and carriers the reads no longer use.
