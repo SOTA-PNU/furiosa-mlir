@@ -399,7 +399,7 @@ void widenNarrowInts(func::FuncOp func) {
 
 ArrayRef<OpClass> mapping::opClasses() {
   static const OpClass classes[] = {gatherClass(), copyClass(), elementwiseClass(), contractionClass(),
-                                    rowwiseClass(), tiledClass()};
+                                    rowwiseClass(), tiledClass(), rowwisePaddedClass()};
   return classes;
 }
 

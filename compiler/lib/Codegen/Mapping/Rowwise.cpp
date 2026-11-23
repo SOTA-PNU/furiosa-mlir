@@ -4,7 +4,10 @@
 // Vector Engine then evaluates it in passes:
 //
 //  - Layout: one row per slice (padded to 256), a row's H columns in time x packet. More than 256 rows run as
-//    row tiles of up to 256, each read from and written to an HBM tile view of the buffers. A row length that is
+//    row tiles of up to 256, each read from and written to an HBM tile view of the buffers: windows of the
+//    outermost row dim by the row dims inside it, whose rows must divide the slices. The padded variant (tried after
+//    the tiled class, which keeps the kernels it maps) windows the first row dim whose others fit, each other padded
+//    to a power of two. A row length that is
 //    not a multiple of 16 pads to one (whole packets): rows cross between HBM and DM through a padded scratch, a
 //    reduction's float input padded with its identity.
 //  - A pass streams one Full (or Row) tensor through a path of ops whose other operands are immediates, VRF
@@ -870,6 +873,26 @@ void rewriteSigmoid(Dag &dag) {
   }
 }
 
+/// The row dim the slices take windows of, outermost in them, and the slices of the other row dims: the first row
+/// dim; `padded`, the first whose others, each padded to a power of two (the NPU misplaces a slice digit inside the
+/// outermost otherwise), fit the 256 slices (the first one when none does). -1 for a single row.
+std::pair<int, int64_t> windowedDim(const Dag &dag, bool padded) {
+  std::pair<int, int64_t> first{-1, 1};
+  for (auto [d, extent] : llvm::enumerate(dag.rowExtents)) {
+    if (extent == 1)
+      continue;
+    int64_t inner = 1;
+    for (auto [e, other] : llvm::enumerate(dag.rowExtents))
+      if (e != d)
+        inner *= padded ? llvm::PowerOf2Ceil(other) : other;
+    if (!padded || inner <= kSlices)
+      return {int(d), inner};
+    if (first.first < 0)
+      first = {int(d), inner};
+  }
+  return first;
+}
+
 /// A planned VE op: its stage, the ALU it takes, and how it reads its other operand.
 enum Stage {
   Tag = 0, Logic = 1, Fxp = 2, FxpToFp = 3, Narrow = 4, Fp = 5, Reduce = 6, FpDiv = 7, Widen = 8, FpToFxp = 9, Clip = 10
@@ -879,8 +902,8 @@ class Planner {
 public:
   Planner(KernelBuilder &kb, Dag &dag, RaisedKernel &raised) : kb(kb), dag(dag), raised(raised), ctx(kb.getContext()) {}
 
-  /// Declares the axes and the kernel's inputs and outputs (before the body).
-  LogicalResult declare(func::FuncOp func, ArrayRef<int64_t> written);
+  /// Declares the axes and the kernel's inputs and outputs (before the body); `padded`: windowedDim's.
+  LogicalResult declare(func::FuncOp func, ArrayRef<int64_t> written, bool padded);
   /// Emits the passes and returns the stored HbmTensors, one per root (none when the rows are tiled: the
   /// outputs are then written in place).
   FailureOr<SmallVector<Value>> emitBody(func::FuncOp func);
@@ -892,7 +915,8 @@ private:
   RaisedKernel &raised;
   MLIRContext *ctx;
   SmallVector<std::pair<int, MapAttr>> rowAxes; // (row dim, axis), outermost first; dim -1: the single row
-  int64_t inner = 1;                             // rows inside the outermost row axis
+  unsigned windowed = 0;                         // the row axis the slices take windows of (outermost in them)
+  int64_t inner = 1;                             // slices of the other row axes, each padded to a power of two
   MapAttr H, slice; // H: the column axis, padded to whole packets
   MapAttr columns;   // the columns HBM holds (H resized to them)
   std::map<int, float> padFill; // padded rows: input node -> the identity of the reduction that reads it
@@ -903,7 +927,7 @@ private:
   std::map<int, Value> inputDm;      // input node -> DmTensor
   SmallVector<unsigned> outParams;   // tiled: the in-place output parameters
 
-  /// The slice mapping of `len` rows of the outermost row axis (all of the inner ones), padded to 256.
+  /// The slice mapping of `len` rows of the windowed row axis (all of the others), padded to 256.
   MapAttr rowsMap(int64_t len);
   /// The HBM mapping of an input: the row axes it varies along, then the column axis.
   MapAttr inputMap(const Node &n);
@@ -1552,7 +1576,7 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
   return commit(node, outType);
 }
 
-LogicalResult Planner::declare(func::FuncOp func, ArrayRef<int64_t> written) {
+LogicalResult Planner::declare(func::FuncOp func, ArrayRef<int64_t> written, bool padded) {
   // Rows move in packets of 8 f32 (16 bf16): a row length that is not a multiple of 16 pads to one. Copies move and
   // stores write the columns alone, so only a reduction reads the padding: a float input it reduces directly pads
   // with the reduction's identity.
@@ -1588,14 +1612,23 @@ LogicalResult Planner::declare(func::FuncOp func, ArrayRef<int64_t> written) {
     rowAxes.push_back({-1, kb.axis("R", 1)});
   H = kb.axis("H", pad ? (dag.h + 15) / 16 * 16 : dag.h);
   columns = pad ? H.resize(dag.h) : H;
-  inner = dag.r / rowAxes.front().second.size();
-  if (kSlices % inner && inner * rowAxes.front().second.size() != kSlices)
+  int dim = tiled() ? dag.tileDim : windowedDim(dag, padded).first;
+  windowed = llvm::find_if(rowAxes, [&](auto &a) { return a.first == dim; }) - rowAxes.begin();
+  if (windowed == rowAxes.size())
+    windowed = 0;
+  inner = 1;
+  for (auto [i, a] : llvm::enumerate(rowAxes))
+    if (i != windowed)
+      inner *= padded ? llvm::PowerOf2Ceil(a.second.size()) : a.second.size();
+  if (!padded && kSlices % inner)
     return fail(func, "rows inside the outermost row dim (") << inner << ") do not divide the 256 slices";
+  if (inner > kSlices)
+    return fail(func, "no row dim whose others (") << inner << " slices, each padded to a power of two) fit the 256 slices";
   // The NPU tiles a window of L rows over an extent E only when L grows into a divisor of E within [L, 2L).
   if (tiled()) {
-    int64_t extent = rowAxes.front().second.size(), step = dag.tileStep;
-    if (rowAxes.front().first != dag.tileDim || step * inner > kSlices)
-      return fail(func, "row tiles that are not windows of the outermost row dim within the slices");
+    int64_t extent = rowAxes[windowed].second.size(), step = dag.tileStep;
+    if ((!padded && windowed) || step * inner > kSlices)
+      return fail(func, "row tiles that are not windows of the windowed row dim within the slices");
     auto windows = [&](int64_t len) {
       for (int64_t d = len; d < 2 * len && d <= extent; ++d)
         if (extent % d == 0)
@@ -1605,7 +1638,7 @@ LogicalResult Planner::declare(func::FuncOp func, ArrayRef<int64_t> written) {
     if (!windows(step) || (extent % step && !windows(extent % step)))
       return fail(func, "row tiles of ") << step << " over " << extent << " rows, which the NPU cannot window";
   }
-  slice = rowsMap(rowAxes.front().second.size());
+  slice = rowsMap(rowAxes[windowed].second.size());
   for (auto [i, n] : llvm::enumerate(dag.nodes)) {
     if (n.kind != Node::Input)
       continue;
@@ -1628,14 +1661,15 @@ LogicalResult Planner::declare(func::FuncOp func, ArrayRef<int64_t> written) {
 }
 
 MapAttr Planner::rowsMap(int64_t len) {
-  MapAttr outer = rowAxes.front().second;
+  MapAttr outer = rowAxes[windowed].second;
   if (len != outer.size())
     outer = outer.resize(len);
   if (len * inner < kSlices)
     outer = outer.padTo(kSlices / inner);
   SmallVector<MapAttr> parts{outer};
-  for (auto &[d, axis] : llvm::drop_begin(rowAxes))
-    parts.push_back(axis);
+  for (auto [i, a] : llvm::enumerate(rowAxes))
+    if (i != windowed)
+      parts.push_back(llvm::isPowerOf2_64(a.second.size()) ? a.second : a.second.padTo(llvm::PowerOf2Ceil(a.second.size())));
   return MapAttr::pair(ctx, parts);
 }
 
@@ -1750,9 +1784,9 @@ FailureOr<SmallVector<Value>> Planner::emitBody(func::FuncOp func) {
                              inputMap(dag.nodes[i]));
     return emitTile(func);
   }
-  // Row tiles along the outermost row axis: each reads its rows of the inputs that have that axis through a
+  // Row tiles along the windowed row axis: each reads its rows of the inputs that have that axis through a
   // tile view (the others broadcast as they are), and writes its rows of the outputs through a mutable one.
-  MapAttr outer = rowAxes.front().second;
+  MapAttr outer = rowAxes[windowed].second;
   int64_t extent = outer.size(), step = dag.tileStep;
   // Whole tiles run as one device loop: the body emitted once, its tile views indexed by the induction variable
   // (unrolled tiles cost the NPU compile time and kernel size superlinearly).
@@ -1791,7 +1825,7 @@ FailureOr<SmallVector<Value>> Planner::emitBody(func::FuncOp func) {
     };
     for (auto [i, p] : params) {
       Node &n = dag.nodes[i];
-      bool hasOuter = rowAxes.front().first >= 0 && (n.rows >> rowAxes.front().first) & 1;
+      bool hasOuter = rowAxes[windowed].first >= 0 && (n.rows >> rowAxes[windowed].first) & 1;
       if (hasOuter) {
         auto [view, map] = tileOf(kb.param(p), n.type, inputMap(n), false);
         inputDm[i] = loadInput(n, view, map);
@@ -1896,17 +1930,18 @@ bool regroup(Dag &dag) {
 }
 
 /// The row tiles, the one decision both furiosa-tile (through `tiling`) and the mapping of an untiled kernel
-/// use: rows beyond the 256 slices take windows of the outermost row dim, as many of its rows as fill the slices
-/// with all the rows inside it.
-void rowTile(Dag &dag) {
-  if (dag.r <= kSlices)
+/// use: rows beyond the 256 slices take windows of the windowed row dim, as many of its rows as fill the slices
+/// with all the others; `padded`, or fewer down to half as many when those divide the dim (whole windows run as
+/// one device loop; unrolled ones cost furiosa-opt's compile time superlinearly).
+void rowTile(Dag &dag, bool padded) {
+  auto [d, inner] = windowedDim(dag, padded);
+  if (d < 0 || dag.rowExtents[d] * inner <= kSlices)
     return;
-  for (auto [d, extent] : llvm::enumerate(dag.rowExtents))
-    if (extent != 1) {
-      dag.tileDim = d;
-      dag.tileStep = std::max<int64_t>(1, kSlices / (dag.r / extent));
-      return;
-    }
+  int64_t fill = std::max<int64_t>(1, kSlices / inner), step = fill;
+  while (padded && dag.rowExtents[d] % step && 2 * (step - 1) >= fill)
+    --step;
+  dag.tileDim = d;
+  dag.tileStep = dag.rowExtents[d] % step ? fill : step;
 }
 
 bool match(RaisedKernel &kernel) {
@@ -1918,24 +1953,47 @@ bool match(RaisedKernel &kernel) {
   return ok;
 }
 
-LogicalResult map(RaisedKernel &kernel) {
+/// Whether the DAG reduces a product of two buffers each varying along a row the other does not (x[r, k] * w[c, k]):
+/// a contraction, the Tensor Unit's (the tiled class's). A table (a mask hoisted from the indices: tl.cumsum's
+/// triangle) is no operand of one.
+bool contracts(const Dag &dag, func::FuncOp func) {
+  auto buffer = [&](int i) -> const Node * {
+    while (dag.nodes[i].kind == Node::Op && dag.nodes[i].op == "ext")
+      i = dag.nodes[i].args[0];
+    const Node &n = dag.nodes[i];
+    return n.kind == Node::Input && n.col && !func.getArgAttr(n.arg, "furiosa.table") ? &n : nullptr;
+  };
+  return llvm::any_of(dag.nodes, [&](const Node &n) {
+    const Node &t = dag.nodes[n.kind == Node::Reduce ? n.args[0] : 0];
+    if (n.kind != Node::Reduce || t.kind != Node::Op || (t.op != "mul" && t.op != "muli"))
+      return false;
+    const Node *a = buffer(t.args[0]), *b = buffer(t.args[1]);
+    return a && b && (a->rows & ~b->rows) && (b->rows & ~a->rows);
+  });
+}
+
+template <bool Padded> LogicalResult map(RaisedKernel &kernel) {
   func::FuncOp func = kernel.func;
   std::string why;
   FailureOr<Dag> folded = fold(func, kernel.written, why);
   if (failed(folded))
     return func.emitError("row-wise: ") << why;
   Dag dag = *folded;
+  // shortcut: the padded layouts refuse contractions (the tiled class's) rather than map them on the Vector Engine;
+  // the row-wise class proper still maps those whose rows divide the slices, as before.
+  if (Padded && contracts(dag, func))
+    return func.emitError("row-wise: a contraction over rows the slices hold only padded (the tiled class's)");
   rewriteRsqrt(dag);
   rewriteReversedSub(dag);
   rewriteSigmoid(dag);
   // A tiled kernel brings its row tiles; an untiled one takes rowTile's.
   if (!dag.tileStep) {
     regroup(dag);
-    rowTile(dag);
+    rowTile(dag, Padded);
   }
   KernelBuilder kb(kernel);
   Planner planner(kb, dag, kernel);
-  if (failed(planner.declare(func, kernel.written)))
+  if (failed(planner.declare(func, kernel.written, Padded)))
     return failure();
   kb.beginBody();
   FailureOr<SmallVector<Value>> hbm = planner.emitBody(func);
@@ -1948,7 +2006,7 @@ LogicalResult map(RaisedKernel &kernel) {
 /// furiosa-tile's loops for a kernel: rowTile's windows as a tile of the root generic's loop over that row dim.
 /// Nothing for a kernel within the slices, a regrouped one (its rows are no loop of a generic), stored values
 /// from several generics, or windows that do not divide the dim.
-std::optional<Tiling> tiling(RaisedKernel &kernel) {
+template <bool Padded> std::optional<Tiling> tiling(RaisedKernel &kernel) {
   std::string why;
   FailureOr<Dag> folded = fold(kernel.func, kernel.written, why);
   if (failed(folded) || folded->tileStep)
@@ -1956,7 +2014,7 @@ std::optional<Tiling> tiling(RaisedKernel &kernel) {
   Dag dag = *folded;
   if (regroup(dag))
     return std::nullopt;
-  rowTile(dag);
+  rowTile(dag, Padded);
   if (!dag.tileStep || dag.rowExtents[dag.tileDim] % dag.tileStep)
     return std::nullopt;
   auto ret = cast<func::ReturnOp>(kernel.func.getBody().front().getTerminator());
@@ -1977,4 +2035,5 @@ std::optional<Tiling> tiling(RaisedKernel &kernel) {
 
 } // namespace
 
-OpClass mlir::furiosa::mapping::rowwiseClass() { return {"row-wise", match, map, tiling}; }
+OpClass mlir::furiosa::mapping::rowwiseClass() { return {"row-wise", match, map<false>, tiling<false>}; }
+OpClass mlir::furiosa::mapping::rowwisePaddedClass() { return {"row-wise", match, map<true>, tiling<true>}; }

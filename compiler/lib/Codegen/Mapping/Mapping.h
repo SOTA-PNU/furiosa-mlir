@@ -124,6 +124,8 @@ OpClass elementwiseClass();
 OpClass contractionClass();
 /// Row-wise elementwise generics and row reductions over [rows, columns] (Mapping/Rowwise.cpp).
 OpClass rowwiseClass();
+/// The row-wise class over row dims the slices hold only padded or windowed along an inner one; tried last.
+OpClass rowwisePaddedClass();
 /// Any kernel the tiled lowering folds: contractions and elementwise tails over row tiles (Tile/Lower.cpp).
 OpClass tiledClass();
 /// Rows of a table read at data-dependent indices, as an indirect DMA (Mapping/Gather.cpp).
