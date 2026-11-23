@@ -1,10 +1,10 @@
-"""Qwen3-0.6B (Qwen/Qwen3-0.6B) in pure Triton: greedy text generation as prefill and decode launch graphs.
+"""Qwen3 in pure Triton: greedy text generation as prefill and decode launch graphs, of any size's ``Config``.
 
-Weights are the raw checkpoint tensors by their safetensors names, with no packing; the output head
-reads ``model.embed_tokens.weight`` (tied embeddings). Each layer's K/V cache is a "state" buffer of
-``[max_seq, 8 * 128]`` rows, so prefill and decode share it, and the argmax writes the next token into
-the "next_token" state that the following decode graph embeds: a decode loop is repeated
-``run(decode(pos))`` with no host compute.
+Qwen3-0.6B (Qwen/Qwen3-0.6B) by default; models/qwen3_{1_7b,4b,8b}.py build the other sizes. Weights are the raw
+checkpoint tensors by their safetensors names, with no packing; the output head reads ``model.embed_tokens.weight``
+(tied embeddings) or ``lm_head.weight``. Each layer's K/V cache is a "state" buffer of ``[max_seq, kv_heads *
+head_dim]`` rows, so prefill and decode share it, and the argmax writes the next token into the "next_token" state
+that the following decode graph embeds: a decode loop is repeated ``run(decode(pos))`` with no host compute.
 """
 
 import math
@@ -65,7 +65,7 @@ class Graph:
 
 
 # ---------------------------------------------------------------------------------------------------
-# Config (Qwen/Qwen3-0.6B config.json)
+# Config (Qwen/Qwen3-0.6B config.json): the default; the builders below take any size's as a Config
 # ---------------------------------------------------------------------------------------------------
 
 HIDDEN = 1024
@@ -276,6 +276,31 @@ def argmax_kernel(x_ptr, out_ptr, row, N, BLOCK: tl.constexpr):
 # ---------------------------------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class Config:
+    """The config.json fields Qwen3 sizes differ in (every size: silu, no attention bias, no rope scaling)."""
+
+    hidden: int
+    layers: int
+    q_heads: int
+    kv_heads: int
+    head_dim: int
+    inter: int
+    vocab: int
+    tied: bool  # tie_word_embeddings: the head is model.embed_tokens.weight, else lm_head.weight
+    rope_theta: float = ROPE_THETA
+    eps: float = EPS
+
+    @property
+    def log2_theta(self):
+        """log2(rope_theta) as (hi, lo), split as LOG2_THETA_HI and LOG2_THETA_LO are."""
+        hi = int(math.log2(self.rope_theta) * 8192) / 8192
+        return hi, math.log2(self.rope_theta) - hi
+
+
+QWEN3_0_6B = Config(HIDDEN, LAYERS, Q_HEADS, KV_HEADS, HEAD_DIM, INTER, VOCAB, tied=True)
+
+
 def _gemm_blocks(M, dtype, fused=False):
     """Fixed tiles per launch: weight-streaming tiles for a few rows, square tiles otherwise."""
     if M <= 16:
@@ -284,14 +309,16 @@ def _gemm_blocks(M, dtype, fused=False):
 
 
 def embedding(g, ids, emb, out):
-    g.launch(embedding_kernel, (ids.shape[0],), ids_ptr=ids, emb_ptr=emb, out_ptr=out, H=HIDDEN, BLOCK_H=triton.next_power_of_2(HIDDEN))
+    H = emb.shape[1]
+    g.launch(embedding_kernel, (ids.shape[0],), ids_ptr=ids, emb_ptr=emb, out_ptr=out, H=H, BLOCK_H=triton.next_power_of_2(H))
 
 
-def rmsnorm(g, h, res, weight, y, row0=0):
+def rmsnorm(g, h, res, weight, y, row0=0, eps=EPS):
     """y = rmsnorm(h[row0:] (+= res)) * weight over y's rows."""
+    N = weight.shape[0]
     g.launch(
         rmsnorm_kernel, (y.shape[0],), h_ptr=h, res_ptr=res if res is not None else h, w_ptr=weight, y_ptr=y,
-        row0=row0, N=HIDDEN, eps=EPS, HAS_RES=res is not None, BLOCK_N=triton.next_power_of_2(HIDDEN),
+        row0=row0, N=N, eps=eps, HAS_RES=res is not None, BLOCK_N=triton.next_power_of_2(N),
     )
 
 
@@ -311,22 +338,23 @@ def swiglu(g, x, w_gate, w_up, y):
     g.launch(swiglu_kernel, grid, **options, x_ptr=x, wg_ptr=w_gate, wu_ptr=w_up, y_ptr=y, M=M, N=N, K=K, **blocks)
 
 
-def qk_norm_rope(g, q, k_cache, q_norm, k_norm, start_pos):
+def qk_norm_rope(g, q, k_cache, q_norm, k_norm, start_pos, cfg=QWEN3_0_6B):
+    hi, lo = cfg.log2_theta
     g.launch(
-        qk_norm_rope_kernel, (q.shape[0], Q_HEADS + KV_HEADS), num_warps=1,
-        q_ptr=q, k_ptr=k_cache, qw_ptr=q_norm, kw_ptr=k_norm, start_pos=start_pos, eps=EPS,
-        log2_theta_hi=LOG2_THETA_HI, log2_theta_lo=LOG2_THETA_LO, Q_HEADS=Q_HEADS, KV_HEADS=KV_HEADS, HEAD_DIM=HEAD_DIM,
+        qk_norm_rope_kernel, (q.shape[0], cfg.q_heads + cfg.kv_heads), num_warps=1,
+        q_ptr=q, k_ptr=k_cache, qw_ptr=q_norm, kw_ptr=k_norm, start_pos=start_pos, eps=cfg.eps,
+        log2_theta_hi=hi, log2_theta_lo=lo, Q_HEADS=cfg.q_heads, KV_HEADS=cfg.kv_heads, HEAD_DIM=cfg.head_dim,
     )
 
 
-def attention(g, q, k_cache, v_cache, out, start_pos):
+def attention(g, q, k_cache, v_cache, out, start_pos, cfg=QWEN3_0_6B):
     T = q.shape[0]
     block_m = 16 if T <= 16 else 64
     fp32 = q.dtype == "fp32"
     g.launch(
-        attention_kernel, (triton.cdiv(T, block_m), Q_HEADS), num_warps=4, num_stages=2 if fp32 else 3,
-        q_ptr=q, k_ptr=k_cache, v_ptr=v_cache, o_ptr=out, start_pos=start_pos, T=T, sm_scale=HEAD_DIM**-0.5,
-        Q_HEADS=Q_HEADS, KV_HEADS=KV_HEADS, HEAD_DIM=HEAD_DIM, BLOCK_M=block_m, BLOCK_N=32 if fp32 else 64,
+        attention_kernel, (triton.cdiv(T, block_m), cfg.q_heads), num_warps=4, num_stages=2 if fp32 else 3,
+        q_ptr=q, k_ptr=k_cache, v_ptr=v_cache, o_ptr=out, start_pos=start_pos, T=T, sm_scale=cfg.head_dim**-0.5,
+        Q_HEADS=cfg.q_heads, KV_HEADS=cfg.kv_heads, HEAD_DIM=cfg.head_dim, BLOCK_M=block_m, BLOCK_N=32 if fp32 else 64,
     )
 
 
@@ -334,63 +362,66 @@ def argmax(g, logits, out, row):
     g.launch(argmax_kernel, (1,), num_warps=8, x_ptr=logits, out_ptr=out, row=row, N=logits.shape[1], BLOCK=4096)
 
 
-def layer(g, i, h, prev_mlp, T, start_pos, dtype, max_seq, tag):
-    """One decoder layer on the residual stream h [T, HIDDEN]; prev_mlp is the previous layer's MLP
+def layer(g, cfg, i, h, prev_mlp, T, start_pos, dtype, max_seq, tag):
+    """One decoder layer on the residual stream h [T, hidden]; prev_mlp is the previous layer's MLP
     output still to be added to h (None for the first layer)."""
     w = lambda name, *shape: g.buffer(f"model.layers.{i}.{name}.weight", dtype, shape, "weight")
     act = lambda name, width: g.buffer(f"{tag}.{name}", dtype, (T, width), "activation")
-    k_cache = g.buffer(f"kv_cache.{i}.k", dtype, (max_seq, KV_HEADS * HEAD_DIM), "state")
-    v_cache = g.buffer(f"kv_cache.{i}.v", dtype, (max_seq, KV_HEADS * HEAD_DIM), "state")
-    x, q, attn, o = act("x", HIDDEN), act("q", Q_HEADS * HEAD_DIM), act("attn", Q_HEADS * HEAD_DIM), act("o", HIDDEN)
+    H, QD, KVD, D = cfg.hidden, cfg.q_heads * cfg.head_dim, cfg.kv_heads * cfg.head_dim, cfg.head_dim
+    k_cache = g.buffer(f"kv_cache.{i}.k", dtype, (max_seq, KVD), "state")
+    v_cache = g.buffer(f"kv_cache.{i}.v", dtype, (max_seq, KVD), "state")
+    x, q, attn, o = act("x", H), act("q", QD), act("attn", QD), act("o", H)
 
-    rmsnorm(g, h, prev_mlp, w("input_layernorm", HIDDEN), x)
-    linear(g, x, w("self_attn.q_proj", Q_HEADS * HEAD_DIM, HIDDEN), q)
-    linear(g, x, w("self_attn.k_proj", KV_HEADS * HEAD_DIM, HIDDEN), k_cache, y_row0=start_pos)
-    linear(g, x, w("self_attn.v_proj", KV_HEADS * HEAD_DIM, HIDDEN), v_cache, y_row0=start_pos)
-    qk_norm_rope(g, q, k_cache, w("self_attn.q_norm", HEAD_DIM), w("self_attn.k_norm", HEAD_DIM), start_pos)
-    attention(g, q, k_cache, v_cache, attn, start_pos)
-    linear(g, attn, w("self_attn.o_proj", HIDDEN, Q_HEADS * HEAD_DIM), o)
+    rmsnorm(g, h, prev_mlp, w("input_layernorm", H), x, eps=cfg.eps)
+    linear(g, x, w("self_attn.q_proj", QD, H), q)
+    linear(g, x, w("self_attn.k_proj", KVD, H), k_cache, y_row0=start_pos)
+    linear(g, x, w("self_attn.v_proj", KVD, H), v_cache, y_row0=start_pos)
+    qk_norm_rope(g, q, k_cache, w("self_attn.q_norm", D), w("self_attn.k_norm", D), start_pos, cfg)
+    attention(g, q, k_cache, v_cache, attn, start_pos, cfg)
+    linear(g, attn, w("self_attn.o_proj", H, QD), o)
 
-    rmsnorm(g, h, o, w("post_attention_layernorm", HIDDEN), x)
-    gated, mlp = act("gated", INTER), act("mlp", HIDDEN)
-    swiglu(g, x, w("mlp.gate_proj", INTER, HIDDEN), w("mlp.up_proj", INTER, HIDDEN), gated)
-    linear(g, gated, w("mlp.down_proj", HIDDEN, INTER), mlp)
+    rmsnorm(g, h, o, w("post_attention_layernorm", H), x, eps=cfg.eps)
+    gated, mlp = act("gated", cfg.inter), act("mlp", H)
+    swiglu(g, x, w("mlp.gate_proj", cfg.inter, H), w("mlp.up_proj", cfg.inter, H), gated)
+    linear(g, gated, w("mlp.down_proj", H, cfg.inter), mlp)
     return mlp
 
 
-def forward(g, ids, T, start_pos, dtype, max_seq, tag, all_logits):
+def forward(g, cfg, ids, T, start_pos, dtype, max_seq, tag, all_logits):
     """Embeds ids [T], runs every layer, and writes logits plus the greedy next token."""
-    emb = g.buffer("model.embed_tokens.weight", dtype, (VOCAB, HIDDEN), "weight")
-    h = g.buffer(f"{tag}.h", dtype, (T, HIDDEN), "activation")
+    emb = g.buffer("model.embed_tokens.weight", dtype, (cfg.vocab, cfg.hidden), "weight")
+    h = g.buffer(f"{tag}.h", dtype, (T, cfg.hidden), "activation")
     embedding(g, ids, emb, h)
     mlp = None
-    for i in range(LAYERS):
-        mlp = layer(g, i, h, mlp, T, start_pos, dtype, max_seq, tag)
+    for i in range(cfg.layers):
+        mlp = layer(g, cfg, i, h, mlp, T, start_pos, dtype, max_seq, tag)
 
     rows = T if all_logits else 1
-    x = g.buffer(f"{tag}.final", dtype, (rows, HIDDEN), "activation")
-    rmsnorm(g, h, mlp, g.buffer("model.norm.weight", dtype, (HIDDEN,), "weight"), x, row0=T - rows)
-    logits = g.buffer("logits", dtype, (rows, VOCAB), "output")
-    linear(g, x, emb, logits)  # tied head: the embedding table is the [VOCAB, HIDDEN] weight
+    x = g.buffer(f"{tag}.final", dtype, (rows, cfg.hidden), "activation")
+    rmsnorm(g, h, mlp, g.buffer("model.norm.weight", dtype, (cfg.hidden,), "weight"), x, row0=T - rows, eps=cfg.eps)
+    logits = g.buffer("logits", dtype, (rows, cfg.vocab), "output")
+    # A tied head is the embedding table itself, the [vocab, hidden] weight.
+    head = emb if cfg.tied else g.buffer("lm_head.weight", dtype, (cfg.vocab, cfg.hidden), "weight")
+    linear(g, x, head, logits)
     argmax(g, logits, g.buffer("next_token", "i32", (1,), "state"), row=rows - 1)
     return g
 
 
-def prefill(seq_len, dtype="bf16", max_seq=MAX_SEQ, all_logits=False):
+def prefill(seq_len, dtype="bf16", max_seq=MAX_SEQ, all_logits=False, cfg=QWEN3_0_6B):
     """Prompt input_ids [seq_len] at positions [0, seq_len): fills the KV cache, writes "next_token"
-    and "logits" ([seq_len, VOCAB] if all_logits, else the last row)."""
+    and "logits" ([seq_len, vocab] if all_logits, else the last row)."""
     g = Graph(f"prefill(seq_len={seq_len}, dtype={dtype}, max_seq={max_seq})")
     ids = g.buffer("input_ids", "i32", (seq_len,), "input")
-    return forward(g, ids, seq_len, 0, dtype, max_seq, f"prefill{seq_len}", all_logits)
+    return forward(g, cfg, ids, seq_len, 0, dtype, max_seq, f"prefill{seq_len}", all_logits)
 
 
-def decode(start_pos, dtype="bf16", max_seq=MAX_SEQ):
+def decode(start_pos, dtype="bf16", max_seq=MAX_SEQ, cfg=QWEN3_0_6B):
     """One step: embeds "next_token" at position start_pos, then overwrites it with the next one."""
     g = Graph(f"decode(start_pos={start_pos}, dtype={dtype}, max_seq={max_seq})")
     ids = g.buffer("next_token", "i32", (1,), "state")
-    return forward(g, ids, 1, start_pos, dtype, max_seq, "decode", False)
+    return forward(g, cfg, ids, 1, start_pos, dtype, max_seq, "decode", False)
 
 
-def graphs():
+def graphs(cfg=QWEN3_0_6B):
     """The graphs scripts/dump_mlir.py writes to the .triton.mlir file."""
-    return [prefill(seq_len=32), decode(start_pos=32)]
+    return [prefill(seq_len=32, cfg=cfg), decode(start_pos=32, cfg=cfg)]
