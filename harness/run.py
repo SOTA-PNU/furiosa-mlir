@@ -12,7 +12,6 @@ import re
 import signal
 import subprocess
 import sys
-import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -26,11 +25,13 @@ from harness.registry import CASES
 from tests.harness import ROOT
 
 sys.path.insert(0, str(ROOT / "compiler"))
-from furiosa_compiler.locks import SLOTS, npu_lock, target_slot  # noqa: E402 - dependency-free
+from furiosa_compiler.locks import CHIPS, SLOTS, npu_lock, target_slot, visible_chips, wait_idle  # noqa: E402
 
 LEVELS = ["L0", "L1", "L2a", "L2", "L3", "L4"]
-OUT = ROOT / "harness" / "out"
-NPU = 3  # the only NPU the harness may open
+# Runs on FURIOSA_CHIPS chips write their own outputs (harness/out/chips<N>/); cargo targets are shared.
+TARGETS = ROOT / "harness" / "out" / "target"
+OUT = ROOT / "harness" / "out" / (f"chips{CHIPS}" if CHIPS > 1 else "")
+NPUS = visible_chips()  # the NPUs the harness may open: npu3 alone, unless FURIOSA_CHIPS > 1 (docs/usage.md)
 TOOLS = ROOT / ".tools" / "bin"
 COMPILER_PY = ROOT / "compiler" / ".venv" / "bin" / "python"  # source-built Triton with the furiosa plugin
 
@@ -50,7 +51,7 @@ def cargo_env(target: str | None, npu: bool) -> dict:
     if not Path("/usr/lib/x86_64-linux-gnu/libclang.so").exists() and Path("/usr/lib/llvm-18/lib").exists():
         env.setdefault("LIBCLANG_PATH", "/usr/lib/llvm-18/lib")
     if npu:
-        env["FURIOSA_VISIBLE_CHIPS"] = str(NPU)
+        env["FURIOSA_VISIBLE_CHIPS"] = ",".join(map(str, NPUS))
     return env
 
 
@@ -71,11 +72,6 @@ def sh(cmd, cwd, env=None, timeout=3600):
 def tail(log: str, n: int = 3) -> str:
     lines = [line for line in log.strip().splitlines() if line.strip()]
     return " | ".join(lines[-n:])[-300:]
-
-
-def npu_idle() -> bool:
-    path = Path(f"/sys/class/rngd_mgmt/rngd!npu{NPU}mgmt/pe_occupancy")
-    return path.exists() and set(path.read_text().split()) == {"0"}
 
 
 def compare(out_path: Path, golden_path: Path, tol) -> Result:
@@ -146,7 +142,7 @@ def build_run_graph(crate: Path, npu: bool) -> tuple[str | None, str]:
     # A few builds at once, each in a target slot whose dependencies are built (harness/README.md). Binaries
     # run from their hashed deps/ path, never target/release/run_graph: every crate's binary has that name
     # (cargo#6313), so resolve it before another build in the slot relinks it.
-    with target_slot(OUT / "target" / ("npu" if npu else "cpu"), crate) as target:
+    with target_slot(TARGETS / ("npu" if npu else "cpu"), crate) as target:
         code, log = sh(cmd, crate, cargo_env(str(target), npu))
         exe = None
         for line in log.splitlines():
@@ -166,22 +162,20 @@ def run_graphs(name: str, crate: Path, npu: bool, tol) -> Result:
     if not exe:
         return Result("FAIL", f"build: {tail(log)}")
     worst = []
-    with npu_lock() if npu else nullcontext():  # builds run side by side, npu3 runs one at a time
-        if npu:  # L4 is the verdict: wait for npu3 rather than skip it.
-            for _ in range(180):
-                if npu_idle():
-                    break
-                time.sleep(10)
-            else:
-                return Result("FAIL", f"npu{NPU} stayed busy for 30 min")
+    npus = ",".join(f"npu{c}" for c in NPUS)
+    with npu_lock(NPUS) if npu else nullcontext():  # builds run side by side, each NPU runs one at a time
         for graph in meta["graphs"]:
             i = graph["index"]
+            # L4 is the verdict: wait for the NPUs rather than skip, and check them right before every run (other
+            # users' services hold npu0..npu2: never preempt them).
+            if npu and not wait_idle(NPUS):
+                return Result("FAIL", f"{npus} stayed busy for 30 min")
             out = OUT / name / ("npu" if npu else "cpu") / str(i) / "outputs.safetensors"
             out.parent.mkdir(parents=True, exist_ok=True)
             out.unlink(missing_ok=True)
             cmd = [exe, str(i), str(GOLDEN / name / str(i) / "inputs.safetensors"), str(out)]
             trace = out.parent / "openat.trace"
-            if npu:  # record every device the run opens: the proof it ran on npu3
+            if npu:  # record every device the run opens: the proof it ran on its NPUs alone
                 cmd = ["strace", "-f", "-qq", "-e", "trace=openat", "-o", str(trace)] + cmd
             code, log = sh(cmd, crate, cargo_env(None, npu))
             if code != 0 or not out.exists():
@@ -189,8 +183,8 @@ def run_graphs(name: str, crate: Path, npu: bool, tol) -> Result:
             if npu:
                 text = trace.read_text()
                 opened = set(re.findall(r'"/dev/rngd/(npu\d+)', text))
-                if opened != {f"npu{NPU}"} or '"/dev/nvidia' in text:
-                    return Result("FAIL", f"graph {i}: did not run on npu{NPU} alone (opened {sorted(opened) or 'no NPU'}"
+                if opened != {f"npu{c}" for c in NPUS} or '"/dev/nvidia' in text:
+                    return Result("FAIL", f"graph {i}: did not run on {npus} alone (opened {sorted(opened) or 'no NPU'}"
                                           f"{', a GPU' if '/dev/nvidia' in text else ''})")
             result = compare(out, GOLDEN / name / str(i) / "outputs.safetensors", tol)
             top1 = CASES[name].top1
@@ -322,7 +316,7 @@ def main():
     parser.add_argument("--impl", choices=["reference", "compiler"], default="reference")
     parser.add_argument("--cases", default=",".join(CASES))
     parser.add_argument("--levels", default=",".join(LEVELS))
-    parser.add_argument("--jobs", type=int, default=SLOTS, help="cases run at once (npu3 runs stay one at a time)")
+    parser.add_argument("--jobs", type=int, default=SLOTS, help="cases run at once (NPU runs stay one at a time)")
     args = parser.parse_args()
     names = args.cases.split(",")
     levels = args.levels.split(",")

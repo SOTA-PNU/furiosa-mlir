@@ -24,6 +24,15 @@ struct RaisedKernel {
   SmallVector<int64_t> written;
 };
 
+/// SPMD over chips: the kernels of a module with `furiosa.chips = N` run on N chips, each on its own copy of the
+/// data (every type's chip mapping is the CHIP axis) (LinalgToFopt.cpp).
+inline constexpr llvm::StringLiteral kChipAxis = "CHIP";
+inline constexpr llvm::StringLiteral kChipsAttr = "furiosa.chips";
+/// The chips the module of `op` runs its kernels on (1 without `furiosa.chips`).
+int64_t chipCount(Operation *op);
+/// The chip mapping of the kernels in the module of `op`: m![1], or the CHIP axis.
+fopt::MapAttr chipMapping(Operation *op);
+
 /// Builds one fopt kernel: a func.func with the #[device] and axes! attributes.
 class KernelBuilder {
 public:
@@ -38,8 +47,9 @@ public:
   /// How many axes are declared so far.
   size_t numAxes() const { return axes.size(); }
   fopt::MapAttr one() { return fopt::MapAttr::broadcast(ctx, 1); }
-  /// The chip mapping (one chip) and cluster mapping (cluster 0 of 2) every kernel uses for now.
-  fopt::MapAttr chip() { return one(); }
+  /// The chip mapping (one chip, or the chip axis of an SPMD kernel: chipMapping) and the cluster mapping (cluster 0
+  /// of 2) every kernel uses.
+  fopt::MapAttr chip() { return chips > 1 ? axis(kChipAxis, chips) : one(); }
   fopt::MapAttr cluster() { return one().padTo(2); }
 
   /// A pointer argument the kernel reads, as `&HbmTensor<D, Chip, element>`; returns its parameter index.
@@ -71,6 +81,7 @@ private:
   RaisedKernel &raised;
   MLIRContext *ctx;
   OpBuilder b;
+  int64_t chips;
   SmallVector<std::pair<std::string, int64_t>> axes;
   SmallVector<Type> inputTypes, outputTypes;
   SmallVector<int64_t> inputArgs, outputArgs;

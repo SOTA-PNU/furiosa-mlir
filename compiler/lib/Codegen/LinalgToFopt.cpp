@@ -22,8 +22,19 @@ using namespace mlir::furiosa::mapping;
 // KernelBuilder
 //===----------------------------------------------------------------------===//
 
+int64_t mapping::chipCount(Operation *op) {
+  ModuleOp module = isa<ModuleOp>(op) ? cast<ModuleOp>(op) : op->getParentOfType<ModuleOp>();
+  auto n = module ? module->getAttrOfType<IntegerAttr>(kChipsAttr) : nullptr;
+  return n ? n.getInt() : 1;
+}
+
+fopt::MapAttr mapping::chipMapping(Operation *op) {
+  int64_t n = chipCount(op);
+  return n > 1 ? fopt::MapAttr::axis(op->getContext(), kChipAxis, n) : fopt::MapAttr::broadcast(op->getContext(), 1);
+}
+
 KernelBuilder::KernelBuilder(RaisedKernel &raised)
-    : raised(raised), ctx(raised.func.getContext()), b(raised.func.getContext()) {}
+    : raised(raised), ctx(raised.func.getContext()), b(raised.func.getContext()), chips(chipCount(raised.func)) {}
 
 fopt::MapAttr KernelBuilder::axis(StringRef name, int64_t size) {
   for (auto &[existing, n] : axes)
@@ -59,7 +70,7 @@ void KernelBuilder::beginBody() {
   func::FuncOp src = raised.func;
   b.setInsertionPoint(src);
   kernel = func::FuncOp::create(b, src.getLoc(), src.getName(), b.getFunctionType(inputTypes, outputTypes));
-  kernel->setAttr(fopt::kChipAttr, b.getI64IntegerAttr(1));
+  kernel->setAttr(fopt::kChipAttr, b.getI64IntegerAttr(chips));
   kernel->setAttr(fopt::kPeAttr, b.getI64IntegerAttr(8));
   for (auto [i, arg] : llvm::enumerate(inputArgs)) {
     kernel.setArgAttr(i, fopt::kNameAttr, b.getStringAttr(raised.argNames[arg]));

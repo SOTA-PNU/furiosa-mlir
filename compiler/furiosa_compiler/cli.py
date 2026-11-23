@@ -76,8 +76,8 @@ def summary(arrays: dict) -> str:
 
 def run(out: Path, graph_index: int, inputs: Path | None, outputs: Path | None, emulation: bool) -> Path:
     """Builds out/crate's run_graph (npu3, or the CPU emulation) and runs one graph of the model."""
-    from furiosa_compiler.locks import npu_lock
-    from furiosa_compiler.npu import NPU, build_run_graph
+    from furiosa_compiler.locks import npu_lock, wait_idle
+    from furiosa_compiler.npu import NPU, NPUS, build_run_graph
 
     graph = json.loads((out / "compiler" / "graph.json").read_text())["graphs"][graph_index]
     if inputs is None:  # random inputs, written next to the outputs so a run can be repeated
@@ -90,7 +90,9 @@ def run(out: Path, graph_index: int, inputs: Path | None, outputs: Path | None, 
     if emulation:
         proc = subprocess.run(cmd, cwd=out / "crate", env=env)
     else:
-        with npu_lock():
+        with npu_lock(NPUS):
+            if not wait_idle(NPUS):  # another user's run holds an NPU: never preempt it
+                sys.exit(f"npu{NPU} stayed busy for 30 min")
             proc = subprocess.run(cmd, cwd=out / "crate", env=env)
     if proc.returncode:
         sys.exit(f"run_graph exited {proc.returncode}")

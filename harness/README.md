@@ -112,9 +112,9 @@ fails the run on any way around that:
   anything but `furiosa`, `driver.set_active`), or CUDA (`torch.cuda`, `.cuda()`), and it checks in
   the compiler venv that Triton's active backend and the driver's compile target are both `furiosa`.
   There, `kernel[grid](...)` itself runs on the NPU (`compiler/furiosa_compiler/npu.py`).
-- L4 runs every graph under `strace` and passes only if the run opened `/dev/rngd/npu3*` and no other
-  NPU or GPU device; L4 waits for npu3 when it is busy (up to 30 min) instead of skipping, so a case
-  is judged on the NPU or fails.
+- L4 runs every graph under `strace` and passes only if the run opened exactly its NPUs (`/dev/rngd/npu3*`,
+  or with `FURIOSA_CHIPS` > 1 those `FURIOSA_VISIBLE_CHIPS` names) and no other NPU or GPU device; L4 waits
+  for its NPUs when they are busy (up to 30 min) instead of skipping, so a case is judged on the NPU or fails.
 - L1 (raised IR on MLIR's CPU JIT) and L3 (furiosa-opt's CPU emulation of the same crate) are
   checks of intermediate stages, never results; the GPU runs Triton only to record golden data,
   in the harness venv, whose Triton has no Furiosa backend.
@@ -195,3 +195,9 @@ returns to its own slot), and runs on npu3 take one lock (`~/.cache/furiosa-npu/
 The report is a case × level table (PASS / FAIL / SKIP with the reason and the worst error), also
 written to `harness/out/report.json`. L4 waits (up to 30 min) until every PE of npu3 is idle; the harness never
 opens another NPU (`FURIOSA_VISIBLE_CHIPS=3`).
+
+`FURIOSA_CHIPS=N` runs every case on N chips (docs/usage.md, Several chips) against the same golden data, with its
+outputs in `harness/out/chips<N>/`: the NPUs are the last N (npu2 and npu3 for two) unless `FURIOSA_VISIBLE_CHIPS`
+names others. npu0-npu2 serve other users: L4 holds the lock of every NPU it uses (`npu<i>.lock` next to
+`npu.lock`) and checks that every PE of each is idle right before each graph's run, waiting otherwise; it never
+preempts a run. Take npu0 and npu1 only for N = 4, briefly.

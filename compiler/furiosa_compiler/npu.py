@@ -11,7 +11,6 @@ import json
 import os
 import shutil
 import subprocess
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -21,11 +20,11 @@ import torch
 
 from furiosa_compiler import driver, tensors
 from furiosa_compiler.crate import build_crate
-from furiosa_compiler.locks import CACHE, npu_lock, target_slot
+from furiosa_compiler.locks import CACHE, CHIPS, npu_lock, target_slot, visible_chips, wait_idle
 
 ROOT = Path(__file__).resolve().parents[2]
-NPU = os.environ.get("FURIOSA_VISIBLE_CHIPS", "3")  # the only NPU this host may open
-OCCUPANCY = Path(f"/sys/class/rngd_mgmt/rngd!npu{NPU}mgmt/pe_occupancy")
+NPUS = visible_chips()  # npu3 alone, unless FURIOSA_CHIPS > 1 (docs/usage.md)
+NPU = ",".join(map(str, NPUS))  # as FURIOSA_VISIBLE_CHIPS
 DTYPES = {torch.float32: "fp32", torch.float16: "fp16", torch.bfloat16: "bf16", torch.int32: "i32", torch.int64: "i64",
           torch.int8: "i8", torch.float8_e4m3fn: "fp8e4nv"}
 # dtypes numpy has no native form of: the integer view torch hands over, and the ml_dtypes type to read it as.
@@ -110,7 +109,7 @@ def executable(launch: Launch) -> tuple[Path, Path]:
     src, options, _, _ = driver.specialize(launch)
     compiler = triton_key() + "".join(p.read_text() for p in sorted(Path(__file__).parent.glob("*.py")))
     key = repr((compiler, launch.kernel.cache_key, sorted(src.constants.items(), key=str), src.signature,
-                options["grid"], options["buffers"], options["scalars"]))
+                options["grid"], options["buffers"], options["scalars"]) + ((CHIPS,) if CHIPS > 1 else ()))
     work = CACHE / f"{launch.kernel.__name__}-{hashlib.sha256(key.encode()).hexdigest()[:16]}"
     work.mkdir(parents=True, exist_ok=True)
     with open(work / ".lock", "w") as lock:
@@ -136,11 +135,10 @@ def run(kernel, grid: tuple, args: dict):
     exe, work = executable(launch)
     inputs, outputs = work / f"in-{os.getpid()}.safetensors", work / f"out-{os.getpid()}.safetensors"
     tensors.save(inputs, {name: host(args[name]) for name in bufs})
-    with npu_lock():
-        for _ in range(180):  # npu3 may be busy with another user's run: wait rather than fail
-            if not OCCUPANCY.exists() or set(OCCUPANCY.read_text().split()) <= {"0"}:  # no status file: no wait
-                break
-            time.sleep(10)
+    with npu_lock(NPUS):
+        # Another user's run may hold an NPU: wait, never preempt it (checked right before the run opens them).
+        if not wait_idle(NPUS):
+            raise RuntimeError(f"{kernel.__name__}: npu{NPU} stayed busy for 30 min")
         proc = subprocess.run([str(exe), "0", str(inputs), str(outputs)], cwd=work / "crate",
                               env=dict(os.environ, FURIOSA_VISIBLE_CHIPS=NPU), capture_output=True, text=True)
     if proc.returncode or not outputs.exists():

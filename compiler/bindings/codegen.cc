@@ -44,38 +44,40 @@ template <typename F> std::string withModule(const std::string &text, F body) {
   return out;
 }
 
+/// The kernels mapped to fopt (furiosa-tile, furiosa-linalg-to-fopt, then with `lower` furiosa-dma and
+/// furiosa-ve-fuse) for `chips` chips: more than one sets the module's furiosa.chips (docs/usage.md).
+std::string mapToFopt(const std::string &text, int64_t chips, bool lower) {
+  return withModule(text, [&](mlir::ModuleOp module, llvm::raw_ostream &os) {
+    mlir::PassManager pm(module->getContext());
+    if (chips > 1)
+      module->setAttr("furiosa.chips", mlir::Builder(module->getContext()).getI64IntegerAttr(chips));
+    pm.addPass(mlir::furiosa::createTilePass());
+    pm.addPass(mlir::furiosa::createLinalgToFoptPass());
+    if (lower) {
+      pm.addPass(mlir::furiosa::createDmaPass());
+      pm.addPass(mlir::furiosa::createVeFusePass());
+    }
+    if (mlir::failed(pm.run(module)))
+      return mlir::failure();
+    module.print(os);
+    return mlir::success();
+  });
+}
+
 } // namespace
 
 void init_furiosa_codegen(nb::module_ &m) {
   auto codegen = m.def_submodule("codegen");
 
-  codegen.def("linalg_to_fopt", [](const std::string &text) {
-    return withModule(text, [](mlir::ModuleOp module, llvm::raw_ostream &os) {
-      mlir::PassManager pm(module->getContext());
-      pm.addPass(mlir::furiosa::createTilePass());
-      pm.addPass(mlir::furiosa::createLinalgToFoptPass());
-      pm.addPass(mlir::furiosa::createDmaPass());
-      pm.addPass(mlir::furiosa::createVeFusePass());
-      if (mlir::failed(pm.run(module)))
-        return mlir::failure();
-      module.print(os);
-      return mlir::success();
-    });
-  });
+  codegen.def(
+      "linalg_to_fopt", [](const std::string &text, int64_t chips) { return mapToFopt(text, chips, true); },
+      nb::arg("text"), nb::arg("chips") = 1);
 
   // The tiled kernels mapped to fopt before furiosa-dma and furiosa-ve-fuse: staged reads (fopt.stage, fopt.read)
   // and Vector Engine ops (fopt.ve) still abstract.
-  codegen.def("linalg_to_ftile", [](const std::string &text) {
-    return withModule(text, [](mlir::ModuleOp module, llvm::raw_ostream &os) {
-      mlir::PassManager pm(module->getContext());
-      pm.addPass(mlir::furiosa::createTilePass());
-      pm.addPass(mlir::furiosa::createLinalgToFoptPass());
-      if (mlir::failed(pm.run(module)))
-        return mlir::failure();
-      module.print(os);
-      return mlir::success();
-    });
-  });
+  codegen.def(
+      "linalg_to_ftile", [](const std::string &text, int64_t chips) { return mapToFopt(text, chips, false); },
+      nb::arg("text"), nb::arg("chips") = 1);
 
   codegen.def("tile", [](const std::string &text) {
     return withModule(text, [](mlir::ModuleOp module, llvm::raw_ostream &os) {

@@ -71,6 +71,26 @@ furiosa trace models/lenet5.py -o out/lenet5-trace --npu --dump out/lenet5-trace
   1  avgpool2d_kernel_0           pool1.out                 0.976            0         0
 ```
 
+## Several chips
+
+`FURIOSA_CHIPS=N` compiles every kernel for N chips (SPMD) and runs it on the N NPUs `FURIOSA_VISIBLE_CHIPS` names;
+it is part of every compile (and of the launch cache key), and N = 1 is the single-chip compiler unchanged.
+
+```
+FURIOSA_CHIPS=2 furiosa compile models/vgg16.py -o out/vgg16-2      # kernels for two chips
+FURIOSA_CHIPS=2 furiosa run out/vgg16-2                            # on npu2 and npu3
+```
+
+Between kernels every buffer is whole on every chip: uploads write each chip's copy (in DRAM the other chips may
+write), downloads read chip 0's. Every kernel runs on every chip, each on its own copy (every chip mapping is the
+`CHIP` axis), so the chips compute the same values.
+
+The NPUs are shared: npu0-npu2 run other users' services. A run opens exactly the NPUs it uses, holds a lock per
+NPU (`~/.cache/furiosa-npu/npu.lock` for npu3, `npu<i>.lock` for the others) and, right before it opens them, waits
+until every PE of each is idle (`/sys/class/rngd_mgmt/rngd!npu<i>mgmt/pe_occupancy`), up to 30 minutes; it never
+preempts another user's run. Single-chip work stays on npu3; take the other NPUs only for N-chip runs, while idle,
+briefly.
+
 ## Debugging the stages
 
 Each kernel's stages, in pipeline order (compiler/README.md describes the passes):
@@ -99,7 +119,8 @@ Each kernel's stages, in pipeline order (compiler/README.md describes the passes
 
 | Variable | Default | |
 |---|---|---|
-| `FURIOSA_VISIBLE_CHIPS` | `3` | the NPU the runs open |
+| `FURIOSA_CHIPS` | `1` | the chips every kernel runs on (below) |
+| `FURIOSA_VISIBLE_CHIPS` | the last `FURIOSA_CHIPS` NPUs (`3`; `2,3`; ...) | the NPUs the runs open, `FURIOSA_CHIPS` of them |
 | `FURIOSA_NPU_CACHE` | `~/.cache/furiosa-npu` | kernel builds and cargo target dirs |
 | `FURIOSA_BUILD_SLOTS` | cores / 16 | cargo builds at once |
 | `FURIOSA_RUNNER_UTILS` | beside libtriton, else the build's | the MLIR runner utilities the JIT links |

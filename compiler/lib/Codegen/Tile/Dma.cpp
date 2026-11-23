@@ -7,6 +7,7 @@
 // of the staged tensor and one HBM-to-DM DMA.
 
 #include "Dma.h"
+#include "../Mapping/Mapping.h"
 
 #include "furiosa/Codegen/Codegen.h"
 
@@ -180,9 +181,11 @@ private:
     return MapAttr::axis(ctx, name, size);
   }
   MapAttr pairOf(ArrayRef<MapAttr> parts) { return MapAttr::pair(ctx, parts); }
-  HbmTensorType hbmType(Type et, MapAttr element) { return HbmTensorType::get(ctx, et, one(), element); }
+  HbmTensorType hbmType(Type et, MapAttr element) {
+    return HbmTensorType::get(ctx, et, mapping::chipMapping(stage), element);
+  }
   DmTensorType dmType(Type et, MapAttr slice, MapAttr element) {
-    return DmTensorType::get(ctx, et, one(), one().padTo(2), slice, element);
+    return DmTensorType::get(ctx, et, mapping::chipMapping(stage), one().padTo(2), slice, element);
   }
 
   int64_t kTiles() { return spec.kTiles(); }

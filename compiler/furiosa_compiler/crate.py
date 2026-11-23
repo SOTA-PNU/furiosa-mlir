@@ -18,6 +18,8 @@ from pathlib import Path
 
 from triton._C.libtriton import furiosa
 
+from furiosa_compiler.locks import CHIPS
+
 # fp16 and fp8 buffers live as f32 on the device (furiosa-opt has no f16), int8 ones as i32 (the Vector Engine
 # computes on 32-bit lanes); all convert at the graph boundary.
 RUST_DTYPES = {"fp32": "f32", "bf16": "bf16", "i32": "i32", "fp16": "f32", "i8": "i32", "fp8e4nv": "f32"}
@@ -225,12 +227,12 @@ def ident(text: str) -> str:
 def map_kernel(linalg: str, kernel_dir: Path, stem: str, what: str) -> tuple[str, dict]:
     """One raised kernel's Rust module and signature; also writes <stem>.fopt.mlir and <stem>.rs."""
     try:
-        fopt = furiosa.codegen.linalg_to_fopt(linalg)
+        fopt = furiosa.codegen.linalg_to_fopt(linalg, CHIPS)
     except RuntimeError as e:
         raise CrateError(f"{what}: linalg -> fopt: {str(e).strip()}") from None
     (kernel_dir / ("fopt.mlir" if stem == "kernel" else f"{stem}.fopt.mlir")).write_text(fopt)
     # The level before furiosa-dma (staged reads still abstract), for inspection.
-    (kernel_dir / ("ftile.mlir" if stem == "kernel" else f"{stem}.ftile.mlir")).write_text(furiosa.codegen.linalg_to_ftile(linalg))
+    (kernel_dir / ("ftile.mlir" if stem == "kernel" else f"{stem}.ftile.mlir")).write_text(furiosa.codegen.linalg_to_ftile(linalg, CHIPS))
     try:
         rust = furiosa.codegen.fopt_to_rust(fopt)
         signature = json.loads(furiosa.codegen.fopt_signature(fopt))
@@ -270,6 +272,24 @@ def codegen(kernel_dir: Path) -> tuple[dict, dict]:
     if errors:
         raise CrateError("\n".join(errors))
     return modules, plan
+
+
+def to_hbm(host: str, mapping: str) -> str:
+    """Rust for a host tensor expression moved to HBM as an untyped buffer, whole on every chip."""
+    if CHIPS > 1:
+        return f"shared(device, {host}).await?"
+    return f"{host}.to_hbm::<m![1], {mapping}>(&mut device.pdma).await?.into_buffer()"
+
+
+# On several chips a kernel may update any buffer it binds in place, which only DRAM the other chips may write allows.
+SHARED = """
+/// A host tensor in HBM, whole on every chip, in DRAM the other chips may write too.
+async fn shared<D: MaterializableScalar, E: M>(device: &mut Device, host: HostTensor<D, E>) -> eyre::Result<HbmBuffer> {{
+    let mut hbm = HbmTensor::<D, m![{chips}], E>::try_from(HbmBuffer::alloc_shared(device, E::SIZE * size_of::<D>())?)?;
+    host.to_hbm::<m![{chips}], E>(&mut device.pdma).output(&mut hbm).await?;
+    Ok(hbm.into_buffer())
+}}
+"""
 
 
 class RunGraph:
@@ -312,19 +332,15 @@ class RunGraph:
             if (axis, elements) not in self.axes:
                 self.axes.append((axis, elements))
             lines.append(
-                f"    let c{n} = HostTensor::<{MLIR_DTYPES[const['dtype']]}, m![{axis}]>::from_buf("
-                f"include_bytes!(\"consts/{symbol}_{n}.bin\").to_vec())"
-                f".to_hbm::<m![1], m![{axis}]>(&mut device.pdma).await?.into_buffer();"
+                f"    let c{n} = " + to_hbm(f"HostTensor::<{MLIR_DTYPES[const['dtype']]}, m![{axis}]>::from_buf("
+                                        f"include_bytes!(\"consts/{symbol}_{n}.bin\").to_vec())", f"m![{axis}]") + ";"
             )
 
         def zeros(pad: str, name: str, rust_dtype: str, elements: int):
             axis = f"Z{elements}"
             if (axis, elements) not in self.axes:
                 self.axes.append((axis, elements))
-            lines.append(
-                f"{pad}let {name} = HostTensor::<{rust_dtype}, m![{axis}]>::zero()"
-                f".to_hbm::<m![1], m![{axis}]>(&mut device.pdma).await?.into_buffer();"
-            )
+            lines.append(f"{pad}let {name} = " + to_hbm(f"HostTensor::<{rust_dtype}, m![{axis}]>::zero()", f"m![{axis}]") + ";")
             defined.add(name)
 
         def slot(where: dict) -> tuple[str, str, str, int]:
@@ -459,10 +475,8 @@ class RunGraph:
         for buffer, info in graph["buffers"].items():
             if info["kind"] in ("input", "weight", "state"):
                 mapping = self.host_mapping(g, names, buffer, info["shape"])
-                lines.append(
-                    f"    let {variable(buffer)} = inputs.host::<{dtype(buffer)}, {mapping}>({json.dumps(buffer)})?"
-                    f".to_hbm::<m![1], {mapping}>(&mut device.pdma).await?.into_buffer();"
-                )
+                lines.append(f"    let {variable(buffer)} = "
+                             + to_hbm(f"inputs.host::<{dtype(buffer)}, {mapping}>({json.dumps(buffer)})?", mapping) + ";")
                 defined.add(variable(buffer))
         for i, launch in enumerate(graph["launches"]):
             symbol = launch["kernel"]
@@ -477,10 +491,8 @@ class RunGraph:
                     axis = f"Z{info['elements'][a]}"
                     if (axis, info["elements"][a]) not in self.axes:
                         self.axes.append((axis, info["elements"][a]))
-                    lines.append(
-                        f"    let {name} = HostTensor::<{info['dtypes'][a]}, m![{axis}]>::zero()"
-                        f".to_hbm::<m![1], m![{axis}]>(&mut device.pdma).await?.into_buffer();"
-                    )
+                    lines.append(f"    let {name} = " + to_hbm(f"HostTensor::<{info['dtypes'][a]}, m![{axis}]>::zero()",
+                                                             f"m![{axis}]") + ";")
                     defined.add(name)
                 args.append(f", {name}.alias(..)?")
             rets = [variable(launch["args"][a]) for a in info["writes"]]
@@ -494,10 +506,12 @@ class RunGraph:
                 mapping = self.host_mapping(g, names, buffer, info["shape"])
                 shape = ", ".join(str(d) for d in info["shape"])
                 put = {"fp16": "put_f16", "i8": "put_i8", "fp8e4nv": "put_f8"}.get(info["dtype"], "put")
-                lines.append(
-                    f"    files.{put}({json.dumps(buffer)}, &[{shape}], HbmTensor::<{dtype(buffer)}, m![1], {mapping}>"
-                    f"::try_from({variable(buffer)}.alias(..)?)?.to_host::<{mapping}>(&mut device.pdma).await?);"
-                )
+                host = (f"HbmTensor::<{dtype(buffer)}, m![1], {mapping}>::try_from({variable(buffer)}.alias(..)?)?"
+                        f".to_host::<{mapping}>(&mut device.pdma).await?")
+                if CHIPS > 1:  # every chip holds the whole buffer: chip 0's copy
+                    host = (f"HostTensor::<{dtype(buffer)}, {mapping}>::try_from({variable(buffer)}.slice(0usize, ..)?"
+                            f".to_host(&mut device.pdma).await?)?")
+                lines.append(f"    files.{put}({json.dumps(buffer)}, &[{shape}], {host});")
         lines.append("    Ok(())")
         lines.append("}")
         return "\n".join(lines)
@@ -535,7 +549,7 @@ async fn main() -> eyre::Result<()> {{
 }}
 
 {chr(10).join(fns)}
-"""
+{SHARED.format(chips=CHIPS) if CHIPS > 1 else ""}"""
 
 
 def failed_crate(crate: Path, model: str, error: str) -> Path:

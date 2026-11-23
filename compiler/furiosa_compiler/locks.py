@@ -5,7 +5,7 @@ import fcntl
 import hashlib
 import os
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 CACHE = Path(os.environ.get("FURIOSA_NPU_CACHE", Path.home() / ".cache" / "furiosa-npu"))
@@ -35,10 +35,46 @@ def target_slot(root: Path, crate: Path, slots: int = SLOTS):
         time.sleep(1)
 
 
+# SPMD over chips (docs/usage.md): every kernel runs on FURIOSA_CHIPS chips, its parallel work split over them.
+CHIPS = int(os.environ.get("FURIOSA_CHIPS", "1"))
+
+
+def visible_chips() -> list:
+    """The NPUs a run opens: FURIOSA_VISIBLE_CHIPS, which names FURIOSA_CHIPS of them (default: the last ones of
+    npu0..npu3, so one chip is npu3). Other users' services hold npu0..npu2: a run opens them only when idle
+    (wait_idle)."""
+    spec = os.environ.get("FURIOSA_VISIBLE_CHIPS") or ",".join(map(str, range(4 - CHIPS, 4)))
+    chips = sorted({int(c) for c in spec.split(",") if c.strip()})
+    if len(chips) != CHIPS:
+        raise ValueError(f"FURIOSA_VISIBLE_CHIPS={spec} names {len(chips)} NPU(s), FURIOSA_CHIPS={CHIPS}")
+    return chips
+
+
+def chips_idle(chips) -> bool:
+    """Whether every PE of every NPU in `chips` is idle (an NPU without a status file has nothing to wait for)."""
+    for c in chips:
+        path = Path(f"/sys/class/rngd_mgmt/rngd!npu{c}mgmt/pe_occupancy")
+        if path.exists() and set(path.read_text().split()) - {"0"}:
+            return False
+    return True
+
+
+def wait_idle(chips, minutes: int = 30) -> bool:
+    """Waits until every NPU in `chips` is idle; never preempts another user's run. Call it holding npu_lock(chips),
+    right before the run opens them."""
+    for _ in range(minutes * 6):
+        if chips_idle(chips):
+            return True
+        time.sleep(10)
+    return chips_idle(chips)
+
+
 @contextmanager
-def npu_lock():
-    """npu3 to this process alone until exit."""
+def npu_lock(chips=(3,)):
+    """The NPUs in `chips` to this process alone until exit, locked in order (npu3's lock is npu.lock)."""
     CACHE.mkdir(parents=True, exist_ok=True)
-    with open(CACHE / "npu.lock", "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with ExitStack() as stack:
+        for c in sorted(chips):
+            lock = stack.enter_context(open(CACHE / ("npu.lock" if c == 3 else f"npu{c}.lock"), "w"))
+            fcntl.flock(lock, fcntl.LOCK_EX)
         yield
