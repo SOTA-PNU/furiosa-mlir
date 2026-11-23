@@ -117,4 +117,6 @@ CASES = {
     # last_hidden_state 1.0% of max|out|); integer outputs are exact.
     "bert_base": Case("models/bert_base.py", weights="huggingface", npu=Tol(rtol=6.4e-2, atol=0),
                       int_ranges={"input_ids": (0, 30522), "token_type_ids": (0, 2), "lengths": (1, 129)}),
+    # gpt2: kv_cache.11.k 2.1% after prefill, logits 0.73% / 0.47% (prefill / decode), next_token unchanged.
+    "gpt2": Case("models/gpt2.py", weights="huggingface", npu=Tol(rtol=4.2e-2, atol=0), int_ranges={"input_ids": (0, 50257)}),
 }
