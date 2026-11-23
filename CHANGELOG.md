@@ -109,6 +109,31 @@ npu stage) against GPU goldens.
   - ConvNeXt-Tiny (1473bd7): 7x7 depthwise conv into channels-last rows, LayerNorm over channels, erf GELU, layer
     scale with a transposed store, patch-GEMM stem and downsampling; 83 launches; max|logit diff| 2.9e-6, rtol
     1.5e-2.
+  - Swin-T (fb109d7): window attention gathered from the cyclically shifted image with the relative position bias
+    and the shifted-window mask, stored back by the reverse roll, patch merging; 95 launches; max|logit diff|
+    4.3e-6.
+  - DenseNet-121 (f50aea8): each dense block one NHWC buffer that layers append their channels to (a store into a
+    channel slice), BN-ReLU as prologue and epilogue, transitions with a 2x2 average pool; 126 launches.
+  - BERT-base (8ba8d7b): embeddings with LayerNorm, 12 post-LN layers with a key padding mask from per-sequence
+    lengths, erf GELU, the tanh pooler; fp32, a batch of 2 padded to 128; max diff 1.1e-5 against transformers.
+  - GPT-2 (c1c10cc): prefill and decode graphs, Conv1D weights read in place, a fused QKV GEMM feeding per-layer KV
+    caches, causal flash attention, tanh GELU, the tied head; greedy tokens identical to transformers'.
+  - Whisper-tiny (327ff98): the encoder (two conv1d as implicit GEMMs, sinusoidal positions, 4 layers over 1500
+    frames) and a decoder step with causal self-attention and cross-attention; next token identical.
+- Larger models: the Qwen3 graphs build every size from a Config, qwen3_0_6b's TTIR unchanged byte for byte
+  (0ff6f16); `qwen3_1_7b` runs them at Qwen3-1.7B's config with the official weights, greedy tokens identical to
+  transformers' (42b818b).
+- Codegen for scatter-add and segment sum (each with a lit test):
+  - A float reduction step a data condition guards adds `select(c, x, -0.0)` (1771109), extending the integer form.
+  - An index compared with data, or masked into such a comparison, is a hoisted table (e841e2c); `rem(a, 2^k) == 0`
+    is its low bits (1987d98).
+  - A column value computed from a column input streams where it meets a row value (06b7a1f).
+  - A reduction no class maps collapses its leading loops once the inputs that read part of them are broadcast over
+    them, kept only if the result maps (7d5803c).
+  - An index list too long for one slice's DM spreads over the slices (c7e8237; it failed on npu3 with an Sram
+    allocation error after mapping).
+  `heldout3_scatter_add` (rel 9.6e-8) and `heldout3_segment_sum` (rel 0) pass L1 to L4: all ten kernels of the third
+  held-out batch pass L4. The matrix's int32/int8 interleave and join now map as one step and pass on npu3.
 ## 1.4.0 (2026-11-18, release/1.4.0)
 
 Milestone: kernels the compiler was not written for. The second held-out batch (ten standard ML ops written from their
