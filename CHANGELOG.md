@@ -135,6 +135,10 @@ npu stage) against GPU goldens.
 - Normalize: a long reduction whose input is read at 0 in a unit dim is reshaped before the split (18ae9a9). The
   upstream split asserted (`cast<AffineDimExpr>`) on RMSNorm with residual run as one program at hidden >= 2048, in
   every Qwen3 size from 1.7B and Qwen2.5-7B; those kernels now map.
+- Raise: a program id is recovered from the tile origin along a view dim, digit by digit (5bd6d61): rows a program
+  computes as `t * GROUP + j` (Llama's GQA attention, 4 query heads per KV head in one tile) or `seq * T + block`
+  (BERT's per-sequence attention) raise. Llama's prefill attention matches on npu3 (max err 0.0073, bf16); its
+  furiosa-opt build takes about 40 minutes.
 - A raise failure's diagnostics travel in its exception (d705248): the harness line shows the first error instead of
   "PassManager::run failed".
 - Golden data keeps checkpoint weights by reference (55b474a): a golden of a case with `weights=` stores only its
