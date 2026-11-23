@@ -126,4 +126,8 @@ CASES = {
                       int_ranges={"input_ids": (0, 30522), "token_type_ids": (0, 2), "lengths": (1, 129)}),
     # gpt2: kv_cache.11.k 2.1% after prefill, logits 0.73% / 0.47% (prefill / decode), next_token unchanged.
     "gpt2": Case("models/gpt2.py", weights="huggingface", npu=Tol(rtol=4.2e-2, atol=0), int_ranges={"input_ids": (0, 50257)}),
+    # whisper_tiny: decoder logits 2.7%, encoder_hidden_states 2.2%, next_token unchanged; input_features in
+    # [-1, 1), the range of Whisper's normalized log-mel features.
+    "whisper_tiny": Case("models/whisper_tiny.py", weights="huggingface", npu=Tol(rtol=5.3e-2, atol=0),
+                         int_ranges={"decoder_input_ids": (0, 51865)}, float_ranges={"input_features": (-1.0, 1.0)}),
 }
