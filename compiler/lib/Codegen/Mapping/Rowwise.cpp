@@ -43,6 +43,9 @@ using namespace mlir::furiosa::mapping;
 namespace {
 
 constexpr int64_t kSlices = 256, kVrfBytes = 8 * 1024;
+// npu3's Tensor Unit reads at most this many VRF operands in one pass ("cannot load more than 5"; the CPU emulation
+// takes more).
+constexpr int kVrfLoads = 5;
 
 enum class Shape { Scalar = 0, Row = 1, Col = 2, Full = 3 };
 
@@ -1144,6 +1147,7 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
   int stage = Tag;
   bool way4 = false;
   std::set<std::string> alus;
+  int vrfLoads = 0; // the VRF operands the pass reads: the Tensor Unit loads at most kVrfLoads
   MapAttr fullTime8 = H.stride(8), fullPacket8 = H.modulo(8), fullTime4 = H.stride(4), fullPacket4 = H.modulo(4);
   auto time = [&]() { return row ? kb.one() : (way4 ? fullTime4 : fullTime8); };
   auto packet = [&]() { return row ? rowPacket(way4 ? 4 : 8) : (way4 ? fullPacket4 : fullPacket8); };
@@ -1193,6 +1197,7 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
     stage = Tag;
     way4 = false;
     alus.clear();
+    vrfLoads = 0;
   };
   auto toWay4 = [&]() {
     if (way4)
@@ -1268,6 +1273,7 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
     stage = Tag;
     way4 = false;
     alus.clear();
+    vrfLoads = 0;
     pair = true;
   } else {
     begin(source, sourceType, path.empty() ? ArrayAttr() : tagsOf(path[0]));
@@ -1378,9 +1384,17 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
     bool clipSub = form == ClipBin && op == "sub";
     if (clipSub && (st.operand < 0 || dag.nodes[st.operand].kind != Node::Const))
       return fail(func, "a subtraction of a VRF operand after the float stage"), failure();
-    // Pass break: a stage behind us, a used ALU, or a stash where the stage cannot stash.
+    // The VRF operands the op reads: its other operand unless an immediate or the stash, a select's two sides.
+    bool readsOperand = form != ReduceOp && form != FpUnary && form != FpZip && form != ClipZip && form != Select &&
+                        form != EqKey && form != IntZip && form != AbsI && form != IToF && form != FToI && op != "neg";
+    auto inVrf = [&](int o) { return o >= 0 && dag.nodes[o].kind != Node::Const; };
+    int loads = form == Select ? inVrf(st.operand) + inVrf(st.operand2)
+                : form == EqKey ? 1
+                                : readsOperand && !st.stash && inVrf(st.operand);
+    // Pass break: a stage behind us, a used ALU, a stash where the stage cannot stash, or a VRF load too many.
     bool sameStageAllowed = need == Fp || need == Clip;
     bool breakHere = need < stage || (need == stage && !sameStageAllowed) || alus.count(alu) ||
+                     vrfLoads + loads > kVrfLoads ||
                      (needWay4 && stage > Narrow && !way4) || (form == ReduceOp && (row || pair)) ||
                      (pair && st.stash) || // pair mode has neither the stash nor the intra-slice reducer
                      ((form == Select || form == EqKey || form == AbsI) && (!tagged || stage != Tag || !alus.empty())) ||
@@ -1532,6 +1546,7 @@ FailureOr<Value> Planner::materialize(int node, func::FuncOp func, Type outType)
     }
     stage = need;
     alus.insert(alu);
+    vrfLoads += loads;
     current = st.node;
   }
   return commit(node, outType);
