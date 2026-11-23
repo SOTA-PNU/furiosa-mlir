@@ -123,6 +123,10 @@ CASES = {
                      graph=Tol(rtol=1.8e-2, atol=0), npu=Tol(rtol=3.6e-2, atol=0), seed=2),  # 1.79% kv_cache.13.v
     "qwen3_8b": Case("models/qwen3_8b.py", weights="huggingface", int_ranges={"input_ids": (0, 151936)},
                      graph=Tol(rtol=2.3e-2, atol=0), npu=Tol(rtol=4.5e-2, atol=0)),  # 2.20% kv_cache.35.v
+    # Other 8B-class architectures, written from the math and transformers' definitions, by the same rule against
+    # transformers' own model.
+    "llama3_1_8b": Case("models/llama3_1_8b.py", weights="huggingface", int_ranges={"input_ids": (0, 128256)},
+                        graph=Tol(rtol=2.3e-2, atol=0), npu=Tol(rtol=4.5e-2, atol=0)),  # 2.22% kv_cache.8.v
     # Held-out Hugging Face models (fp32 checkpoints), by the fp32 models' rule: twice the drift of the same
     # Triton graph run in bf16 on the GPU, at the worst output (measured: bert_base pooler_output 3.2%,
     # last_hidden_state 1.0% of max|out|); integer outputs are exact.
