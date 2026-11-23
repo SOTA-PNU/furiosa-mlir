@@ -1144,8 +1144,11 @@ void splitGuardedReductions(ModuleOp module, function_ref<bool(linalg::GenericOp
 
 /// An integer reduction whose step a condition guards, yielding select(p, acc . t, acc) (a carry summed over the
 /// tiles before a column's), in a generic no class maps as it is, combines the identity where p does not hold:
-/// acc . select(p, t, e), e the identity of `.`, a masked term as the classes take. Integers only: a float term the
-/// guard skips may be inf, which the mask's product (selectsToArithmetic) would turn into NaN.
+/// acc . select(p, t, e), e the identity of `.`, a masked term as the classes take. A float one only where p reads
+/// data (an atomic folding the lanes whose ids select the element, a loop over every counter value its loaded bounds
+/// reach), with e = -0.0 for an add so that x + e = x for every x: an index-only guard would become the mask's
+/// product (selectsToArithmetic), which turns a skipped inf into NaN (so do index-only parts of a data guard, which
+/// nestSelectKeys keys apart: exact for finite terms there, as a masked load's).
 void unguardSteps(ModuleOp module, function_ref<bool(linalg::GenericOp)> mapsAlone) {
   SmallVector<linalg::GenericOp> generics;
   module.walk([&](linalg::GenericOp g) { generics.push_back(g); });
@@ -1155,15 +1158,24 @@ void unguardSteps(ModuleOp module, function_ref<bool(linalg::GenericOp)> mapsAlo
     Block &body = *g.getBody();
     BlockArgument acc = body.getArgument(g.getNumDpsInputs());
     auto sel = cast<linalg::YieldOp>(body.getTerminator()).getOperand(0).getDefiningOp<arith::SelectOp>();
-    if (!sel || !sel.getType().isInteger() || dependsOn(sel.getCondition(), acc))
+    auto readsData = [&](Value v) {
+      return llvm::any_of(body.getArguments().take_front(g.getNumDpsInputs()),
+                          [&](BlockArgument in) { return dependsOn(v, in); });
+    };
+    if (!sel || dependsOn(sel.getCondition(), acc) ||
+        !(sel.getType().isInteger() || (isa<FloatType>(sel.getType()) && readsData(sel.getCondition()))))
       continue;
     bool kept = sel.getTrueValue() == acc; // select(p, acc, acc . t): the step where p does not hold
     Operation *c = (kept ? sel.getFalseValue() : sel.getTrueValue()).getDefiningOp();
     if ((kept ? sel.getFalseValue() : sel.getTrueValue()) == acc || (kept ? sel.getTrueValue() : sel.getFalseValue()) != acc ||
-        !isa_and_nonnull<arith::AddIOp, arith::MaxSIOp, arith::MinSIOp>(c) || c->getBlock() != &body)
+        !isa_and_nonnull<arith::AddIOp, arith::MaxSIOp, arith::MinSIOp, arith::AddFOp, arith::MaximumFOp,
+                         arith::MinimumFOp>(c) ||
+        c->getBlock() != &body)
       continue;
     unsigned t = c->getOperand(0) == acc ? 1 : 0;
     std::optional<TypedAttr> e = arith::getNeutralElement(c);
+    if (isa<arith::AddFOp>(c))
+      e = FloatAttr::get(sel.getType(), -0.0);
     if (c->getOperand(1 - t) != acc || dependsOn(c->getOperand(t), acc) || !e || mapsAlone(g))
       continue;
     OpBuilder b(sel);
