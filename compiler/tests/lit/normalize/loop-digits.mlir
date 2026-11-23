@@ -21,3 +21,26 @@ module {
     return %r : tensor<4x2xf32>
   }
 }
+
+// A reduction loop whose extent only its carrier spans (an im2col's K, read through the digits of a gather
+// address) splits as well: the carrier is reshaped by the digits, like an output.
+
+// CHECK-LABEL: func.func @carried
+// CHECK: %[[BOX:.*]] = tensor.extract_slice %{{.*}}[0, 0, 0] [2, 2, 4] [1, 1, 1] : tensor<2x2x16xf32> to tensor<2x2x4xf32>
+// CHECK: linalg.generic {{.*}} iterator_types = ["parallel", "reduction", "reduction"]
+// CHECK-SAME: ins(%[[BOX]] : tensor<2x2x4xf32>) outs(%{{.*}} : tensor<2xf32>)
+#gather = affine_map<(d0, d1) -> (d0 * 32 + (d1 floordiv 4) * 16 + d1 mod 4)>
+#carrier = affine_map<(d0, d1) -> (d1)>
+#row = affine_map<(d0, d1) -> (d0)>
+module {
+  func.func @carried(%x: tensor<64xf32>, %o: tensor<2xf32>) -> tensor<2xf32> attributes {furiosa.written = [1]} {
+    %k = tensor.empty() : tensor<8xi8>
+    %e = tensor.empty() : tensor<2xf32>
+    %r = linalg.generic {indexing_maps = [#carrier, #gather, #row], iterator_types = ["parallel", "reduction"]} ins(%k, %x : tensor<8xi8>, tensor<64xf32>) outs(%e : tensor<2xf32>) {
+    ^bb0(%c: i8, %a: f32, %out: f32):
+      %s = arith.addf %out, %a : f32
+      linalg.yield %s : f32
+    } -> tensor<2xf32>
+    return %r : tensor<2xf32>
+  }
+}

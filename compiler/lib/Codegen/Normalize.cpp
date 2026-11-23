@@ -1327,43 +1327,54 @@ linalg::GenericOp splitLoopDigits(linalg::GenericOp g) {
   if (!split)
     return g;
   unsigned nd = newRanges.size();
+  // Outputs, and inputs that only carry loop extents (a tensor.empty), span the loops by plain dims and are
+  // reshaped by their digits; the other inputs read the loops' values.
   SmallVector<AffineMap> maps;
-  for (OpOperand *in : g.getDpsInputOperands()) {
-    SmallVector<AffineExpr> exprs;
-    for (AffineExpr e : g.getMatchingIndexingMap(in).getResults()) {
-      AffineExpr r = withinRanges(simplifyAffineExpr(e.replaceDimsAndSymbols(value, {}), nd, 0), newRanges);
-      if (failed(linearForm(r)))
-        return g;
-      exprs.push_back(simplifyAffineExpr(r, nd, 0));
-    }
-    maps.push_back(AffineMap::get(nd, 0, exprs, ctx));
-  }
-  for (OpOperand &out : g.getDpsInitsMutable())
-    if (!g.getMatchingIndexingMap(&out).isProjectedPermutation())
-      return g;
-  OpBuilder b(g);
-  Location loc = g.getLoc();
-  SmallVector<Value> inits;
   SmallVector<SmallVector<ReassociationIndices>> groups;
-  for (OpOperand &out : g.getDpsInitsMutable()) {
+  SmallVector<SmallVector<int64_t>> shapes;
+  for (OpOperand &o : g->getOpOperands()) {
+    AffineMap m = g.getMatchingIndexingMap(&o);
     SmallVector<AffineExpr> exprs;
-    SmallVector<int64_t> shape;
     groups.emplace_back();
-    for (AffineExpr r : g.getMatchingIndexingMap(&out).getResults()) {
-      groups.back().emplace_back();
-      for (unsigned k : digits[cast<AffineDimExpr>(r).getPosition()]) {
-        groups.back().back().push_back(shape.size());
-        exprs.push_back(getAffineDimExpr(k, ctx));
-        shape.push_back(newRanges[k]);
+    shapes.emplace_back();
+    if (!g.isDpsInit(&o) && !(o.get().getDefiningOp<tensor::EmptyOp>() && m.isProjectedPermutation())) {
+      for (AffineExpr e : m.getResults()) {
+        AffineExpr r = withinRanges(simplifyAffineExpr(e.replaceDimsAndSymbols(value, {}), nd, 0), newRanges);
+        if (failed(linearForm(r)))
+          return g;
+        exprs.push_back(simplifyAffineExpr(r, nd, 0));
+      }
+    } else {
+      if (!m.isProjectedPermutation())
+        return g;
+      for (AffineExpr r : m.getResults()) {
+        groups.back().emplace_back();
+        for (unsigned k : digits[cast<AffineDimExpr>(r).getPosition()]) {
+          groups.back().back().push_back(shapes.back().size());
+          exprs.push_back(getAffineDimExpr(k, ctx));
+          shapes.back().push_back(newRanges[k]);
+        }
       }
     }
     maps.push_back(AffineMap::get(nd, 0, exprs, ctx));
-    auto t = cast<RankedTensorType>(out.get().getType()).clone(shape);
-    inits.push_back(out.get().getDefiningOp<tensor::EmptyOp>()
-                        ? tensor::EmptyOp::create(b, loc, shape, t.getElementType()).getResult()
-                        : tensor::ExpandShapeOp::create(b, loc, t, out.get(), groups.back()).getResult());
   }
-  auto fresh = linalg::GenericOp::create(b, loc, TypeRange(ValueRange(inits)), g.getDpsInputs(), inits, maps, iters);
+  if (!inversePermutation(concatAffineMaps(maps, ctx)))
+    return g; // a digit no operand spans
+  OpBuilder b(g);
+  Location loc = g.getLoc();
+  SmallVector<Value> operands;
+  for (auto [o, shape, group] : llvm::zip(g->getOpOperands(), shapes, groups)) {
+    auto t = cast<RankedTensorType>(o.get().getType());
+    operands.push_back(group.empty() ? o.get()
+                       : o.get().getDefiningOp<tensor::EmptyOp>()
+                           ? tensor::EmptyOp::create(b, loc, shape, t.getElementType()).getResult()
+                           : tensor::ExpandShapeOp::create(b, loc, t.clone(shape), o.get(), group).getResult());
+  }
+  unsigned ni = g.getNumDpsInputs();
+  ValueRange inits = ValueRange(operands).drop_front(ni);
+  groups.erase(groups.begin(), groups.begin() + ni);
+  auto fresh = linalg::GenericOp::create(b, loc, TypeRange(inits), ValueRange(operands).take_front(ni), inits, maps,
+                                         iters);
   fresh->setDiscardableAttrs(g->getDiscardableAttrDictionary());
   fresh.getRegion().takeBody(g.getRegion());
   for (auto index : llvm::to_vector(fresh.getRegion().front().getOps<linalg::IndexOp>())) {
