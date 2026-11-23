@@ -129,6 +129,12 @@ npu stage) against GPU goldens.
   an LLVM assertion (`cast<AffineDimExpr>`) in RMSNorm with residual run as one program at hidden >= 2048 (and
   Llama's argmax), Llama's GQA prefill attention ("an address varies between program instances"), and silent
   segfaults after tiling in GEMMs with N >= 12288 (SwiGLU, Llama's 128256-token head). Fixes are in progress.
+- Golden data keeps checkpoint weights by reference (55b474a): a golden of a case with `weights=` stores only its
+  inputs and states; every consumer (the harness's levels, `furiosa_compiler.l1`/`l1_launch`, the crate's run_graph)
+  reads full inputs restored from the pinned checkpoint into a cache, bit-identical to the old files. Old goldens
+  still work. An 8B model's golden no longer stores its 16 GB of weights once per graph.
+- Tolerances: where L1's raised graph on the CPU JIT drifts from the GPU golden more than the reference
+  implementation does, that drift sets graph and npu (0342c84; qwen3_1_7b 2.69%, as qwen3_0_6b's 2.7%).
 - Codegen for scatter-add and segment sum (each with a lit test):
   - A float reduction step a data condition guards adds `select(c, x, -0.0)` (1771109), extending the integer form.
   - An index compared with data, or masked into such a comparison, is a hoisted table (e841e2c); `rem(a, 2^k) == 0`
