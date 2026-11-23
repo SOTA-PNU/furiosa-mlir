@@ -396,7 +396,34 @@ void splitLongReductions(ModuleOp module) {
         row = n / parts;
     if (!row)
       continue;
+    // splitReduction reads every map result as a dim: an input read at 0 in a unit dim (a row of a [1, n] slice)
+    // is reshaped to drop it first; any other read keeps the reduction whole.
+    SmallVector<AffineMap> maps = g.getIndexingMapsArray();
+    auto unitZero = [&](OpOperand *in, int64_t d) {
+      auto c = dyn_cast<AffineConstantExpr>(maps[in->getOperandNumber()].getResult(d));
+      return c && c.getValue() == 0 && cast<RankedTensorType>(in->get().getType()).getDimSize(d) == 1;
+    };
+    if (!llvm::all_of(g.getDpsInputOperands(), [&](OpOperand *in) {
+          return llvm::all_of(llvm::seq<int64_t>(0, maps[in->getOperandNumber()].getNumResults()), [&](int64_t d) {
+            return isa<AffineDimExpr>(maps[in->getOperandNumber()].getResult(d)) || unitZero(in, d);
+          });
+        }))
+      continue;
     rewriter.setInsertionPoint(g);
+    for (OpOperand *in : g.getDpsInputOperands()) {
+      AffineMap &m = maps[in->getOperandNumber()];
+      auto t = cast<RankedTensorType>(in->get().getType());
+      SmallVector<AffineExpr> kept;
+      SmallVector<int64_t> shape;
+      for (int64_t d = 0; d < m.getNumResults(); ++d)
+        if (!unitZero(in, d)) {
+          kept.push_back(m.getResult(d));
+          shape.push_back(t.getDimSize(d));
+        }
+      in->set(furiosa::reshapeTo(rewriter, g.getLoc(), in->get(), RankedTensorType::get(shape, t.getElementType())));
+      m = AffineMap::get(m.getNumDims(), 0, kept, g.getContext());
+    }
+    g.setIndexingMapsAttr(rewriter.getAffineMapArrayAttr(maps));
     (void)linalg::splitReduction(rewriter, cast<linalg::LinalgOp>(g.getOperation()), [&](linalg::LinalgOp) {
       return linalg::SplitReductionOptions{n / row, 0, false};
     });
