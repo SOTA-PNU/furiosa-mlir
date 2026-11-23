@@ -415,6 +415,12 @@ RaisedKernel mapping::raisedKernel(func::FuncOp func) { return {func, argNames(f
 /// A launch passes the device and the kernel's parameters as one tuple, which furiosa-opt takes up to 24 long.
 static constexpr unsigned kMaxParams = 23;
 
+/// furiosa-opt's memory grows with the elements the reads of a Vector Engine reduction are staged to when they are
+/// replicated (along output axes the reduction's result is broadcast over): the corpus's steps stage up to 40M and
+/// build (26.6M took over 16 GB); a 155M step of attention at 197 tokens took over 50 GB. A mapping that replicates
+/// more does not map the kernel (a step candidate splits instead).
+static constexpr int64_t kMaxBroadcast = 64 << 20;
+
 bool mapping::mapsOnCopy(func::FuncOp func, const OpClass &c, unsigned maxDmas) {
   OpBuilder b(func.getContext());
   OwningOpRef<ModuleOp> scratch = ModuleOp::create(b, func.getLoc());
@@ -432,13 +438,20 @@ bool mapping::mapsOnCopy(func::FuncOp func, const OpClass &c, unsigned maxDmas) 
   // A class whose mapping does not verify does not map the kernel (codegen would fail on it).
   auto kernel = scratch->lookupSymbol<func::FuncOp>(func.getName());
   unsigned dmas = 0;
+  int64_t broadcast = 0;
   if (kernel)
     kernel.walk([&](Operation *op) {
       dmas += isa<fopt::StageOp, fopt::ReadOp, fopt::ToDmOp, fopt::ViewToDmOp, fopt::ToHbmOp, fopt::DmToHbmViewOp,
                   fopt::HbmToHbmViewOp, fopt::GatherOp>(op);
+      // A read inside a Vector Engine reduction ("rf") staged larger than its buffer: replicated.
+      if (auto stage = dyn_cast<fopt::StageOp>(op); stage && stage.getSpec().get("rf")) {
+        int64_t staged = stage.getType().getElement().size();
+        if (staged > stage.getSource().getType().getElement().size())
+          broadcast += staged;
+      }
     });
   return kernel && !kernel->hasAttr(kUnsplitAttr) && kernel.getNumArguments() <= kMaxParams && dmas <= maxDmas &&
-         succeeded(verify(kernel));
+         broadcast <= kMaxBroadcast && succeeded(verify(kernel));
 }
 
 LogicalResult mapping::mapKernel(func::FuncOp func) {
