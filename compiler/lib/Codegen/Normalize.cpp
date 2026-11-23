@@ -2384,6 +2384,21 @@ void expandMath(ModuleOp module) {
     op.getResult().replaceAllUsesWith(arith::SubIOp::create(b, loc, a, q).getResult());
     op.erase();
   });
+  // A remainder by a power of two m only compared with 0 (another width's, as a loop's step divisibility on index
+  // values) is its low bits: rem(a, m) == 0 iff a & (m - 1) == 0, in any width.
+  module.walk([&](arith::CmpIOp cmp) {
+    auto rem = cmp.getLhs().getDefiningOp<arith::RemSIOp>();
+    APInt m;
+    if (!rem || !matchPattern(cmp.getRhs(), m_Zero()) || !matchPattern(rem.getRhs(), m_ConstantInt(&m)) ||
+        !m.isStrictlyPositive() || !m.isPowerOf2() ||
+        (cmp.getPredicate() != arith::CmpIPredicate::eq && cmp.getPredicate() != arith::CmpIPredicate::ne))
+      return;
+    OpBuilder b(cmp);
+    Value low = arith::ConstantOp::create(b, cmp.getLoc(), b.getIntegerAttr(rem.getType(), m.getZExtValue() - 1));
+    cmp.getLhsMutable().assign(arith::AndIOp::create(b, cmp.getLoc(), rem.getLhs(), low));
+    if (rem.use_empty())
+      rem.erase();
+  });
   module.walk([&](arith::MulUIExtendedOp op) {
     if (!op.getType(0).isInteger(32))
       return;
