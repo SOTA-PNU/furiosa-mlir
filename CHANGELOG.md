@@ -26,6 +26,13 @@ npu stage) against GPU goldens.
 - Normalize: a loop split into the digits a `//` and `%` read takes apart, which only the reduction's carrier spans,
   reshapes the carrier like an output; a split that would leave a digit unspanned is not made (66d40f0; it asserted
   in `getStaticLoopRanges`). ViT's patch embedding maps as one contraction; all of vit_b16 passes L2a.
+- A read whose address comes from the loop indices alone but not affinely (a float floor, a flat index over tiles
+  its divisor does not align with) gathers from a hoisted address table instead of staying in gather form; past 256
+  rows the addresses are inserted into zeros (f3ed504). `heldout3_upsample_bilinear` passes L1 to L4 (rel 0).
+- Tiled class: a contraction whose result an enclosing reduction's body reads is refused (e3d9bd3; furiosa-opt had
+  rejected the kernel at the NPU build after the mapping was accepted), and a 0/1 mask table is no contraction
+  operand (2a32c04): a masked f32 sum went through the bf16 contraction path and was off by 1e-3. Steps marks the
+  tables it externalizes. `heldout3_batch_norm` passes L1 to L4 (rel 4.4e-7).
 ## 1.4.0 (2026-11-18, release/1.4.0)
 
 Milestone: kernels the compiler was not written for. The second held-out batch (ten standard ML ops written from their
