@@ -135,9 +135,16 @@ LogicalResult Plan::tryGemm(unsigned node) {
     }
   }
   if (groups.size() == 1 && groups[0].size() >= 1 && !free.empty()) {
-    // One operand with output axes and per-K factors: the largest per-K factor is the other operand.
-    groups.push_back({free.pop_back_val()});
+    // One operand with output axes and per-K factors: the largest per-K factor is the other operand. Not a table
+    // (Steps' index-only values: a mask that selectsToArithmetic made a factor): data scaled by a table is no
+    // contraction, which would round the data to bf16; the Vector Engine reduces it in f32, as Triton does.
+    auto data = llvm::find_if(llvm::reverse(free),
+                              [&](unsigned f) { return !func.getArgAttr(p.reads[factors[f]].arg, "furiosa.table"); });
+    if (data == free.rend())
+      return success();
+    groups.push_back({*data});
     groupAxes.push_back({});
+    free.erase(std::next(data).base());
   }
   if (groups.size() != 2)
     return groups.size() == 1 ? fail("a contraction with a batch axis (both operands index it)") : success();

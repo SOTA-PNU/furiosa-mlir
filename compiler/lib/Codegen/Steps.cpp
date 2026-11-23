@@ -139,7 +139,11 @@ SmallVector<DenseElementsAttr> externalize(func::FuncOp func) {
   for (arith::ConstantOp c : tensorConstants(func)) {
     auto attr = cast<DenseElementsAttr>(c.getValue());
     std::string name = "c" + std::to_string(data.size());
-    if (failed(func.insertArgument(func.getNumArguments(), c.getType(), {},
+    // Marked as a table: op classes may tell index-only data (a mask) from the kernel's.
+    auto table = DictionaryAttr::get(func.getContext(),
+                                     NamedAttribute(StringAttr::get(func.getContext(), "furiosa.table"),
+                                                    UnitAttr::get(func.getContext())));
+    if (failed(func.insertArgument(func.getNumArguments(), c.getType(), table,
                                    NameLoc::get(StringAttr::get(func.getContext(), name)))))
       break;
     c.replaceAllUsesWith(func.getArgument(func.getNumArguments() - 1));

@@ -1,10 +1,14 @@
 // RUN: furiosa-mlir-opt --furiosa-split-steps %s | FileCheck %s
+// RUN: furiosa-mlir-opt --furiosa-split-steps %s | furiosa-mlir-opt --furiosa-steps-plan | FileCheck %s --check-prefix=PLAN
 
 // Nearest upsampling reads x[i, floor(j * 0.5)]: an address of the loop indices alone that no indexing map takes
 // (a float floor). It gathers like a data-dependent one, from the table of its addresses (0, 0, 1, 1, 2, ...): the
 // 8-byte row a >> 1 of x seen as [75, 2], a copy per lane, a select by the lane a & 1. The gather DMA takes whole
 // 256s of rows past 256: the 300 addresses are inserted into 512 zeros, a copy step (the row-wise class pads no
 // row tiles).
+
+// The plan's step modules take the tables as trailing arguments marked furiosa.table.
+// PLAN: func.func @nearest__s0(%arg0: tensor<6x50xi32> {{.*}}, %arg1: tensor<6x50xi32> {furiosa.table}
 
 // CHECK-LABEL: func.func private @nearest__s0
 // CHECK: arith.constant dense<"0x0000000000000000010000000100000002000000
