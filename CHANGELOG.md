@@ -4,7 +4,15 @@ main carries the next version as `X.Y.Z.dev0`. A release is a `release/X.Y.Z` br
 with the commit "Release X.Y.Z" and the tag `vX.Y.Z`. "On npu3" means harness level L4 (or the operator matrix's
 npu stage) against GPU goldens.
 
-## 1.5.0 (unreleased, main)
+## 1.6.0 (unreleased, main)
+
+- Raise, Swin-T's window attention (unshifted windows), three fallbacks taken only where the old path failed (each
+  with a lit test): a masked store's digits resolve over the lanes its mask keeps (3eec6a9); a value is rewritten
+  within each instance's tile when the whole coordinate ranges keep it apart (4881ada); a masked load's address is
+  rewritten over the lanes its mask keeps (d678368). Swin-T's SHIFT=0 window attention matches a NumPy reference at
+  all four L1 stages (1.4e-6); the shifted windows (a store that wraps around the image) still fail the raise.
+
+## 1.5.0 (release/1.5.0, at 8aa63d7)
 
 - A third held-out batch (`heldout3_*`, e1ca4c1: sliding-window attention, scatter-add, batch-norm statistics, avg pool
   with padding, bilinear upsampling, MoE top-2 gating, segment sum, an fp8 scaled matmul, residual add with layer
