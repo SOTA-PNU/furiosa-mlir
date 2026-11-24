@@ -11,6 +11,12 @@ npu stage) against GPU goldens.
   within each instance's tile when the whole coordinate ranges keep it apart (4881ada); a masked load's address is
   rewritten over the lanes its mask keeps (d678368). Swin-T's SHIFT=0 window attention matches a NumPy reference at
   all four L1 stages (1.4e-6); the shifted windows (a store that wraps around the image) still fail the raise.
+- Tile: the plan keeps a kernel's unrolled K-tile reads within furiosa-opt's dynamic addresses (6352b6c): a K tile
+  is admitted only if K tiles x operands <= 64, half of furiosa-opt's 128, chosen from the build-time curve (64
+  tiles 69 s, 65 tiles 745-1395 s); above it the plan falls back to whole-K column tiles. Llama's and Qwen2.5's
+  128256/152064-wide heads build in 31-33 s at 4.8 GB (they failed after 163 s / 1484 s) and match on npu3 within
+  a bf16 ulp. The corpus and all 907 matrix cases are unchanged.
+- Tolerances of `qwen3_4b` by the CPU-vs-GPU drift (49c9c8d): graph 2.6e-2, npu 5.2e-2.
 
 ## 1.5.0 (release/1.5.0, at 8aa63d7)
 
