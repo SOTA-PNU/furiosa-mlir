@@ -123,7 +123,8 @@ CASES = {
                        graph=Tol(rtol=3e-2, atol=0), npu=Tol(rtol=5.4e-2, atol=0), seed=2),
     # transformers 2.47% kv_cache.14.v; L1 CPU JIT vs GPU 2.69% kv_cache.27.v (every launch within one ulp)
     "qwen3_4b": Case("models/qwen3_4b.py", weights="huggingface", int_ranges={"input_ids": (0, 151936)},
-                     graph=Tol(rtol=1.8e-2, atol=0), npu=Tol(rtol=3.6e-2, atol=0), seed=2),  # 1.79% kv_cache.13.v
+                     graph=Tol(rtol=2.6e-2, atol=0), npu=Tol(rtol=5.2e-2, atol=0), seed=2),
+    # transformers 1.79% kv_cache.13.v; L1 CPU JIT vs GPU 2.6% kv_cache.35.v (graph 0; every launch within one ulp)
     "qwen3_8b": Case("models/qwen3_8b.py", weights="huggingface", int_ranges={"input_ids": (0, 151936)},
                      graph=Tol(rtol=2.3e-2, atol=0), npu=Tol(rtol=4.5e-2, atol=0)),  # 2.20% kv_cache.35.v
     # Other 8B-class architectures, written from the math and transformers' definitions, by the same rule against
