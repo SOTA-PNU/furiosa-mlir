@@ -9,6 +9,8 @@ from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 CACHE = Path(os.environ.get("FURIOSA_NPU_CACHE", Path.home() / ".cache" / "furiosa-npu"))
+# Device locks stay host-wide whatever FURIOSA_NPU_CACHE says: a private build cache must not mean a private lock.
+LOCKS = Path.home() / ".cache" / "furiosa-npu"
 # Concurrent cargo builds. Each runs the furiosa-opt driver, which spreads one kernel's work over all
 # cores but is serial between its phases; 16 cores per build keep the machine busy.
 SLOTS = int(os.environ.get("FURIOSA_BUILD_SLOTS", max(1, (os.cpu_count() or 16) // 16)))
@@ -72,9 +74,9 @@ def wait_idle(chips, minutes: int = 30) -> bool:
 @contextmanager
 def npu_lock(chips=(3,)):
     """The NPUs in `chips` to this process alone until exit, locked in order (npu3's lock is npu.lock)."""
-    CACHE.mkdir(parents=True, exist_ok=True)
+    LOCKS.mkdir(parents=True, exist_ok=True)
     with ExitStack() as stack:
         for c in sorted(chips):
-            lock = stack.enter_context(open(CACHE / ("npu.lock" if c == 3 else f"npu{c}.lock"), "w"))
+            lock = stack.enter_context(open(LOCKS / ("npu.lock" if c == 3 else f"npu{c}.lock"), "w"))
             fcntl.flock(lock, fcntl.LOCK_EX)
         yield
