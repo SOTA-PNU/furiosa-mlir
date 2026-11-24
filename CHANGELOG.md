@@ -17,6 +17,8 @@ npu stage) against GPU goldens.
   128256/152064-wide heads build in 31-33 s at 4.8 GB (they failed after 163 s / 1484 s) and match on npu3 within
   a bf16 ulp. The corpus and all 907 matrix cases are unchanged.
 - Tolerances of `qwen3_4b` by the CPU-vs-GPU drift (49c9c8d): graph 2.6e-2, npu 5.2e-2.
+- `qwen3_1_7b` passes L0 to L4 on npu3, the first of the larger LLMs: 568 launches, every one within 0.0069 at L1;
+  L4 3.1% at kv_cache.16.v against 5.4%, the greedy tokens exact.
 - N chips: `furiosa-shard` traces a split through slices that keep the split dim whole and pads of other dims
   (f4b450c), so pool windows split by channel (ResNet-101's maxpool 103.6 -> 52.2 ms at N = 2), as do the depthwise
   convs of MobileNetV3 and EfficientNet and Qwen3's RoPE halves by head; and a buffer read and written in place
