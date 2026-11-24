@@ -187,6 +187,22 @@ std::optional<std::pair<SmallVector<int64_t>, int64_t>> linearize(AffineExpr e, 
   return std::make_pair(coeffs, constant);
 }
 
+/// `ranges` (one per dim) narrowed to where every condition linear in one dim holds (k * dim + c >= 0): the lanes a
+/// mask keeps, as 49 of a window's 64 lanes.
+void narrowToConds(MutableArrayRef<Interval> ranges, ArrayRef<AffineExpr> conds) {
+  for (AffineExpr c : conds) {
+    auto lin = linearize(c, ranges.size());
+    if (!lin || llvm::count_if(lin->first, [](int64_t k) { return k != 0; }) != 1)
+      continue;
+    unsigned i = llvm::find_if(lin->first, [](int64_t k) { return k != 0; }) - lin->first.begin();
+    int64_t k = lin->first[i], c0 = lin->second;
+    if (k < 0)
+      ranges[i].hi = std::max(ranges[i].lo, std::min(ranges[i].hi, floorDiv(c0, -k)));
+    else
+      ranges[i].lo = std::min(ranges[i].hi, std::max(ranges[i].lo, -floorDiv(c0, k)));
+  }
+}
+
 /// `e` split into its constant term and the rest.
 std::pair<AffineExpr, int64_t> splitConstant(AffineExpr e) {
   if (auto c = dyn_cast<AffineConstantExpr>(e))
@@ -1649,7 +1665,7 @@ FailureOr<StoreSpace> Raiser::storeSpace(Write store, ArrayRef<int64_t> extraStr
     auto it = llvm::find(encl, l);
     toSyms.push_back(it != encl.end() ? getAffineDimExpr(it - encl.begin(), ctx) : getAffineConstantExpr(0, ctx));
   }
-  std::vector<AffineExpr> address(act.size()), unresolved(act.size());
+  std::vector<AffineExpr> address(act.size()), unresolved(act.size()), narrowed(act.size());
   SmallVector<Value> dataMask;
   std::vector<SmallVector<AffineExpr>> maskConds(act.size());
   std::vector<bool> maskNever(act.size(), false);
@@ -1668,8 +1684,6 @@ FailureOr<StoreSpace> Raiser::storeSpace(Write store, ArrayRef<int64_t> extraStr
     SmallVector<Interval> ranges;
     for (int64_t e : extentsOf[n])
       ranges.push_back({0, std::max<int64_t>(e - 1, 0)});
-    unresolved[n] = simplify(p->expr.replaceDimsAndSymbols(toDims, toSyms), rank, 0);
-    address[n] = simplify(resolveDigits(unresolved[n], ranges, {}), rank, 0);
     if (store.getMask()) {
       SmallVector<AffineExpr> conds;
       bool never = false;
@@ -1682,6 +1696,12 @@ FailureOr<StoreSpace> Raiser::storeSpace(Write store, ArrayRef<int64_t> extraStr
       if (n == 0)
         dataMask = data;
     }
+    unresolved[n] = simplify(p->expr.replaceDimsAndSymbols(toDims, toSyms), rank, 0);
+    address[n] = simplify(resolveDigits(unresolved[n], ranges, {}), rank, 0);
+    // Over the lanes the mask keeps (a window's 49 tokens of 64 lanes), digits the whole tile leaves (a row
+    // (y0 + t floordiv 7) mod H past the image's last) may resolve: the points past them are never written.
+    narrowToConds(ranges, maskConds[n]);
+    narrowed[n] = simplify(resolveDigits(unresolved[n], ranges, {}), rank, 0);
   }
 
   // Axes the address takes apart with div/mod get a per-instance origin read off the atoms
@@ -1732,8 +1752,11 @@ FailureOr<StoreSpace> Raiser::storeSpace(Write store, ArrayRef<int64_t> extraStr
   // keeps digits there that the other instances' ranges resolve: then every instance keeps them all.
   if (const char *why = explain()) {
     address = unresolved;
-    if (explain())
-      return store.emitError("furiosa: ") << why, failure();
+    if (explain()) {
+      address = narrowed;
+      if (explain())
+        return store.emitError("furiosa: ") << why, failure();
+    }
   }
   SmallVector<Component> terms;
   if (!components(rest[0], 1, terms))
