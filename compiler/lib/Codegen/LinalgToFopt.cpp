@@ -680,12 +680,20 @@ void applySplit(func::FuncOp func, const Split &s, int64_t n) {
 
 /// Splits the outermost parallel dim of a result that reaches the kernel's other values as blocks and still maps
 /// split (an op class maps the block kernel), trying the results in order; a kernel with none runs whole on every
-/// chip. A kernel that reads a buffer it writes (in place) is not split.
+/// chip. A buffer the kernel reads and writes (in place, a residual add) splits only as its result does: each chip
+/// reads and writes its own block.
 void shardKernel(func::FuncOp func, int64_t n, function_ref<LogicalResult(ModuleOp)> maps) {
-  for (int64_t a : writtenArgs(func))
-    if (!func.getArgument(a).use_empty())
-      return;
   Operation *ret = func.getBody().front().getTerminator();
+  auto inPlace = [&](const Split &s) {
+    for (auto [r, a] : llvm::enumerate(writtenArgs(func))) {
+      BlockArgument arg = func.getArgument(a);
+      auto in = s.dims.find(arg), out = s.dims.find(ret->getOperand(r));
+      bool split = in != s.dims.end(), splitOut = out != s.dims.end();
+      if (!arg.use_empty() && (split != splitOut || (split && in->second != out->second)))
+        return false;
+    }
+    return true;
+  };
   // FURIOSA_DEBUG=1 says why a dim does not split.
   auto why = [&](unsigned r, int64_t d, StringRef reason) {
     if (getenv("FURIOSA_DEBUG"))
@@ -697,6 +705,10 @@ void shardKernel(func::FuncOp func, int64_t n, function_ref<LogicalResult(Module
       Split s;
       if (failed(propagate(func, r, d, n, s))) {
         why(i, d, "not a box of one dim of every operand");
+        continue;
+      }
+      if (!inPlace(s)) {
+        why(i, d, "a buffer read and written in place splits apart from its result");
         continue;
       }
       // On a copy in a module like this one, nested in it while it maps: the block kernel must map all the way to

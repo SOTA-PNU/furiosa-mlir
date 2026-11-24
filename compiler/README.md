@@ -135,11 +135,11 @@ round-to-nearest-even out); `steps.mlir` and the stages before it keep `f16`.
 
 For N chips (`FURIOSA_CHIPS`, docs/usage.md) every kernel's chip mapping is the `CHIP` axis, and `furiosa-shard`
 runs first: it splits the outermost parallel dim of a result whose blocks are boxes of one dim of every operand
-(traced through the linalg ops, and the slices and pads that keep the dim whole, in both directions) and whose block
-maps (the whole mapping, tried on a copy), and marks the split arguments and results `furiosa.shard`. The class maps
-the block; its kernel takes and returns the whole buffers (chip mapping `m![N]`, the same on every chip), copies the
-chip's block of each split argument out of them and gathers the result's blocks into every chip's copy
-(`KernelBuilder`; lit: mapping/chips.mlir).
+(traced through the linalg ops, and the slices and pads that keep the dim whole, in both directions; a buffer
+updated in place splits as its result does) and whose block maps (the whole mapping, tried on a copy), and marks the
+split arguments and results `furiosa.shard`. The class maps the block; its kernel takes and returns the whole
+buffers (chip mapping `m![N]`, the same on every chip), copies the chip's block of each split argument out of them
+and gathers the result's blocks into every chip's copy (`KernelBuilder`; lit: mapping/chips.mlir).
 
 A specialization is keyed by kernel, constexpr and float scalar values, grid and the dtype/shape of each pointer
 argument (not the buffer names), so one compiled kernel serves every launch with that shape; `graph.json`

@@ -88,9 +88,10 @@ of every operand (a matmul's rows, an image's output channels, a row-wise op's r
 (`furiosa-shard`, lib/Codegen/LinalgToFopt.cpp): chip c copies block c of the inputs that dim indexes out of its
 own copy, computes block c of the result, and the result's blocks are gathered into every chip's copy (an
 all-gather: a DMA across chips). The other inputs are read whole. A slice that keeps the dim whole (a pool's window
-reads, split by channel) or a pad of other dims is a block of its source's block. A kernel with no such dim (one whose
-blocks would be windows, use the dim's index as data, or do not divide by N), or that reads a buffer it writes, runs
-whole on every chip. `FURIOSA_DEBUG=1` says why a dim does not split.
+reads, split by channel) or a pad of other dims is a block of its source's block, and a buffer the kernel reads and
+writes in place (a residual add) splits as its result does. A kernel with no such dim (one whose blocks would be
+windows, use the dim's index as data, or do not divide by N, or a buffer it updates in place read at another index)
+runs whole on every chip. `FURIOSA_DEBUG=1` says why a dim does not split.
 
 The NPUs are shared: npu0-npu2 run other users' services. A run opens exactly the NPUs it uses, holds a lock per
 NPU (`~/.cache/furiosa-npu/npu.lock` for npu3, `npu<i>.lock` for the others) and, right before it opens them, waits

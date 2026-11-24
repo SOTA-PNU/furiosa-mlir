@@ -6,9 +6,9 @@
 // whose blocks are boxes of one dim of every operand: the matmul's rows, so each chip reads its rows of x and all of
 // w. Mapping gives the kernel the whole buffers, the same on every chip (chip mapping m![2]): it copies its block of x
 // out of them, maps the block as on one chip, and gathers its block of the result into every chip's copy (the
-// all-gather, a DMA across chips). A kernel that reads a buffer it writes (in place) is not split: it runs whole on
-// every chip. A slice that keeps the split dim whole is a block of its source's block: a pool's window reads split by
-// channel.
+// all-gather, a DMA across chips). A buffer the kernel reads and writes (in place) splits as its result does, each
+// chip reading its own block (accumulate); read at another index (transposed), the kernel runs whole on every chip.
+// A slice that keeps the split dim whole is a block of its source's block: a pool's window reads split by channel.
 
 // SHARD-LABEL: func.func @mm
 // SHARD-SAME: (%arg0: tensor<32x64xf32> {furiosa.shard = 0 : i64}, %arg1: tensor<64x64xf32>,
@@ -17,6 +17,9 @@
 // SHARD: linalg.generic
 // SHARD-SAME: ins({{.*}} : tensor<32x64xf32>, tensor<64x64xf32>) outs({{.*}} : tensor<32x64xf32>)
 // SHARD-LABEL: func.func @accumulate
+// SHARD-SAME: (%arg0: tensor<32x64xf32> {furiosa.shard = 0 : i64}, %arg1: tensor<32x64xf32> {furiosa.shard = 0 : i64})
+// SHARD-SAME: -> (tensor<32x64xf32> {furiosa.shard = 0 : i64})
+// SHARD-LABEL: func.func @transposed
 // SHARD-SAME: (%arg0: tensor<64x64xf32>, %arg1: tensor<64x64xf32>) -> tensor<64x64xf32>
 // SHARD-LABEL: func.func @pool
 // SHARD-SAME: (%arg0: tensor<8x32xf32> {furiosa.shard = 1 : i64}, %arg1: tensor<7x32xf32> {furiosa.shard = 1 : i64})
@@ -38,6 +41,10 @@
 // CHECK: fopt.hbm_to_hbm_view %[[FROM]], %[[TO]]
 // CHECK: return %[[OUT]]
 // CHECK-LABEL: func.func @accumulate
+// CHECK-SAME: (%arg0: !fopt.hbm<f32, <"2">, <"CHIP{2}, {{[A-Z0-9_]+}}{2048}">>
+// CHECK-SAME: %arg1: !fopt.hbm<f32, <"2">, <"CHIP{2}, {{[A-Z0-9_]+}}{2048}">>
+// CHECK: return
+// CHECK-LABEL: func.func @transposed
 // CHECK-SAME: (%arg0: !fopt.hbm<f32, <"CHIP{2}">,
 // CHECK-SAME: ["CHIP", 2]
 // CHECK-SAME: fopt.chip = 2
@@ -53,6 +60,7 @@
 #w = affine_map<(d0, d1, d2) -> (d2, d1)>
 #o = affine_map<(d0, d1, d2) -> (d0, d1)>
 #id = affine_map<(d0, d1) -> (d0, d1)>
+#tr = affine_map<(d0, d1) -> (d1, d0)>
 module attributes {furiosa.chips = 2 : i64} {
   func.func @mm(%x: tensor<64x64xf32>, %w: tensor<64x64xf32>, %out: tensor<64x64xf32>) -> tensor<64x64xf32>
       attributes {furiosa.written = [2]} {
@@ -80,6 +88,18 @@ module attributes {furiosa.chips = 2 : i64} {
       attributes {furiosa.written = [1]} {
     %e = tensor.empty() : tensor<64x64xf32>
     %sum = linalg.generic {indexing_maps = [#id, #id, #id], iterator_types = ["parallel", "parallel"]}
+        ins(%x, %out : tensor<64x64xf32>, tensor<64x64xf32>) outs(%e : tensor<64x64xf32>) {
+    ^bb0(%a: f32, %b: f32, %c: f32):
+      %s = arith.addf %a, %b : f32
+      linalg.yield %s : f32
+    } -> tensor<64x64xf32>
+    return %sum : tensor<64x64xf32>
+  }
+
+  func.func @transposed(%x: tensor<64x64xf32>, %out: tensor<64x64xf32>) -> tensor<64x64xf32>
+      attributes {furiosa.written = [1]} {
+    %e = tensor.empty() : tensor<64x64xf32>
+    %sum = linalg.generic {indexing_maps = [#id, #tr, #id], iterator_types = ["parallel", "parallel"]}
         ins(%x, %out : tensor<64x64xf32>, tensor<64x64xf32>) outs(%e : tensor<64x64xf32>) {
     ^bb0(%a: f32, %b: f32, %c: f32):
       %s = arith.addf %a, %b : f32
