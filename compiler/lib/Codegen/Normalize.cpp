@@ -1462,6 +1462,111 @@ linalg::GenericOp initsToInputs(linalg::GenericOp g) {
   return fresh;
 }
 
+/// Two adjacent reduction loops hi, lo that every operand reads only as the one value hi * E + lo (E = lo's extent:
+/// an implicit GEMM's K loop stepped in tiles, k0 + offs_k) merge into one loop of that value when a floordiv or mod
+/// takes the value apart at a place that is no digit boundary of the pair (k // 3 over 3 taps in tiles of 64), so
+/// splitLoopDigits can split the merged loop at it. An extent carrier spanning the pair is reshaped.
+linalg::GenericOp mergeLoopPairs(linalg::GenericOp g) {
+  MLIRContext *ctx = g.getContext();
+  SmallVector<int64_t> ranges = g.getStaticLoopRanges();
+  auto iters = g.getIteratorTypesArray();
+  if (ShapedType::isDynamicShape(ranges))
+    return g;
+  // The pair: a dividend holding hi at E times lo's coefficient, its place K / c(lo) inside lo but no divisor of E,
+  // or above lo but no multiple of E dividing hi's extent, and a divisor of the merged extent.
+  std::optional<unsigned> hi;
+  for (OpOperand *in : g.getDpsInputOperands())
+    for (AffineExpr r : g.getMatchingIndexingMap(in).getResults())
+      r.walk([&](AffineExpr x) {
+        auto bin = dyn_cast<AffineBinaryOpExpr>(x);
+        auto k = bin ? dyn_cast<AffineConstantExpr>(bin.getRHS()) : AffineConstantExpr();
+        if (hi || !k || k.getValue() <= 1 ||
+            (x.getKind() != AffineExprKind::FloorDiv && x.getKind() != AffineExprKind::Mod))
+          return;
+        auto lin = linearForm(bin.getLHS());
+        if (failed(lin))
+          return;
+        for (unsigned d = 0; d + 1 < ranges.size(); ++d) {
+          int64_t ch = lin->second[d], cl = lin->second[d + 1], kv = k.getValue(), e = ranges[d + 1];
+          if (iters[d] != utils::IteratorType::reduction || iters[d + 1] != utils::IteratorType::reduction ||
+              cl <= 0 || ch != cl * e || kv % cl)
+            continue;
+          int64_t place = kv / cl;
+          bool boundary = place < e ? e % place == 0 : place % e == 0 && ranges[d] % (place / e) == 0;
+          if (!boundary && (ranges[d] * e) % place == 0)
+            hi = d;
+        }
+      });
+  if (!hi)
+    return g;
+  unsigned lo = *hi + 1, nd = ranges.size() - 1;
+  int64_t e = ranges[lo];
+  AffineExpr k = getAffineDimExpr(*hi, ctx);
+  SmallVector<AffineExpr> value; // each old loop over the new ones
+  for (unsigned d = 0; d < ranges.size(); ++d)
+    value.push_back(d == *hi ? k.floorDiv(e) : d == lo ? k % e : getAffineDimExpr(d < lo ? d : d - 1, ctx));
+  OpBuilder b(g);
+  Location loc = g.getLoc();
+  SmallVector<AffineMap> maps;
+  SmallVector<Value> operands;
+  for (OpOperand &o : g->getOpOperands()) {
+    AffineMap m = g.getMatchingIndexingMap(&o);
+    SmallVector<AffineExpr> exprs;
+    Value v = o.get();
+    bool spans = m.isFunctionOfDim(*hi) || m.isFunctionOfDim(lo);
+    auto empty = v.getDefiningOp<tensor::EmptyOp>();
+    if (spans && empty && m.isProjectedPermutation()) {
+      // A carrier: the pair as adjacent dims.
+      SmallVector<int64_t> shape;
+      for (auto [j, r] : llvm::enumerate(m.getResults())) {
+        unsigned d = cast<AffineDimExpr>(r).getPosition();
+        if (d == lo)
+          continue;
+        if (d == *hi && (j + 1 == m.getNumResults() || m.getResult(j + 1) != getAffineDimExpr(lo, ctx)))
+          return g;
+        exprs.push_back(d == *hi ? k : value[d]);
+        shape.push_back(d == *hi ? ranges[*hi] * e : empty.getType().getDimSize(j));
+      }
+      if (!m.isFunctionOfDim(*hi))
+        return g;
+      v = tensor::EmptyOp::create(b, loc, shape, empty.getType().getElementType());
+    } else {
+      if (spans && g.isDpsInit(&o))
+        return g;
+      for (AffineExpr r : m.getResults()) {
+        AffineExpr s = simplifyAffineExpr(r.replaceDimsAndSymbols(value, {}), nd, 0);
+        bool apart = false; // the merged loop taken apart at E: the read does not take the pair together
+        s.walk([&](AffineExpr x) { apart |= x == k.floorDiv(e) || x == k % e; });
+        if (apart)
+          return g;
+        exprs.push_back(s);
+      }
+    }
+    maps.push_back(AffineMap::get(nd, 0, exprs, ctx));
+    operands.push_back(v);
+  }
+  iters.erase(iters.begin() + lo);
+  unsigned ni = g.getNumDpsInputs();
+  auto fresh = linalg::GenericOp::create(b, loc, g.getResultTypes(), ValueRange(operands).take_front(ni),
+                                         ValueRange(operands).drop_front(ni), maps, iters);
+  fresh->setDiscardableAttrs(g->getDiscardableAttrDictionary());
+  fresh.getRegion().takeBody(g.getRegion());
+  for (auto index : llvm::to_vector(fresh.getRegion().front().getOps<linalg::IndexOp>())) {
+    OpBuilder ib(index);
+    unsigned d = index.getDim();
+    Value v = linalg::IndexOp::create(ib, loc, d < lo ? d : d - 1);
+    if (d == *hi || d == lo) {
+      Value c = arith::ConstantIndexOp::create(ib, loc, e);
+      v = d == *hi ? arith::DivUIOp::create(ib, loc, v, c).getResult() : arith::RemUIOp::create(ib, loc, v, c).getResult();
+    }
+    index.replaceAllUsesWith(v);
+    index.erase();
+  }
+  g.replaceAllUsesWith(fresh.getResults());
+  g.erase();
+  return fresh;
+}
+
 /// A loop that reads take apart with floordiv or mod (a row index read as the bits of tl.sort's [2, ..., 2]
 /// stages) splits into those digits when every read is linear afterwards (delinearizeRead then projects it): the
 /// places are k / c for each floordiv or mod by k of a dividend holding the loop at coefficient c, nesting and
@@ -2743,7 +2848,7 @@ void mlir::furiosa::normalizeKernels(ModuleOp module, function_ref<bool(linalg::
   SmallVector<linalg::GenericOp> generics;
   module.walk([&](linalg::GenericOp g) { generics.push_back(g); });
   for (linalg::GenericOp &g : generics) {
-    g = splitLoopDigits(initsToInputs(dropUnitReductions(promoteExtracts(g))), mapsAlone);
+    g = splitLoopDigits(mergeLoopPairs(initsToInputs(dropUnitReductions(promoteExtracts(g)))), mapsAlone);
     for (unsigned i = 0; i < g.getNumDpsInputs(); ++i) {
       delinearizeRead(g, i);
       maskToPad(g, i);
