@@ -18,6 +18,11 @@
 namespace mlir::furiosa::tile {
 
 constexpr int64_t kSlices = 256, kLanes = 8, kTrfLaneBytes = 8 * 1024, kDmBudget = 384 * 1024;
+/// Unrolled K-tile reads (K tiles x contraction operands) a plan may make. Each reads its operand's tile at an address
+/// of its own, and furiosa-opt gives a kernel 128 dynamic addresses (its driver's TIDX_DYNAMIC_SIZE; more fail the
+/// build: "CTensorAddr::Var() count must be <= TENSOR_DYNAMIC_INDICIES_MAX"). Half of them, as the build time climbs
+/// steeply near the limit (two operands on npu3: 32 and 48 K tiles 51-53 s, 64 69 s, 65 745 s).
+constexpr int64_t kKTileReads = 64;
 
 inline int64_t roundUp(int64_t x, int64_t m) { return (x + m - 1) / m * m; }
 

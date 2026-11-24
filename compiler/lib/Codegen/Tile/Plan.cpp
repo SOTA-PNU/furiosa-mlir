@@ -282,7 +282,8 @@ LogicalResult Plan::planLayout() {
     llvm::append_range(operands, gemm->trfExtras);
     bool tapMajorK = llvm::any_of(operands, [&](unsigned r) { return tapMajorRead(p.reads[r]); });
     auto kTileFits = [&](int64_t t) {
-      return kf % t == 0 && (!tapMajorK || t % kl.innerPad == 0 || kl.innerPad % t == 0);
+      return kf % t == 0 && kf / t * int64_t(operands.size()) <= kKTileReads &&
+             (!tapMajorK || t % kl.innerPad == 0 || kl.innerPad % t == 0);
     };
     colLocalSize = 0;
     int64_t bestCost = INT64_MAX;
@@ -328,7 +329,8 @@ LogicalResult Plan::planLayout() {
         }
     }
     if (!kTile)
-      return fail("no K tile fits the TRF for " + std::to_string(c) + " columns");
+      return fail("no K tile fits the TRF for " + std::to_string(c) + " columns in " +
+                  std::to_string(kKTileReads) + " K-tile reads");
   } else if (c % kLanes == 0) {
     // Vector Engine work: whole columns when few, else blocks over the slices (all of them when there are no rows).
     colLocalSize = c;
