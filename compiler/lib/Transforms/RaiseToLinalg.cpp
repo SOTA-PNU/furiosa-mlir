@@ -1341,6 +1341,8 @@ private:
   std::set<unsigned> originUses;
   // (view dim, divisor) pairs an expression of this store took apart with floordiv/mod.
   std::set<std::pair<unsigned, int64_t>> digitUses;
+  // Generic dim ranges a masked load's address is rewritten over (the lanes its mask keeps); empty: the whole dims.
+  SmallVector<Interval> maskedDims;
 
   LogicalResult parseLaunch();
   LogicalResult evaluate();
@@ -2169,6 +2171,8 @@ AffineExpr Raiser::tidy(const Gen &g, AffineExpr e, int instance) {
   SmallVector<Interval> dims, syms;
   for (unsigned d = 0; d < nd; ++d)
     dims.push_back({g.lo[d], g.lo[d] + g.extent[d] - 1});
+  for (unsigned d = 0; d < std::min<size_t>(nd, maskedDims.size()); ++d)
+    dims[d] = {std::max(dims[d].lo, maskedDims[d].lo), std::min(dims[d].hi, maskedDims[d].hi)};
   // Within one instance's tile: each view coordinate lies in that tile's extent from the instance's first one.
   if (instance >= 0)
     for (auto [j, pos] : llvm::enumerate(g.coordPos))
@@ -2807,14 +2811,40 @@ FailureOr<Value> Raiser::emitLoad(Gen &g, Read load, ArrayRef<Axis> env) {
     if (!p || p->base != arg || p->data != p0->data)
       return load.emitError("furiosa: load base differs between program instances"), failure();
   }
-  auto addr = rewrite(load, g, env, [](const Sym &s) { return s.expr; }, load.getPtr());
-  if (failed(addr))
-    return failure();
   SmallVector<Interval> ranges, symRanges;
   for (unsigned d = 0; d < g.extent.size(); ++d)
     ranges.push_back({g.lo[d], g.lo[d] + g.extent[d] - 1});
   for (int64_t trip : loopTrip)
     symRanges.push_back({0, std::max<int64_t>(trip - 1, 0)});
+  auto address = [&] { return rewrite(load, g, env, [](const Sym &s) { return s.expr; }, load.getPtr()); };
+  FailureOr<AffineExpr> addr = failure();
+  {
+    ScopedDiagnosticHandler quiet(ctx, [](Diagnostic &) { return success(); });
+    auto origins = originUses;
+    auto digits = digitUses;
+    addr = address();
+    // An address that is one expression only over the lanes the mask keeps (a window's 49 key tokens of 64 lanes,
+    // whose rows past them leave the image): rewritten there; the other lanes read `other`, clamped below.
+    const Sym *m0 = load.getMask() ? act[0]->get(load.getMask()) : nullptr;
+    if (failed(addr) && m0 && m0->kind == Sym::Mask) {
+      originUses = origins;
+      digitUses = digits;
+      SmallVector<AffineExpr> conds;
+      for (unsigned c = 0; c < m0->conds.size(); ++c)
+        if (auto e = rewrite(load, g, env, [c](const Sym &s) { return s.conds[c]; }, load.getMask()); succeeded(e))
+          conds.push_back(*e);
+      maskedDims = ranges;
+      narrowToConds(maskedDims, conds);
+      addr = address();
+      maskedDims.clear();
+    }
+    if (failed(addr)) {
+      originUses = origins;
+      digitUses = digits;
+    }
+  }
+  if (failed(addr) && failed(addr = address())) // for its diagnostic
+    return failure();
 
   Value on;
   if (load.getMask()) {
