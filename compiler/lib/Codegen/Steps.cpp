@@ -22,6 +22,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
+#include "mlir/Transforms/RegionUtils.h"
 
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/StringMap.h"
@@ -180,16 +181,25 @@ bool mapsWhole(func::FuncOp func) {
   return false;
 }
 
-/// Whether some op class maps `g` as a step of its own: its inputs as buffers, a fill init kept, index-only
-/// values as tables (as hoistIndexOnly leaves the steps).
+/// Whether some op class maps `g` as a step of its own: its inputs as buffers, a fill or empty init kept (as the steps
+/// clone them), index-only values as tables (as hoistIndexOnly leaves the steps), and the tensors its body reads
+/// from outside (a gather's table) as buffers too.
 bool mapsAlone(linalg::GenericOp g) {
   OpBuilder b(g.getContext());
   Location loc = g.getLoc();
   SmallVector<Value> ins(g.getDpsInputs());
+  SetVector<Value> above;
+  getUsedValuesDefinedAbove(g.getRegion(), above);
+  SmallVector<Value> read;
+  for (Value v : above)
+    if (isa<RankedTensorType>(v.getType()) && !v.getDefiningOp<arith::ConstantOp>())
+      read.push_back(v);
   SmallVector<Type> types;
   for (Value v : ins)
     types.push_back(v.getType());
   types.push_back(g.getResultTypes()[0]);
+  for (Value v : read)
+    types.push_back(v.getType());
   auto func = func::FuncOp::create(b, loc, "alone", b.getFunctionType(types, g.getResultTypes()));
   func->setAttr("furiosa.written", b.getI64ArrayAttr({int64_t(ins.size())}));
   Block *body = func.addEntryBlock();
@@ -197,11 +207,15 @@ bool mapsAlone(linalg::GenericOp g) {
   IRMapping map;
   for (auto [v, arg] : llvm::zip(ins, body->getArguments()))
     map.map(v, arg);
+  for (auto [v, arg] : llvm::zip(read, body->getArguments().take_back(read.size())))
+    map.map(v, arg);
   Value init = g.getDpsInits()[0];
   if (auto fill = init.getDefiningOp<linalg::FillOp>(); fill && fill.getInputs()[0].getDefiningOp<arith::ConstantOp>()) {
     b.clone(*fill.getInputs()[0].getDefiningOp(), map);
     b.clone(*fill.getOutputs()[0].getDefiningOp(), map);
     b.clone(*fill, map);
+  } else if (init.getDefiningOp<tensor::EmptyOp>()) {
+    b.clone(*init.getDefiningOp(), map);
   } else {
     map.map(init, body->getArgument(ins.size()));
   }
