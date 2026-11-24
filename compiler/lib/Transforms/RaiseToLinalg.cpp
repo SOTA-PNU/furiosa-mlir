@@ -1349,7 +1349,8 @@ private:
   LogicalResult raiseStore(Write store);
 
   AffineExpr originExpr(const Gen &g, unsigned viewDim);
-  AffineExpr tidy(const Gen &g, AffineExpr e);
+  AffineExpr tidy(const Gen &g, AffineExpr e, int instance = -1);
+  FailureOr<AffineExpr> rewriteInTiles(const Gen &g, ArrayRef<AffineExpr> raw);
   FailureOr<AffineExpr> rewrite(Operation *at, const Gen &g, ArrayRef<Axis> env,
                                 std::function<AffineExpr(const Sym &)> select, Value v);
   FailureOr<AffineExpr> fitOrigins(Operation *at, const Gen &g, ArrayRef<int64_t> consts);
@@ -2163,16 +2164,23 @@ AffineExpr Raiser::originExpr(const Gen &g, unsigned k) {
 }
 
 /// `e` simplified with the ranges of the generic's dims and of the loop counters.
-AffineExpr Raiser::tidy(const Gen &g, AffineExpr e) {
+AffineExpr Raiser::tidy(const Gen &g, AffineExpr e, int instance) {
   unsigned nd = g.extent.size(), nl = loopTrip.size();
   SmallVector<Interval> dims, syms;
   for (unsigned d = 0; d < nd; ++d)
     dims.push_back({g.lo[d], g.lo[d] + g.extent[d] - 1});
+  // Within one instance's tile: each view coordinate lies in that tile's extent from the instance's first one.
+  if (instance >= 0)
+    for (auto [j, pos] : llvm::enumerate(g.coordPos))
+      if (pos >= 0 && space->viewPhase[j] >= 0) {
+        int64_t lo = space->viewLo[instance][j];
+        dims[pos] = {std::max(dims[pos].lo, lo), std::min(dims[pos].hi, lo + space->viewExtent[j] - 1)};
+      }
   for (int64_t t : loopTrip)
     syms.push_back({0, std::max<int64_t>(t, 1) - 1});
   AffineExpr r = simplify(resolveDigits(simplify(e, nd, nl), dims, syms), nd, nl);
   // A store-view dim this generic iterates that the expression divides into digits.
-  if (space)
+  if (space && instance < 0)
     r.walk([&](AffineExpr x) {
       if (x.getKind() != AffineExprKind::FloorDiv && x.getKind() != AffineExprKind::Mod)
         return;
@@ -2197,7 +2205,7 @@ FailureOr<AffineExpr> Raiser::rewrite(Operation *at, const Gen &g, ArrayRef<Axis
   SmallVector<AffineExpr> viewToGen;
   for (int pos : g.coordPos)
     viewToGen.push_back(pos >= 0 ? getAffineDimExpr(pos, ctx) : getAffineConstantExpr(0, ctx));
-  SmallVector<AffineExpr> per;
+  SmallVector<AffineExpr> per, raw;
   static const Sym none; // v null: `select` reads the env alone
   for (auto [n, ev] : llvm::enumerate(act)) {
     const Sym *s = v ? ev->get(v) : &none;
@@ -2246,15 +2254,19 @@ FailureOr<AffineExpr> Raiser::rewrite(Operation *at, const Gen &g, ArrayRef<Axis
     for (unsigned l = 0; l < loopTrip.size(); ++l)
       if (e.isFunctionOfSymbol(l) && !g.loopPos.count(l) && !g.loopIv.count(l) && !llvm::is_contained(space->loops, l))
         return at->emitError("furiosa: a loop counter is used outside its loop"), failure();
-    per.push_back(tidy(g, e.replaceDimsAndSymbols(dims, syms)));
+    raw.push_back(e.replaceDimsAndSymbols(dims, syms));
+    per.push_back(tidy(g, raw.back()));
   }
   auto [rest0, c0] = splitConstant(per[0]);
   SmallVector<int64_t> consts;
   bool same = true;
   for (AffineExpr e : per) {
     auto [rest, c] = splitConstant(e);
-    if (rest != rest0)
+    if (rest != rest0) {
+      if (auto tiled = rewriteInTiles(g, raw); succeeded(tiled))
+        return tiled;
       return at->emitError("furiosa: an address differs structurally between program instances"), failure();
+    }
     consts.push_back(c);
     same &= (c == c0);
   }
@@ -2271,7 +2283,58 @@ FailureOr<AffineExpr> Raiser::rewrite(Operation *at, const Gen &g, ArrayRef<Axis
   auto sym = rewriteSymbolic(at, g, env, select, v);
   if (succeeded(sym))
     return sym;
+  if (auto tiled = rewriteInTiles(g, raw); succeeded(tiled))
+    return tiled;
   return fitOrigins(at, g, consts); // for its diagnostic
+}
+
+/// The same rewrite within each instance's tile, for a value the whole coordinate ranges leave apart: a digit axis
+/// split over view dims that different instances' tiles start along (t floordiv 7 of a window's 49 tokens, rows of
+/// a 7 x 7 window in an image) resolves where each coordinate stays in its tile. The instances must then agree up to
+/// a constant that is an affine function of their tiles' first coordinates along the view dims, which the
+/// coordinates there determine.
+FailureOr<AffineExpr> Raiser::rewriteInTiles(const Gen &g, ArrayRef<AffineExpr> raw) {
+  if (space->viewLo.size() != act.size())
+    return failure();
+  SmallVector<AffineExpr> basis;
+  std::vector<SmallVector<int64_t>> rows(act.size());
+  for (auto [j, pos] : llvm::enumerate(g.coordPos))
+    if (pos >= 0 && space->viewPhase[j] >= 0) {
+      AffineExpr x = getAffineDimExpr(pos, ctx);
+      basis.push_back(x - (x - space->viewPhase[j]) % space->viewExtent[j]);
+      for (unsigned n = 0; n < act.size(); ++n)
+        rows[n].push_back(space->viewLo[n][j]);
+    }
+  AffineExpr rest0;
+  SmallVector<int64_t> consts;
+  for (auto [n, e] : llvm::enumerate(raw)) {
+    auto [rest, c] = splitConstant(tidy(g, e, n));
+    if (n && rest != rest0)
+      return failure();
+    rest0 = rest;
+    consts.push_back(c);
+  }
+  // As fitOrigins: a value that is a tile's first coordinate over the tile size (a head index, its channel block's
+  // first channel / 32) fits times that dim's step between instances, then divides.
+  auto fit = fitAffine(rows, consts);
+  int64_t scale = 1;
+  for (unsigned f = 0; f < basis.size() && !fit; ++f) {
+    int64_t step = 0;
+    for (auto &r : rows)
+      step = std::gcd(step, std::abs(r[f] - rows[0][f]));
+    SmallVector<int64_t> scaled;
+    for (int64_t c : consts)
+      scaled.push_back(c * step);
+    if (step > 1 && (fit = fitAffine(rows, scaled)))
+      scale = step;
+  }
+  if (!fit)
+    return failure();
+  AffineExpr out = getAffineConstantExpr((*fit)[basis.size()], ctx);
+  for (auto [k, b] : llvm::enumerate(basis))
+    out = out + b * (*fit)[k];
+  out = rest0 + (scale > 1 ? out.floorDiv(scale) : out);
+  return tidy(g, out);
 }
 
 /// The same rewrite from the symbolic-pid evaluation: each program id is recovered from a tile origin
