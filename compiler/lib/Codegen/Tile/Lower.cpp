@@ -1022,7 +1022,14 @@ LogicalResult Lowering::emit() {
             asAxes.push_back(digit(d));
     }
     if (colExtent) {
-      asAxes.push_back(ax(*col).padTo(colExtent));
+      // Local columns padded to the packet stay padded (canonical()'s colLocal).
+      MapAttr padded = ax(*col).padTo(colExtent);
+      if (colLocalSize == colPad) {
+        asAxes.push_back(padded);
+      } else {
+        asAxes.push_back(padded.stride(colLocalSize));
+        asAxes.push_back(padded.modulo(colLocalSize).padTo(colPad));
+      }
     } else {
       if (colBlock)
         asAxes.push_back(digit(*colBlock));
